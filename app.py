@@ -431,7 +431,7 @@ async def hf_download(req: HFDownloadRequest):
     local_dir = req.local_dir or default_dir
 
     script = f"""
-import sys, json, os
+import sys, json, os, time
 sys.stdout.reconfigure(line_buffering=True)
 from huggingface_hub import list_repo_files, hf_hub_download
 
@@ -441,17 +441,25 @@ try:
     total = len(files)
     print(json.dumps({{"progress": {{"file": 0, "total": total, "name": ""}}}}), flush=True)
     local_dir = "{local_dir}"
-    last_path = local_dir
+    errors = []
     for i, filename in enumerate(files, 1):
         print(json.dumps({{"progress": {{"file": i - 1, "total": total, "name": filename}}}}), flush=True)
-        dest = hf_hub_download(
-            repo_id="{safe_repo}",
-            filename=filename,
-            local_dir=local_dir,
-        )
-        last_path = os.path.dirname(dest)
+        for attempt in range(2):
+            try:
+                hf_hub_download(repo_id="{safe_repo}", filename=filename, local_dir=local_dir)
+                break
+            except Exception as e:
+                if attempt == 0:
+                    print(json.dumps({{"warning": f"Retrying {{filename}}: {{e}}"}}), flush=True)
+                    time.sleep(3)
+                else:
+                    errors.append(filename)
+                    print(json.dumps({{"warning": f"Skipped {{filename}}: {{e}}"}}), flush=True)
         print(json.dumps({{"progress": {{"file": i, "total": total, "name": filename}}}}), flush=True)
-    print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
+    if errors:
+        print(json.dumps({{"status": "complete_with_errors", "path": local_dir, "failed": errors}}), flush=True)
+    else:
+        print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
 except Exception as e:
     print(json.dumps({{"status": "error", "error": str(e)}}), flush=True)
 """
@@ -777,6 +785,8 @@ body::before{
   line-height:1.7;
   white-space:pre-wrap;
 }
+.prog-log.has-error{border-color:#c0392b;color:#e74c3c}
+.prog-log.has-warning{border-color:#8a6d00;}
 
 /* ── Engine card ── */
 .engine-card{
@@ -1631,7 +1641,10 @@ async function hfDownload() {
   bar.className = 'prog-bar spin';
   bar.style.width = '';
   fileInfo.textContent = '';
+  log.className = 'prog-log';
   log.textContent = 'Fetching file list…';
+
+  let hadError = false;
 
   try {
     const resp = await fetch('/api/hf/download', {
@@ -1660,13 +1673,26 @@ async function hfDownload() {
             log.textContent = `Downloading ${repo}… ${pct}%`;
           } else if (ev.status === 'starting') {
             log.textContent = 'Starting: ' + repo;
+          } else if (ev.warning) {
+            log.className = 'prog-log has-warning';
+            log.textContent += '\n⚠ ' + ev.warning;
           } else if (ev.status === 'complete') {
             bar.style.width = '100%';
             fileInfo.textContent = '';
             toast('✓ Downloaded: ' + ev.path, 'ok');
             log.textContent = '✓ Complete → ' + ev.path;
+          } else if (ev.status === 'complete_with_errors') {
+            hadError = true;
+            bar.style.width = '100%';
+            fileInfo.textContent = '';
+            toast('⚠ Done with errors — ' + ev.failed.length + ' file(s) skipped', 'err');
+            log.className = 'prog-log has-error';
+            log.textContent = '⚠ Complete with errors → ' + ev.path +
+              '\nFailed files:\n' + ev.failed.join('\n');
           } else if (ev.status === 'error') {
+            hadError = true;
             toast('Error: ' + ev.error, 'err');
+            log.className = 'prog-log has-error';
             log.textContent += '\n✗ ' + ev.error;
           } else if (ev.log) {
             log.textContent += '\n' + ev.log;
@@ -1676,11 +1702,16 @@ async function hfDownload() {
       }
     }
   } catch(e) {
+    hadError = true;
     toast('Download failed: ' + e.message, 'err');
+    log.className = 'prog-log has-error';
+    log.textContent += '\n✗ ' + e.message;
   } finally {
     btn.disabled = false;
     btn.innerHTML = '⬇ Download';
-    setTimeout(() => { prog.classList.remove('show'); bar.style.width = '0'; fileInfo.textContent = ''; }, 3000);
+    if (!hadError) {
+      setTimeout(() => { prog.classList.remove('show'); bar.style.width = '0'; fileInfo.textContent = ''; }, 3000);
+    }
   }
 }
 
