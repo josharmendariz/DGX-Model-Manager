@@ -11,7 +11,6 @@ import os
 import platform
 import socket
 import subprocess
-import sys
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -370,10 +369,17 @@ async def get_vllm_profiles():
 @app.get("/api/vllm/status")
 async def vllm_status():
     result = subprocess.run(
-        ["docker", "ps", "--filter", "name=^vllm$", "--format", "{{.Names}}\t{{.Status}}"],
+        ["docker", "ps", "--filter", "name=vllm", "--format", "{{.Names}}\t{{.Status}}"],
         capture_output=True, text=True, timeout=5,
     )
-    running = bool(result.stdout.strip())
+    container_info = result.stdout.strip()
+    running = bool(container_info)
+
+    # Fallback: if docker ps finds nothing, check the HTTP endpoint directly
+    # (handles cases where the container name doesn't match, or vLLM runs outside Docker)
+    if not running:
+        running = await service_ok(VLLM_BASE, "/health")
+
     model = None
     if running:
         try:
@@ -384,7 +390,7 @@ async def vllm_status():
                     model = d[0]["id"]
         except Exception:
             pass
-    return {"running": running, "model": model, "container_info": result.stdout.strip()}
+    return {"running": running, "model": model, "container_info": container_info}
 
 
 @app.post("/api/vllm/stop")
@@ -431,35 +437,13 @@ async def hf_download(req: HFDownloadRequest):
     local_dir = req.local_dir or default_dir
 
     script = f"""
-import sys, json, os, time
+import sys, json
 sys.stdout.reconfigure(line_buffering=True)
-from huggingface_hub import list_repo_files, hf_hub_download
-
+from huggingface_hub import snapshot_download
 print(json.dumps({{"status": "starting", "repo": "{safe_repo}"}}), flush=True)
 try:
-    files = list(list_repo_files("{safe_repo}"))
-    total = len(files)
-    print(json.dumps({{"progress": {{"file": 0, "total": total, "name": ""}}}}), flush=True)
-    local_dir = "{local_dir}"
-    errors = []
-    for i, filename in enumerate(files, 1):
-        print(json.dumps({{"progress": {{"file": i - 1, "total": total, "name": filename}}}}), flush=True)
-        for attempt in range(2):
-            try:
-                hf_hub_download(repo_id="{safe_repo}", filename=filename, local_dir=local_dir)
-                break
-            except Exception as e:
-                if attempt == 0:
-                    print(json.dumps({{"warning": f"Retrying {{filename}}: {{e}}"}}), flush=True)
-                    time.sleep(3)
-                else:
-                    errors.append(filename)
-                    print(json.dumps({{"warning": f"Skipped {{filename}}: {{e}}"}}), flush=True)
-        print(json.dumps({{"progress": {{"file": i, "total": total, "name": filename}}}}), flush=True)
-    if errors:
-        print(json.dumps({{"status": "complete_with_errors", "path": local_dir, "failed": errors}}), flush=True)
-    else:
-        print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
+    path = snapshot_download(repo_id="{safe_repo}", local_dir="{local_dir}")
+    print(json.dumps({{"status": "complete", "path": path}}), flush=True)
 except Exception as e:
     print(json.dumps({{"status": "error", "error": str(e)}}), flush=True)
 """
@@ -467,7 +451,7 @@ except Exception as e:
     async def stream() -> AsyncGenerator[str, None]:
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", script,
+                "python3", "-c", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -476,6 +460,11 @@ except Exception as e:
                 line = raw.decode().strip()
                 if line:
                     yield f"data: {line}\n\n"
+            stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
+            for line in stderr_data.decode().split("\n"):
+                stripped = line.strip()
+                if stripped and "%" not in stripped and "it/s" not in stripped:
+                    yield f"data: {json.dumps({'log': stripped})}\n\n"
             await proc.wait()
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
@@ -785,8 +774,6 @@ body::before{
   line-height:1.7;
   white-space:pre-wrap;
 }
-.prog-log.has-error{border-color:#c0392b;color:#e74c3c}
-.prog-log.has-warning{border-color:#8a6d00;}
 
 /* ── Engine card ── */
 .engine-card{
@@ -987,7 +974,6 @@ body::before{
 
       <div class="progress-wrap" id="hf-progress">
         <div class="prog-bar-outer"><div class="prog-bar spin" id="hf-bar"></div></div>
-        <div id="hf-file-info" style="font-size:11px;color:var(--muted);margin-bottom:4px;font-family:'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
         <div class="prog-log" id="hf-log"></div>
       </div>
     </div>
@@ -1629,22 +1615,14 @@ async function hfDownload() {
   const dir  = document.getElementById('hf-dir').value.trim();
   if (!repo) { document.getElementById('hf-repo').focus(); return; }
 
-  const btn      = document.getElementById('hf-btn');
-  const prog     = document.getElementById('hf-progress');
-  const bar      = document.getElementById('hf-bar');
-  const fileInfo = document.getElementById('hf-file-info');
-  const log      = document.getElementById('hf-log');
+  const btn  = document.getElementById('hf-btn');
+  const prog = document.getElementById('hf-progress');
+  const log  = document.getElementById('hf-log');
 
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Downloading…';
   prog.classList.add('show');
-  bar.className = 'prog-bar spin';
-  bar.style.width = '';
-  fileInfo.textContent = '';
-  log.className = 'prog-log';
-  log.textContent = 'Fetching file list…';
-
-  let hadError = false;
+  log.textContent = 'Starting download: ' + repo;
 
   try {
     const resp = await fetch('/api/hf/download', {
@@ -1662,56 +1640,26 @@ async function hfDownload() {
         if (!line.startsWith('data: ')) continue;
         try {
           const ev = JSON.parse(line.slice(6));
-          if (ev.progress) {
-            const {file, total, name} = ev.progress;
-            const pct = total > 0 ? Math.round(file / total * 100) : 0;
-            bar.className = 'prog-bar';
-            bar.style.width = pct + '%';
-            fileInfo.textContent = total > 0
-              ? `${file} / ${total} files${name ? '  ·  ' + name : ''}`
-              : 'Counting files…';
-            log.textContent = `Downloading ${repo}… ${pct}%`;
-          } else if (ev.status === 'starting') {
-            log.textContent = 'Starting: ' + repo;
-          } else if (ev.warning) {
-            log.className = 'prog-log has-warning';
-            log.textContent += '\n⚠ ' + ev.warning;
-          } else if (ev.status === 'complete') {
-            bar.style.width = '100%';
-            fileInfo.textContent = '';
+          if (ev.status === 'complete') {
             toast('✓ Downloaded: ' + ev.path, 'ok');
-            log.textContent = '✓ Complete → ' + ev.path;
-          } else if (ev.status === 'complete_with_errors') {
-            hadError = true;
-            bar.style.width = '100%';
-            fileInfo.textContent = '';
-            toast('⚠ Done with errors — ' + ev.failed.length + ' file(s) skipped', 'err');
-            log.className = 'prog-log has-error';
-            log.textContent = '⚠ Complete with errors → ' + ev.path +
-              '\nFailed files:\n' + ev.failed.join('\n');
+            log.textContent += '\n✓ Complete → ' + ev.path;
           } else if (ev.status === 'error') {
-            hadError = true;
             toast('Error: ' + ev.error, 'err');
-            log.className = 'prog-log has-error';
             log.textContent += '\n✗ ' + ev.error;
           } else if (ev.log) {
             log.textContent += '\n' + ev.log;
+          } else if (ev.status) {
+            log.textContent += '\n' + ev.status;
           }
           log.scrollTop = log.scrollHeight;
         } catch(e) {}
       }
     }
   } catch(e) {
-    hadError = true;
     toast('Download failed: ' + e.message, 'err');
-    log.className = 'prog-log has-error';
-    log.textContent += '\n✗ ' + e.message;
   } finally {
     btn.disabled = false;
     btn.innerHTML = '⬇ Download';
-    if (!hadError) {
-      setTimeout(() => { prog.classList.remove('show'); bar.style.width = '0'; fileInfo.textContent = ''; }, 3000);
-    }
   }
 }
 
