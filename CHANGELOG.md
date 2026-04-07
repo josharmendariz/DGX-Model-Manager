@@ -23,6 +23,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - **config.json** — added `services.vllm_base` field (default `http://127.0.0.1:8000`).
+- **docs.html** — added vLLM Engine tab guide (section 05), vLLM Profiles reference (section 09), vLLM troubleshooting entries. Architecture diagram updated to three backends. Model recommendation badges made engine-agnostic.
 - **`/api/status`** — now includes `vllm` key with `ok` and `model` fields.
 - **`/api/nodeinfo`** — now includes `vllm_port`.
 
