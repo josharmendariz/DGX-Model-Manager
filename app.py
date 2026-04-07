@@ -11,6 +11,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -444,7 +445,7 @@ except Exception as e:
     async def stream() -> AsyncGenerator[str, None]:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "python3", "-c", script,
+                sys.executable, "-c", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
