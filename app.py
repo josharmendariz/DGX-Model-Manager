@@ -431,13 +431,27 @@ async def hf_download(req: HFDownloadRequest):
     local_dir = req.local_dir or default_dir
 
     script = f"""
-import sys, json
+import sys, json, os
 sys.stdout.reconfigure(line_buffering=True)
-from huggingface_hub import snapshot_download
+from huggingface_hub import list_repo_files, hf_hub_download
+
 print(json.dumps({{"status": "starting", "repo": "{safe_repo}"}}), flush=True)
 try:
-    path = snapshot_download(repo_id="{safe_repo}", local_dir="{local_dir}")
-    print(json.dumps({{"status": "complete", "path": path}}), flush=True)
+    files = list(list_repo_files("{safe_repo}"))
+    total = len(files)
+    print(json.dumps({{"progress": {{"file": 0, "total": total, "name": ""}}}}), flush=True)
+    local_dir = "{local_dir}"
+    last_path = local_dir
+    for i, filename in enumerate(files, 1):
+        print(json.dumps({{"progress": {{"file": i - 1, "total": total, "name": filename}}}}), flush=True)
+        dest = hf_hub_download(
+            repo_id="{safe_repo}",
+            filename=filename,
+            local_dir=local_dir,
+        )
+        last_path = os.path.dirname(dest)
+        print(json.dumps({{"progress": {{"file": i, "total": total, "name": filename}}}}), flush=True)
+    print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
 except Exception as e:
     print(json.dumps({{"status": "error", "error": str(e)}}), flush=True)
 """
@@ -454,11 +468,6 @@ except Exception as e:
                 line = raw.decode().strip()
                 if line:
                     yield f"data: {line}\n\n"
-            stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
-            for line in stderr_data.decode().split("\n"):
-                stripped = line.strip()
-                if stripped and "%" not in stripped and "it/s" not in stripped:
-                    yield f"data: {json.dumps({'log': stripped})}\n\n"
             await proc.wait()
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
@@ -968,6 +977,7 @@ body::before{
 
       <div class="progress-wrap" id="hf-progress">
         <div class="prog-bar-outer"><div class="prog-bar spin" id="hf-bar"></div></div>
+        <div id="hf-file-info" style="font-size:11px;color:var(--muted);margin-bottom:4px;font-family:'JetBrains Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
         <div class="prog-log" id="hf-log"></div>
       </div>
     </div>
@@ -1609,14 +1619,19 @@ async function hfDownload() {
   const dir  = document.getElementById('hf-dir').value.trim();
   if (!repo) { document.getElementById('hf-repo').focus(); return; }
 
-  const btn  = document.getElementById('hf-btn');
-  const prog = document.getElementById('hf-progress');
-  const log  = document.getElementById('hf-log');
+  const btn      = document.getElementById('hf-btn');
+  const prog     = document.getElementById('hf-progress');
+  const bar      = document.getElementById('hf-bar');
+  const fileInfo = document.getElementById('hf-file-info');
+  const log      = document.getElementById('hf-log');
 
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Downloading…';
   prog.classList.add('show');
-  log.textContent = 'Starting download: ' + repo;
+  bar.className = 'prog-bar spin';
+  bar.style.width = '';
+  fileInfo.textContent = '';
+  log.textContent = 'Fetching file list…';
 
   try {
     const resp = await fetch('/api/hf/download', {
@@ -1634,16 +1649,27 @@ async function hfDownload() {
         if (!line.startsWith('data: ')) continue;
         try {
           const ev = JSON.parse(line.slice(6));
-          if (ev.status === 'complete') {
+          if (ev.progress) {
+            const {file, total, name} = ev.progress;
+            const pct = total > 0 ? Math.round(file / total * 100) : 0;
+            bar.className = 'prog-bar';
+            bar.style.width = pct + '%';
+            fileInfo.textContent = total > 0
+              ? `${file} / ${total} files${name ? '  ·  ' + name : ''}`
+              : 'Counting files…';
+            log.textContent = `Downloading ${repo}… ${pct}%`;
+          } else if (ev.status === 'starting') {
+            log.textContent = 'Starting: ' + repo;
+          } else if (ev.status === 'complete') {
+            bar.style.width = '100%';
+            fileInfo.textContent = '';
             toast('✓ Downloaded: ' + ev.path, 'ok');
-            log.textContent += '\n✓ Complete → ' + ev.path;
+            log.textContent = '✓ Complete → ' + ev.path;
           } else if (ev.status === 'error') {
             toast('Error: ' + ev.error, 'err');
             log.textContent += '\n✗ ' + ev.error;
           } else if (ev.log) {
             log.textContent += '\n' + ev.log;
-          } else if (ev.status) {
-            log.textContent += '\n' + ev.status;
           }
           log.scrollTop = log.scrollHeight;
         } catch(e) {}
@@ -1654,6 +1680,7 @@ async function hfDownload() {
   } finally {
     btn.disabled = false;
     btn.innerHTML = '⬇ Download';
+    setTimeout(() => { prog.classList.remove('show'); bar.style.width = '0'; fileInfo.textContent = ''; }, 3000);
   }
 }
 
