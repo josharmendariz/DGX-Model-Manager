@@ -6,23 +6,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [0.0.4] - 2026-04-03
-
-### Fixed
-
-- **Ollama model delete (for real this time)** — `httpx.AsyncClient.delete()` does not support the `json=` keyword argument, which caused every delete to fail with `AsyncClient.delete() got an unexpected keyword argument 'json'`. Changed to `c.request("DELETE", ...)` which correctly sends the JSON body. Timeout increased to 60s and 404 handling added for clearer error messages.
-
-- **Favicon route missing** — the `/favicon.png` route and `<link rel="icon">` tag were documented in the changelog but never committed. Added both, plus the `FileResponse` import.
+## [0.0.5] - 2026-04-07
 
 ### Added
 
-- **Dynamic node info** — header bar and SGLang engine footer are no longer hardcoded. New `/api/nodeinfo` endpoint detects hostname, LAN IP, port, architecture, and total memory at runtime. The UI fetches this on page load via JavaScript.
+- **vLLM Engine tab** — full start/stop/profiles support mirroring the SGLang tab. Docker-based, with its own profile system (`vllm_profiles.json`), status LED, 20-second polling, and ready detection requiring both container running + model serving. Status pill in the header bar shows live vLLM health alongside the other services.
 
-- **`config.json` loading** — `app.py` now reads `~/model-manager/config.json` at startup. The port for `uvicorn.run()` is pulled from `app.port` instead of being hardcoded to `8090`.
+- **vLLM status pill** — header bar now shows four service indicators: SGLang, Ollama, LiteLLM, and vLLM. The vLLM pill displays the active model name when running.
+
+### Fixed
+
+- **`~/` paths in profile scripts now resolve correctly** — both SGLang and vLLM start endpoints now call `os.path.expanduser()` on the script path before checking existence or executing. Previously, profiles using `~/sglang/start.sh` style paths would always fail with "Script not found".
+
+- **Docker container detection is now exact-match** — status checks for SGLang and vLLM now use `name=^sglang$` / `name=^vllm$` filters instead of substring matching, preventing false positives from unrelated containers with similar names.
+
+### Changed
+
+- **config.json** — added `services.vllm_base` field (default `http://127.0.0.1:8000`).
+- **`/api/status`** — now includes `vllm` key with `ok` and `model` fields.
+- **`/api/nodeinfo`** — now includes `vllm_port`.
 
 ---
 
-## [0.0.2] - 2026-04-02
+## [0.0.4] - 2026-04-02
 
 ### Fixed
 
@@ -40,7 +46,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [0.0.1] - 2026-04-01
+## [0.0.3] - 2026-04-01
 
 ### Added
 

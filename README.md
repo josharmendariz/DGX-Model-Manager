@@ -1,6 +1,6 @@
 # DGX Spark Model Manager
 
-A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX Nano G1n** (GB10, 128 GB unified memory). Pull Ollama models, download from HuggingFace, manage LiteLLM routing, and control SGLang — all from one browser tab.
+A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX Nano G1n** (GB10, 128 GB unified memory). Pull Ollama models, download from HuggingFace, manage LiteLLM routing, and control SGLang or vLLM — all from one browser tab.
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-aarch64%20Ubuntu-orange)
 
@@ -11,9 +11,12 @@ A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX N
 - **Ollama Models** — pull, list, and delete models with live download progress
 - **LiteLLM Routing** — one-click wildcard routing so every Ollama model is auto-exposed to all your apps
 - **SGLang Engine** — start/stop the SGLang Docker container via configurable launch profiles
+- **vLLM Engine** — start/stop the vLLM Docker container via configurable launch profiles
 - **HuggingFace Download** — download any model from HF Hub directly to the device
-- **Live Status Bar** — real-time health indicators for SGLang, Ollama, and LiteLLM
+- **Live Status Bar** — real-time health indicators for SGLang, vLLM, Ollama, and LiteLLM
 - **Built-in Help Page** — documentation at `/help`
+
+Both SGLang and vLLM are fully supported as inference engines. Use whichever you prefer — or both, on different ports with different models. Each engine has its own tab, profiles, and status indicator.
 
 ---
 
@@ -25,9 +28,10 @@ A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX N
 | [Ollama](https://ollama.com) | ✅ | Core model management |
 | [LiteLLM](https://github.com/BerriAI/litellm) | Optional | Unified API routing |
 | [SGLang](https://github.com/sgl-project/sglang) | Optional | Large model inference |
-| Docker | Optional | Required for SGLang start/stop |
+| [vLLM](https://github.com/vllm-project/vllm) | Optional | Large model inference (alternative to SGLang) |
+| Docker | Optional | Required for SGLang and vLLM start/stop |
 
-The app works with just Ollama installed. LiteLLM and SGLang tabs gracefully show offline status if those services aren't running.
+The app works with just Ollama installed. LiteLLM, SGLang, and vLLM tabs gracefully show offline status if those services aren't running.
 
 ---
 
@@ -35,8 +39,8 @@ The app works with just Ollama installed. LiteLLM and SGLang tabs gracefully sho
 
 ```bash
 # 1. Clone
-git clone https://github.com/yourusername/dgx-model-manager
-cd dgx-model-manager
+git clone https://github.com/calico88x/DGX-Model-Manager
+cd DGX-Model-Manager
 
 # 2. Configure (edit before running)
 nano config.json
@@ -64,7 +68,8 @@ Edit `config.json` before running setup. All fields have sensible defaults.
   "services": {
     "ollama_base":  "http://127.0.0.1:11434",
     "litellm_base": "http://127.0.0.1:4000",
-    "sglang_base":  "http://127.0.0.1:30000"
+    "sglang_base":  "http://127.0.0.1:30000",
+    "vllm_base":    "http://127.0.0.1:8000"
   },
   "paths": {
     "litellm_config": "~/litellm/litellm_config.yaml",
@@ -80,6 +85,7 @@ Edit `config.json` before running setup. All fields have sensible defaults.
 | `services.ollama_base` | `http://127.0.0.1:11434` | Ollama API URL |
 | `services.litellm_base` | `http://127.0.0.1:4000` | LiteLLM proxy URL |
 | `services.sglang_base` | `http://127.0.0.1:30000` | SGLang API URL |
+| `services.vllm_base` | `http://127.0.0.1:8000` | vLLM API URL |
 | `paths.litellm_config` | `~/litellm/litellm_config.yaml` | Path to your LiteLLM config file |
 | `paths.hf_cache` | `~/.cache/huggingface/hub` | HuggingFace model cache directory |
 
@@ -135,6 +141,72 @@ sudo docker run --rm --gpus all --ipc=host \
 
 ---
 
+## vLLM Profiles
+
+![vLLM Tab](misc/vllm-tab.png)
+
+vLLM profiles work identically to SGLang profiles. Edit `vllm_profiles.json` to define your startup configurations:
+
+```json
+[
+  {
+    "id": "my-model",
+    "name": "My Model Name",
+    "script": "~/vllm/start_my_model.sh",
+    "description": "70B model · ~45 GB VRAM · ~5 min warm-up",
+    "vram_gb": 45
+  }
+]
+```
+
+Each profile points to a shell script that launches the vLLM Docker container. The container **must be named `vllm`** so the app can detect and control it.
+
+### Example vLLM start script
+
+```bash
+#!/usr/bin/env bash
+sudo docker run --rm --gpus all --ipc=host \
+  --name vllm \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  vllm/vllm-openai:latest \
+  --model /root/.cache/huggingface/hub/models--your-org--your-model/snapshots/main \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 1
+```
+
+### Common vLLM flags
+
+| Flag | Description |
+|------|-------------|
+| `--model` | Path to model weights or HuggingFace repo ID |
+| `--tensor-parallel-size` | Number of GPUs for tensor parallelism (1 for DGX Spark) |
+| `--max-model-len` | Maximum context length (reduce if hitting OOM) |
+| `--gpu-memory-utilization` | Fraction of GPU memory to use (default 0.9) |
+| `--dtype` | Data type: `auto`, `float16`, `bfloat16` |
+| `--quantization` | Quantization method: `awq`, `gptq`, `squeezellm`, etc. |
+| `--tool-call-parser` | Tool calling format: `mistral`, `hermes`, `llama3_json`, etc. |
+| `--enable-auto-tool-choice` | Auto-detect tool calls from model output |
+
+> **Tip:** vLLM's default port is `8000`. If you're running both SGLang and vLLM simultaneously on different models, the default ports (`30000` and `8000`) won't conflict. Just make sure you have enough memory for both.
+
+### Using vLLM with LiteLLM
+
+To route vLLM models through LiteLLM at `:4000`, add an entry to your `litellm_config.yaml`:
+
+```yaml
+- model_name: my-vllm-model
+  litellm_params:
+    model: openai/my-model-name
+    api_base: http://127.0.0.1:8000/v1
+    api_key: token-abc123  # vLLM default, or set with --api-key
+```
+
+Then restart LiteLLM from the LiteLLM tab or via `sudo systemctl restart litellm`.
+
+---
+
 ## LiteLLM Wildcard Routing
 
 The **Apply Wildcard** button in the LiteLLM tab adds this single entry to your `litellm_config.yaml`:
@@ -149,6 +221,8 @@ The **Apply Wildcard** button in the LiteLLM tab adds this single entry to your 
 After this one-time change, every model you pull into Ollama is automatically available to all apps connected to LiteLLM at `:4000` — no further config edits required.
 
 The button also restarts the LiteLLM service automatically. This requires passwordless sudo for `systemctl restart litellm` — the setup script will offer to configure this for you.
+
+> **Note:** The wildcard only covers Ollama models. SGLang and vLLM models need explicit entries in the LiteLLM config — see the sections above for examples.
 
 ---
 
@@ -189,16 +263,59 @@ sudo systemctl disable model-manager
 ## Stack Architecture
 
 ```
-Your Apps (OpenClaw, Open WebUI, scripts, etc.)
+Your Apps (Open WebUI, scripts, any OpenAI client, etc.)
          │
          ▼
-   LiteLLM :4000  ──────────────────────────────┐
-         │                                       │
-         ▼                                       ▼
-  SGLang :30000                          Ollama :11434
-  (large models,                         (small/medium models,
-   NVFP4, MoE)                            hot-swap on demand)
+   LiteLLM :4000  ──────────────────────────────┬──────────────────┐
+         │                                       │                  │
+         ▼                                       ▼                  ▼
+  SGLang :30000                          Ollama :11434        vLLM :8000
+  (large models,                         (small/medium,       (large models,
+   NVFP4, MoE)                            hot-swap)            alternative engine)
 ```
+
+SGLang and vLLM serve the same role — high-performance inference for large models. Use whichever fits your workflow. Both are controlled via Docker and managed through their respective tabs in the UI.
+
+---
+
+## Model Recommendations for DGX Spark (128 GB)
+
+### With a large-model engine running (~31 GB available for Ollama)
+
+This applies whether you're running SGLang or vLLM as your primary engine.
+
+| Model | Pull Name | Size | Use Case |
+|-------|-----------|------|----------|
+| Qwen2.5 Coder 32B | `qwen2.5-coder:32b` | ~20 GB | Coding |
+| QwQ 32B | `qwq:32b` | ~20 GB | Reasoning |
+| Phi-4 | `phi4` | ~8 GB | General, fast |
+| DeepSeek-R1 14B | `deepseek-r1:14b` | ~9 GB | Reasoning |
+| Nomic Embed | `nomic-embed-text` | <1 GB | Embeddings/RAG |
+
+### With engines stopped (full 128 GB)
+
+| Model | Pull Name | Size | Use Case |
+|-------|-----------|------|----------|
+| Qwen3 Coder Next | `qwen3-coder-next` | ~54 GB | Agentic coding, 256K context |
+| DeepSeek-R1 70B | `deepseek-r1:70b` | ~43 GB | Heavy reasoning |
+| Qwen2.5 72B | `qwen2.5:72b` | ~45 GB | General, large |
+
+---
+
+## SGLang vs vLLM — Which Should I Use?
+
+Both engines are excellent. Here's a quick comparison to help you decide:
+
+| | SGLang | vLLM |
+|---|---|---|
+| **Strengths** | RadixAttention (prefix caching), fast structured output, strong MoE support | Broad model/quantization support, PagedAttention, mature ecosystem |
+| **Docker image** | `lmsysorg/sglang:*` | `vllm/vllm-openai:*` |
+| **Default port** | 30000 | 8000 |
+| **API format** | OpenAI-compatible (`/v1/`) | OpenAI-compatible (`/v1/`) |
+| **Tool calling** | `--tool-call-parser` | `--tool-call-parser` + `--enable-auto-tool-choice` |
+| **Container name** | `sglang` (expected by app) | `vllm` (expected by app) |
+
+Both expose the same OpenAI-compatible API, so your apps don't need to change when switching between them. LiteLLM routes to either one the same way.
 
 ---
 

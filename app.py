@@ -26,8 +26,10 @@ import uvicorn
 OLLAMA_BASE    = "http://127.0.0.1:11434"
 LITELLM_BASE   = "http://127.0.0.1:4000"
 SGLANG_BASE    = "http://127.0.0.1:30000"
+VLLM_BASE      = "http://127.0.0.1:8000"
 LITELLM_CONFIG = Path(os.path.expanduser("~/litellm/litellm_config.yaml"))
 PROFILES_FILE  = Path(os.path.expanduser("~/model-manager/sglang_profiles.json"))
+VLLM_PROFILES  = Path(os.path.expanduser("~/model-manager/vllm_profiles.json"))
 
 # Load app config
 _CONFIG_FILE = Path(os.path.expanduser("~/model-manager/config.json"))
@@ -76,6 +78,9 @@ class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
 
+class VLLMStartRequest(BaseModel):
+    profile: str
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def service_ok(base: str, path: str = "/health") -> bool:
@@ -105,6 +110,13 @@ def load_profiles() -> list:
             return json.load(f)
     return []
 
+
+def load_vllm_profiles() -> list:
+    if VLLM_PROFILES.exists():
+        with open(VLLM_PROFILES) as f:
+            return json.load(f)
+    return []
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ZGX Model Manager")
@@ -113,10 +125,11 @@ app = FastAPI(title="ZGX Model Manager")
 
 @app.get("/api/status")
 async def get_status():
-    sglang_ok, ollama_ok, litellm_ok = await asyncio.gather(
+    sglang_ok, ollama_ok, litellm_ok, vllm_ok = await asyncio.gather(
         service_ok(SGLANG_BASE, "/health"),
         service_ok(OLLAMA_BASE, "/api/tags"),
         service_ok(LITELLM_BASE, "/health"),
+        service_ok(VLLM_BASE, "/health"),
     )
     sglang_model = None
     if sglang_ok:
@@ -128,10 +141,21 @@ async def get_status():
                     sglang_model = d[0]["id"]
         except Exception:
             pass
+    vllm_model = None
+    if vllm_ok:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as c:
+                r = await c.get(VLLM_BASE + "/v1/models")
+                d = r.json().get("data", [])
+                if d:
+                    vllm_model = d[0]["id"]
+        except Exception:
+            pass
     return {
         "sglang":  {"ok": sglang_ok,  "model": sglang_model},
         "ollama":  {"ok": ollama_ok},
         "litellm": {"ok": litellm_ok},
+        "vllm":    {"ok": vllm_ok, "model": vllm_model},
     }
 
 @app.get("/api/nodeinfo")
@@ -141,6 +165,7 @@ async def get_nodeinfo():
     arch = platform.machine()
     mem_gb = _get_total_memory_gb()
     sglang_port = SGLANG_BASE.rsplit(":", 1)[-1]
+    vllm_port = VLLM_BASE.rsplit(":", 1)[-1]
     return {
         "hostname": hostname,
         "ip": ip,
@@ -148,6 +173,7 @@ async def get_nodeinfo():
         "arch": arch,
         "memory_gb": mem_gb,
         "sglang_port": sglang_port,
+        "vllm_port": vllm_port,
     }
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
@@ -280,7 +306,7 @@ async def get_sglang_profiles():
 @app.get("/api/sglang/status")
 async def sglang_status():
     result = subprocess.run(
-        ["docker", "ps", "--filter", "name=sglang", "--format", "{{.Names}}\t{{.Status}}"],
+        ["docker", "ps", "--filter", "name=^sglang$", "--format", "{{.Names}}\t{{.Status}}"],
         capture_output=True, text=True, timeout=5,
     )
     running = bool(result.stdout.strip())
@@ -320,11 +346,73 @@ async def start_sglang(req: SGLangStartRequest):
     profile = next((p for p in profiles if p["id"] == req.profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req.profile}' not found")
-    script = profile.get("script", "")
+    script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
         raise HTTPException(400, f"Script not found: {script}")
 
     log_path = f"/tmp/sglang_{req.profile}.log"
+    with open(log_path, "w") as logf:
+        subprocess.Popen(
+            ["bash", script],
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return {"ok": True, "message": f"Launched {profile['name']} — logs at {log_path}"}
+
+# ── vLLM ──────────────────────────────────────────────────────────────────────
+
+@app.get("/api/vllm/profiles")
+async def get_vllm_profiles():
+    return load_vllm_profiles()
+
+
+@app.get("/api/vllm/status")
+async def vllm_status():
+    result = subprocess.run(
+        ["docker", "ps", "--filter", "name=^vllm$", "--format", "{{.Names}}\t{{.Status}}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    running = bool(result.stdout.strip())
+    model = None
+    if running:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as c:
+                r = await c.get(VLLM_BASE + "/v1/models")
+                d = r.json().get("data", [])
+                if d:
+                    model = d[0]["id"]
+        except Exception:
+            pass
+    return {"running": running, "model": model, "container_info": result.stdout.strip()}
+
+
+@app.post("/api/vllm/stop")
+async def stop_vllm():
+    result = subprocess.run(
+        ["docker", "stop", "vllm"],
+        capture_output=True, text=True, timeout=60,
+    )
+    ok = result.returncode == 0
+    if not ok:
+        result = subprocess.run(
+            ["sudo", "docker", "stop", "vllm"],
+            capture_output=True, text=True, timeout=60,
+        )
+        ok = result.returncode == 0
+    return {"ok": ok, "output": (result.stdout + result.stderr).strip()}
+
+
+@app.post("/api/vllm/start")
+async def start_vllm(req: VLLMStartRequest):
+    profiles = load_vllm_profiles()
+    profile = next((p for p in profiles if p["id"] == req.profile), None)
+    if not profile:
+        raise HTTPException(404, f"Profile '{req.profile}' not found")
+    script = os.path.expanduser(profile.get("script", ""))
+    if not Path(script).exists():
+        raise HTTPException(400, f"Script not found: {script}")
+
+    log_path = f"/tmp/vllm_{req.profile}.log"
     with open(log_path, "w") as logf:
         subprocess.Popen(
             ["bash", script],
@@ -338,7 +426,7 @@ async def start_sglang(req: SGLangStartRequest):
 @app.post("/api/hf/download")
 async def hf_download(req: HFDownloadRequest):
     safe_repo = req.repo_id.replace("'", "").replace('"', "")
-    default_dir = f"/home/nova/.cache/huggingface/hub/{safe_repo.replace('/', '--')}"
+    default_dir = os.path.expanduser(f"~/.cache/huggingface/hub/{safe_repo.replace('/', '--')}")
     local_dir = req.local_dir or default_dir
 
     script = f"""
@@ -802,6 +890,7 @@ body::before{
     <div class="pill" id="pill-sglang"><div class="dot"></div><span>SGLang</span></div>
     <div class="pill" id="pill-ollama"><div class="dot"></div><span>Ollama</span></div>
     <div class="pill" id="pill-litellm"><div class="dot"></div><span>LiteLLM</span></div>
+    <div class="pill" id="pill-vllm"><div class="dot"></div><span>vLLM</span></div>
     <button class="refresh-btn" onclick="pollStatus()" title="Refresh status">↻</button>
     <a href="/help" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--muted);text-decoration:none;padding:4px 10px;border:1px solid var(--border);border-radius:5px;transition:all .15s;" onmouseover="this.style.color='var(--amber)';this.style.borderColor='var(--amber)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">? Docs</a>
   </div>
@@ -825,6 +914,9 @@ body::before{
     <div class="nav-section-label">Engine</div>
     <div class="nav-item" id="nav-sglang" onclick="switchTab('sglang')">
       <span class="nav-icon">🚀</span>SGLang
+    </div>
+    <div class="nav-item" id="nav-vllm" onclick="switchTab('vllm')">
+      <span class="nav-icon">⚡</span>vLLM
     </div>
   </nav>
 
@@ -868,7 +960,7 @@ body::before{
         </div>
         <div class="sec-label" style="margin-bottom:8px">Local Directory <span style="color:var(--muted);font-size:10px">(optional — leave blank for HF cache default)</span></div>
         <div class="input-row" style="margin-bottom:0">
-          <input class="input" id="hf-dir" placeholder="/home/nova/models/my-model">
+          <input class="input" id="hf-dir" placeholder="/home/user/models/my-model">
           <button class="btn btn-primary" id="hf-btn" onclick="hfDownload()">⬇ Download</button>
         </div>
       </div>
@@ -883,7 +975,7 @@ body::before{
     <div class="tab" id="tab-litellm">
       <div class="page-hdr">
         <div class="page-title">LiteLLM Routing</div>
-        <div class="page-sub">Unified gateway at <code>:4000</code>. All apps — OpenClaw, Open WebUI, scripts — connect here. This config controls which models they can see.</div>
+        <div class="page-sub">Unified gateway at <code>:4000</code>. All apps — Open WebUI, scripts, agents — connect here. This config controls which models they can see.</div>
       </div>
 
       <div class="card" id="wildcard-card">
@@ -956,6 +1048,43 @@ body::before{
       </div>
     </div>
 
+    <!-- ─── VLLM ─── -->
+    <div class="tab" id="tab-vllm">
+      <div class="page-hdr">
+        <div class="page-title">vLLM Engine</div>
+        <div class="page-sub">vLLM loads one large model at a time via Docker. Select a profile and start it below — status updates automatically.</div>
+      </div>
+
+      <div class="engine-card" id="vllm-engine-card">
+        <div class="engine-status-row">
+          <div class="engine-led" id="vllm-engine-led"></div>
+          <div>
+            <div class="engine-title" id="vllm-engine-title">Checking…</div>
+            <div class="engine-model" id="vllm-engine-model"></div>
+          </div>
+          <div class="engine-actions">
+            <button class="btn btn-danger" id="vllm-stop-btn" onclick="stopVLLM()" disabled>■ Stop</button>
+          </div>
+        </div>
+        <div class="engine-footer" id="vllm-engine-footer">loading…</div>
+      </div>
+
+      <div class="sec-label">Profiles</div>
+      <div class="profile-list" id="vllm-profile-list">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto"></div></div>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:12px;margin-top:14px">
+        <button class="btn btn-primary" id="vllm-start-btn" onclick="startVLLM()">▶ Start Selected</button>
+        <span style="font-size:12px;color:var(--muted)">Runs start script in background · check status pill</span>
+      </div>
+
+      <div class="progress-wrap" id="vllm-progress" style="margin-top:14px">
+        <div class="prog-bar-outer"><div class="prog-bar spin"></div></div>
+        <div class="prog-log" id="vllm-log"></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -968,6 +1097,7 @@ body::before{
 
 let activeTab = 'ollama';
 let selectedProfile = null;
+let selectedVLLMProfile = null;
 let statusTimer = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1121,10 @@ async function loadNodeInfo() {
     if (d.arch) parts.push(d.arch);
     if (d.memory_gb) parts.push(d.memory_gb + ' GB memory');
     document.getElementById('engine-footer').textContent = parts.join(' \u00b7 ');
+    const vparts = ['Port :' + d.vllm_port, 'Docker'];
+    if (d.arch) vparts.push(d.arch);
+    if (d.memory_gb) vparts.push(d.memory_gb + ' GB memory');
+    document.getElementById('vllm-engine-footer').textContent = vparts.join(' \u00b7 ');
   } catch(e) {
     document.getElementById('hdr-node').textContent = 'could not detect';
   }
@@ -1008,6 +1142,7 @@ function switchTab(name) {
   activeTab = name;
   if (name === 'litellm') { loadLiteLLMModels(); loadLiteLLMConfig(); checkWildcard(); }
   if (name === 'sglang')  { loadSGLangStatus(); loadProfiles(); }
+  if (name === 'vllm')    { loadVLLMStatus(); loadVLLMProfiles(); }
   if (name === 'ollama')  { loadOllamaModels(); }
 }
 
@@ -1022,6 +1157,8 @@ async function pollStatus() {
       d.sglang.model ? 'SGLang · ' + d.sglang.model.split('/').pop().slice(0,18) : 'SGLang');
     setPill('pill-ollama', d.ollama.ok, 'Ollama');
     setPill('pill-litellm', d.litellm.ok, 'LiteLLM');
+    setPill('pill-vllm', d.vllm.ok,
+      d.vllm.model ? 'vLLM · ' + d.vllm.model.split('/').pop().slice(0,18) : 'vLLM');
   } catch(e) {}
 }
 
@@ -1333,6 +1470,124 @@ async function startSGLang() {
         clearInterval(poll);
         toast('✓ SGLang is ready!', 'ok');
         prog.classList.remove('show');
+      }
+    }, 20000);
+  } catch(e) {
+    toast('Start failed: ' + e.message, 'err');
+    prog.classList.remove('show');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Start Selected';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vLLM
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadVLLMStatus() {
+  try {
+    const d = await apiFetch('/api/vllm/status');
+    const led   = document.getElementById('vllm-engine-led');
+    const title = document.getElementById('vllm-engine-title');
+    const model = document.getElementById('vllm-engine-model');
+    const card  = document.getElementById('vllm-engine-card');
+    const stop  = document.getElementById('vllm-stop-btn');
+
+    if (d.running) {
+      led.className = 'engine-led on';
+      title.textContent = 'vLLM — Running';
+      model.textContent = d.model || 'Model loading…';
+      card.classList.add('online');
+      stop.disabled = false;
+    } else {
+      led.className = 'engine-led';
+      title.textContent = 'vLLM — Stopped';
+      model.textContent = '';
+      card.classList.remove('online');
+      stop.disabled = true;
+    }
+  } catch(e) {}
+}
+
+async function loadVLLMProfiles() {
+  const el = document.getElementById('vllm-profile-list');
+  try {
+    const profiles = await apiFetch('/api/vllm/profiles');
+    if (!profiles.length) {
+      el.innerHTML = '<div class="empty"><div class="empty-text">No vLLM profiles defined — add them to <code style="font-family:var(--mono);color:var(--amber);font-size:11px">~/model-manager/vllm_profiles.json</code></div></div>';
+      return;
+    }
+    if (!selectedVLLMProfile) selectedVLLMProfile = profiles[0].id;
+    renderVLLMProfiles(profiles);
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+  }
+}
+
+function renderVLLMProfiles(profiles) {
+  document.getElementById('vllm-profile-list').innerHTML = profiles.map(p => `
+    <div class="profile-item ${selectedVLLMProfile === p.id ? 'selected' : ''}"
+         onclick="selectVLLMProfile('${p.id}', this)">
+      <div class="p-radio"></div>
+      <div class="p-info">
+        <div class="p-name">${p.name}</div>
+        <div class="p-desc">${p.description}</div>
+      </div>
+      <div class="p-vram">${p.vram_gb} GB</div>
+    </div>
+  `).join('');
+}
+
+function selectVLLMProfile(id, el) {
+  selectedVLLMProfile = id;
+  document.querySelectorAll('#vllm-profile-list .profile-item').forEach(p => p.classList.remove('selected'));
+  el.classList.add('selected');
+}
+
+async function stopVLLM() {
+  if (!confirm('Stop vLLM? This will interrupt any active inference requests.')) return;
+  const btn = document.getElementById('vllm-stop-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div>';
+  try {
+    const d = await apiFetch('/api/vllm/stop', 'POST');
+    toast(d.ok ? '✓ vLLM stopped' : 'Stop may have failed: ' + d.output, d.ok ? 'ok' : 'err');
+    setTimeout(() => { loadVLLMStatus(); btn.innerHTML = '■ Stop'; }, 1500);
+  } catch(e) {
+    toast('Error: ' + e.message, 'err');
+    btn.innerHTML = '■ Stop';
+  }
+}
+
+async function startVLLM() {
+  if (!selectedVLLMProfile) { toast('Select a profile first', 'err'); return; }
+  const btn  = document.getElementById('vllm-start-btn');
+  const prog = document.getElementById('vllm-progress');
+  const log  = document.getElementById('vllm-log');
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Launching…';
+  prog.classList.add('show');
+  log.textContent = 'Sending start command…';
+
+  try {
+    const d = await apiFetch('/api/vllm/start', 'POST', {profile: selectedVLLMProfile});
+    toast('✓ vLLM starting — may take a few minutes', 'ok');
+    log.textContent = d.message + '\n\nPolling status every 20 seconds…';
+
+    const poll = setInterval(async () => {
+      await loadVLLMStatus();
+      const led = document.getElementById('vllm-engine-led');
+      if (led.classList.contains('on')) {
+        const model = document.getElementById('vllm-engine-model');
+        if (model.textContent && model.textContent !== 'Model loading…') {
+          clearInterval(poll);
+          toast('✓ vLLM is ready!', 'ok');
+          prog.classList.remove('show');
+        } else {
+          log.textContent = d.message + '\n\nContainer running — model still loading…';
+        }
       }
     }, 20000);
   } catch(e) {
