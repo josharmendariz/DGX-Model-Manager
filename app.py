@@ -220,6 +220,14 @@ async def get_nodeinfo():
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
+@app.get("/api/scriptdirs")
+async def get_scriptdirs():
+    return {
+        "sglang": str(SGLANG_SCRIPT_DIR),
+        "vllm":   str(VLLM_SCRIPT_DIR),
+    }
+
+
 @app.get("/api/ollama/models")
 async def list_ollama_models():
     try:
@@ -1069,7 +1077,7 @@ body::before{
     <div class="tab" id="tab-sglang">
       <div class="page-hdr">
         <div class="page-title">SGLang Engine</div>
-        <div class="page-sub">SGLang loads one large model at a time. ~5 min warm-up. Select a profile and start it below — status updates automatically.</div>
+        <div class="page-sub">SGLang loads one large model at a time. ~5 min warm-up. Profiles are auto-detected from <code style="font-family:var(--mono);color:var(--amber);font-size:12px" id="sglang-script-dir">~/SGLang/</code> — add a <code style="font-family:var(--mono);color:var(--amber);font-size:12px">start_*.sh</code> script there to make it appear below.</div>
       </div>
 
       <div class="engine-card" id="engine-card">
@@ -1084,6 +1092,13 @@ body::before{
           </div>
         </div>
         <div class="engine-footer" id="engine-footer">loading…</div>
+      </div>
+
+      <div style="margin-bottom:12px;padding:12px 16px;background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.22);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.8">
+        <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="sglang-script-dir-banner">~/SGLang/</span></div>
+        Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
+        Name, description, and VRAM are read from optional header comments in the script:<br>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 119B NVFP4 &nbsp;·&nbsp; # VRAM: 119</code>
       </div>
 
       <div class="sec-label">Profiles</div>
@@ -1106,7 +1121,7 @@ body::before{
     <div class="tab" id="tab-vllm">
       <div class="page-hdr">
         <div class="page-title">vLLM Engine</div>
-        <div class="page-sub">vLLM loads one large model at a time via Docker. Select a profile and start it below — status updates automatically.</div>
+        <div class="page-sub">vLLM loads one large model at a time via Docker. Profiles are auto-detected from <code style="font-family:var(--mono);color:var(--amber);font-size:12px">~/vLLM/</code> — add a <code style="font-family:var(--mono);color:var(--amber);font-size:12px">start_*.sh</code> script there to make it appear below.</div>
       </div>
 
       <div class="engine-card" id="vllm-engine-card">
@@ -1121,6 +1136,13 @@ body::before{
           </div>
         </div>
         <div class="engine-footer" id="vllm-engine-footer">loading…</div>
+      </div>
+
+      <div style="margin-bottom:12px;padding:12px 16px;background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.22);border-radius:8px;font-size:12px;color:var(--muted);line-height:1.8">
+        <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="vllm-script-dir-banner">~/vLLM/</span></div>
+        Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
+        Name, description, and VRAM are read from optional header comments in the script:<br>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 49B BF16 &nbsp;·&nbsp; # VRAM: 97</code>
       </div>
 
       <div class="sec-label">Profiles</div>
@@ -1162,8 +1184,23 @@ document.addEventListener('DOMContentLoaded', () => {
   pollStatus();
   loadOllamaModels();
   loadNodeInfo();
+  loadScriptDirs();
   statusTimer = setInterval(pollStatus, 12000);
 });
+
+async function loadScriptDirs() {
+  try {
+    const d = await apiFetch('/api/scriptdirs');
+    ['sglang-script-dir-banner'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = d.sglang + '/';
+    });
+    ['vllm-script-dir-banner'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = d.vllm + '/';
+    });
+  } catch(e) {}
+}
 
 async function loadNodeInfo() {
   try {

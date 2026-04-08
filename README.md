@@ -91,40 +91,40 @@ Edit `config.json` before running setup. All fields have sensible defaults.
 
 ---
 
-## SGLang Profiles
+## SGLang Scripts
 
-SGLang profiles define startup configurations for large models. Edit `sglang_profiles.json` to match your setup:
+Place your SGLang startup scripts in `~/SGLang/`. Any file named `start_*.sh` is automatically discovered and listed as a profile in the SGLang tab — no JSON editing required.
 
-```json
-[
-  {
-    "id": "my-model",
-    "name": "My Model Name",
-    "script": "~/sglang/start_my_model.sh",
-    "description": "70B model · ~45 GB VRAM · ~5 min warm-up",
-    "vram_gb": 45
-  }
-]
+```
+~/SGLang/
+  start_mistral_small4.sh
+  start_qwen3_70b.sh
+  ...
 ```
 
-Each profile points to a shell script that launches the SGLang Docker container. Add as many profiles as you have models — they'll all appear in the SGLang tab as selectable options.
-
-### Example SGLang start script
+Add optional header comments to control what the profile card displays:
 
 ```bash
 #!/usr/bin/env bash
+# Name: Mistral Small 4
+# Description: 119B NVFP4 · ~5 min warm-up
+# VRAM: 119
+
 sudo docker run --rm --gpus all --ipc=host \
-  --name sglang \
+  --name my-sglang-container \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
   -p 30000:30000 \
   lmsysorg/sglang:nightly-dev-cu13 \
   python3 -m sglang.launch_server \
-    --model-path /root/.cache/huggingface/hub/models--your-org--your-model/snapshots/main \
+    --model-path /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
+    --quantization modelopt_fp4 \
     --host 0.0.0.0 \
     --port 30000 \
-    --attention-backend triton \
     --tool-call-parser mistral
 ```
+
+The `setup.sh` script creates `~/SGLang/` and drops an annotated example script there to use as a starting point.
 
 > **GB10 / SM121A note:** The GB10 uses the `sm_121a` architecture which older bundled `ptxas` versions don't recognise. Two workarounds are available:
 >
@@ -141,40 +141,39 @@ sudo docker run --rm --gpus all --ipc=host \
 
 ---
 
-## vLLM Profiles
+## vLLM Scripts
 
-![vLLM Tab](misc/vllm-tab.png)
+Place your vLLM startup scripts in `~/vLLM/`. Any file named `start_*.sh` is automatically discovered and listed as a profile in the vLLM tab. The container can be named anything — the app identifies it by port.
 
-vLLM profiles work identically to SGLang profiles. Edit `vllm_profiles.json` to define your startup configurations:
-
-```json
-[
-  {
-    "id": "my-model",
-    "name": "My Model Name",
-    "script": "~/vllm/start_my_model.sh",
-    "description": "70B model · ~45 GB VRAM · ~5 min warm-up",
-    "vram_gb": 45
-  }
-]
+```
+~/vLLM/
+  start_nemotron3super_vllm.sh
+  start_llama3_70b.sh
+  ...
 ```
 
-Each profile points to a shell script that launches the vLLM Docker container. The container **must be named `vllm`** so the app can detect and control it.
-
-### Example vLLM start script
+Same header comment format as SGLang:
 
 ```bash
 #!/usr/bin/env bash
+# Name: Nemotron 3 Super
+# Description: 49B BF16 · Nvidia flagship · ~5 min warm-up
+# VRAM: 97
+
 sudo docker run --rm --gpus all --ipc=host \
-  --name vllm \
+  --name my-vllm-container \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
   vllm/vllm-openai:latest \
-  --model /root/.cache/huggingface/hub/models--your-org--your-model/snapshots/main \
+  --model /root/.cache/huggingface/hub/models--nvidia--Nemotron-Super-49B-v1/snapshots/main \
   --host 0.0.0.0 \
   --port 8000 \
-  --tensor-parallel-size 1
+  --tensor-parallel-size 1 \
+  --tool-call-parser mistral \
+  --enable-auto-tool-choice
 ```
+
+The `setup.sh` script creates `~/vLLM/` and drops an annotated example script there to use as a starting point.
 
 ### Common vLLM flags
 
@@ -278,6 +277,30 @@ SGLang and vLLM serve the same role — high-performance inference for large mod
 
 ---
 
+## Model Recommendations for DGX Spark (128 GB)
+
+### With a large-model engine running (~31 GB available for Ollama)
+
+This applies whether you're running SGLang or vLLM as your primary engine.
+
+| Model | Pull Name | Size | Use Case |
+|-------|-----------|------|----------|
+| Qwen2.5 Coder 32B | `qwen2.5-coder:32b` | ~20 GB | Coding |
+| QwQ 32B | `qwq:32b` | ~20 GB | Reasoning |
+| Phi-4 | `phi4` | ~8 GB | General, fast |
+| DeepSeek-R1 14B | `deepseek-r1:14b` | ~9 GB | Reasoning |
+| Nomic Embed | `nomic-embed-text` | <1 GB | Embeddings/RAG |
+
+### With engines stopped (full 128 GB)
+
+| Model | Pull Name | Size | Use Case |
+|-------|-----------|------|----------|
+| Qwen3 Coder Next | `qwen3-coder-next` | ~54 GB | Agentic coding, 256K context |
+| DeepSeek-R1 70B | `deepseek-r1:70b` | ~43 GB | Heavy reasoning |
+| Qwen2.5 72B | `qwen2.5:72b` | ~45 GB | General, large |
+
+---
+
 ## SGLang vs vLLM — Which Should I Use?
 
 Both engines are excellent. Here's a quick comparison to help you decide:
@@ -289,7 +312,7 @@ Both engines are excellent. Here's a quick comparison to help you decide:
 | **Default port** | 30000 | 8000 |
 | **API format** | OpenAI-compatible (`/v1/`) | OpenAI-compatible (`/v1/`) |
 | **Tool calling** | `--tool-call-parser` | `--tool-call-parser` + `--enable-auto-tool-choice` |
-| **Container name** | `sglang` (expected by app) | `vllm` (expected by app) |
+| **Container name** | Any (detected by port :30000) | Any (detected by port :8000) |
 
 Both expose the same OpenAI-compatible API, so your apps don't need to change when switching between them. LiteLLM routes to either one the same way.
 

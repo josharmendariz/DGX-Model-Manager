@@ -6,6 +6,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.0.6] - 2026-04-08
+
+### Added
+
+- **Auto-scan script directories** — SGLang and vLLM profiles are now discovered automatically by scanning `~/SGLang/start_*.sh` and `~/vLLM/start_*.sh`. No JSON profile files to edit. Drop a script in the folder and it appears in the UI on next page load.
+
+- **Script header metadata** — profile name, description, and VRAM are read from optional comments in the first 20 lines of each script (`# Name:`, `# Description:`, `# VRAM:`). If omitted, the name is derived from the filename and VRAM shows as `—`.
+
+- **Script directory banner** — both the SGLang and vLLM tabs now display a persistent info banner above the profile list showing the exact script directory path (`/home/<user>/SGLang/` and `/home/<user>/vLLM/`), resolved at runtime via a new `/api/scriptdirs` endpoint.
+
+- **Example scripts created by setup** — `setup.sh` now creates `~/SGLang/` and `~/vLLM/` directories and writes a heavily-commented example `start_*.sh` into each, only if no scripts already exist. Includes GB10/SM121A notes and common flags.
+
+- **Container-agnostic stop** — SGLang and vLLM stop endpoints now find the running container by port (`docker ps --filter publish=<port>`) instead of by name. Container names in startup scripts are no longer constrained.
+
+- **Container-agnostic status** — SGLang and vLLM status endpoints now use the HTTP `/health` endpoint as the source of truth for `running`, matching the behaviour of the top-bar status pills. `docker ps` is retained for `container_info` only.
+
+### Fixed
+
+- **Ollama tab broken after scriptdirs addition** — missing `@app.get` decorator on `list_ollama_models` caused a 405 Method Not Allowed error on the Ollama tab.
+
+### Changed
+
+- **`sglang_profiles.json` and `vllm_profiles.json` removed** — replaced entirely by the auto-scan approach. Existing installs can delete these files.
+- **Docs and README updated** — all profile setup instructions rewritten to reflect the script-directory workflow. Container naming requirement removed from vLLM docs.
+
+---
+
 ## [0.0.5] - 2026-04-07
 
 ### Added
@@ -23,7 +50,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - **config.json** — added `services.vllm_base` field (default `http://127.0.0.1:8000`).
-- **docs.html** — added vLLM Engine tab guide (section 05), vLLM Profiles reference (section 09), vLLM troubleshooting entries. Architecture diagram updated to three backends. Model recommendation badges made engine-agnostic.
 - **`/api/status`** — now includes `vllm` key with `ok` and `model` fields.
 - **`/api/nodeinfo`** — now includes `vllm_port`.
 

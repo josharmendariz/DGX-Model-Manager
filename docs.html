@@ -678,7 +678,7 @@ qwen2.5:32b-instruct-q4_K_M
       <p>SGLang is the high-performance inference engine for large models. It loads one model at a time into the GB10 unified memory pool. Unlike Ollama, model swaps require a full restart (~5 minutes).</p>
 
       <h3>Status Card</h3>
-      <p>The green LED and top bar glow indicate SGLang is running and responsive. The model name shown is pulled live from <code>:30000/v1/models</code>. The Stop button sends <code>docker stop sglang</code>.</p>
+      <p>The green LED and top bar glow indicate SGLang is running and responsive. The model name shown is pulled live from <code>:30000/v1/models</code>. Status is detected via the <code>/health</code> endpoint — the container can be named anything.</p>
 
       <div class="callout warn">
         <div class="callout-label">Stop before starting</div>
@@ -686,23 +686,21 @@ qwen2.5:32b-instruct-q4_K_M
       </div>
 
       <h3>Profiles</h3>
-      <p>Profiles are pre-defined startup configurations stored in <code>~/model-manager/sglang_profiles.json</code>. Each profile points to a shell script that starts SGLang with the right flags for that model.</p>
+      <p>Profiles are automatically discovered from your <code>~/SGLang/</code> directory. Any file matching <code>start_*.sh</code> is listed as a selectable profile — no JSON editing required. The UI re-scans on every page load so new scripts appear immediately.</p>
+
+      <p>To control what the profile card displays, add optional header comments to the first 20 lines of your script:</p>
 
       <div class="code-wrap">
-        <div class="code-header"><span class="code-title">~/model-manager/sglang_profiles.json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <div class="code-body">[
-  {
-    <span class="cv">"id"</span>:          <span class="cs">"mistral-small-4"</span>,
-    <span class="cv">"name"</span>:        <span class="cs">"Mistral Small 4 · 119B NVFP4"</span>,
-    <span class="cv">"script"</span>:      <span class="cs">"~/SGLang/start_sglang.sh"</span>,
-    <span class="cv">"description"</span>: <span class="cs">"Primary flagship · ~97 GB VRAM · ~5 min warm-up"</span>,
-    <span class="cv">"vram_gb"</span>:     <span class="ca">97</span>,
-    <span class="cv">"model_path"</span>:  <span class="cs">"~/.cache/huggingface/hub/..."</span>
-  }
-]</div>
+        <div class="code-header"><span class="code-title">~/SGLang/start_mistral_small4.sh — header comments</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># Name: Mistral Small 4</span>
+<span class="cm"># Description: 119B NVFP4 · ~5 min warm-up</span>
+<span class="cm"># VRAM: 119</span>
+<span class="cm">#</span>
+<span class="cm"># ... rest of your launch command ...</span></div>
       </div>
 
-      <p>To add a new profile for a different large model, duplicate the block, give it a unique <code>id</code>, and point <code>script</code> at a new startup script. The profile will appear in the UI immediately on next page load.</p>
+      <p>If no header comments are present the name is derived from the filename (<code>start_mistral_small4.sh</code> → <em>Mistral Small4</em>) and VRAM shows as <code>—</code>.</p>
 
       <h3>Starting a Profile</h3>
       <p>Select a profile and click Start. The start script runs in the background — the app polls SGLang's <code>/health</code> endpoint every 20 seconds and updates the status card when it comes online. Expect 3–7 minutes for large models.</p>
@@ -716,15 +714,20 @@ qwen2.5:32b-instruct-q4_K_M
       <p>vLLM is a high-performance inference engine and an alternative to SGLang. Like SGLang, it loads one model at a time and runs as a Docker container. The vLLM tab works identically to the SGLang tab — same profile system, same status polling, same start/stop workflow.</p>
 
       <h3>Status Card</h3>
-      <p>The green LED and top bar glow indicate vLLM is running and responsive. The model name is pulled live from <code>:8000/v1/models</code>. The Stop button sends <code>docker stop vllm</code>.</p>
-
-      <div class="callout warn">
-        <div class="callout-label">Container naming</div>
-        <p>Your vLLM start script must name the container <code>vllm</code> (i.e. <code>--name vllm</code>) for the app to detect and control it. This mirrors the SGLang convention where the container must be named <code>sglang</code>.</p>
-      </div>
+      <p>The green LED and top bar glow indicate vLLM is running and responsive. The model name is pulled live from <code>:8000/v1/models</code>. Status is detected via the <code>/health</code> endpoint — the container can be named anything. The Stop button finds the running container by port, so it works regardless of the container name in your script.</p>
 
       <h3>Profiles</h3>
-      <p>Profiles are stored in <code>~/model-manager/vllm_profiles.json</code>. Each profile points to a shell script that starts vLLM with the right flags for that model. See the <a href="#vllm-profiles" style="color:var(--amber)">vLLM Profiles</a> reference section for the full format and example scripts.</p>
+      <p>Profiles are automatically discovered from your <code>~/vLLM/</code> directory. Any file matching <code>start_*.sh</code> is listed as a selectable profile. The same optional header comments work as with SGLang:</p>
+
+      <div class="code-wrap">
+        <div class="code-header"><span class="code-title">~/vLLM/start_nemotron3super_vllm.sh — header comments</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># Name: Nemotron 3 Super</span>
+<span class="cm"># Description: 49B BF16 · Nvidia flagship · ~5 min warm-up</span>
+<span class="cm"># VRAM: 97</span>
+<span class="cm">#</span>
+<span class="cm"># ... rest of your launch command ...</span></div>
+      </div>
 
       <h3>Starting a Profile</h3>
       <p>Select a profile and click Start. The start script runs in the background — the app polls vLLM's <code>/health</code> endpoint every 20 seconds and updates the status card when it comes online. The ready toast only fires once the model is actually serving, not just when the container starts.</p>
@@ -886,30 +889,52 @@ deepseek-ai/DeepSeek-V3</div>
       <div class="eyebrow">08 — Reference</div>
       <h2>Adding SGLang Profiles</h2>
 
-      <p>When you download a new large model via the HF tab and want to serve it through SGLang, the process is:</p>
+      <p>There is no JSON file to edit. The app auto-scans <code>~/SGLang/</code> for any file named <code>start_*.sh</code> and presents each one as a selectable profile. Adding a new profile is just adding a new script.</p>
 
       <div class="steps">
         <div class="step">
           <div class="step-num">1</div>
           <div class="step-body">
-            <div class="step-title">Create a startup script</div>
-            <div class="step-desc">Copy <code>~/SGLang/start_sglang.sh</code>, rename it for the new model, and change the model path and any flags (e.g. <code>--tool-call-parser</code> may differ per model family).</div>
+            <div class="step-title">Create a startup script in ~/SGLang/</div>
+            <div class="step-desc">Copy the example script placed there by setup, rename it for your model (e.g. <code>start_qwen3_70b.sh</code>), and update the model path and flags. The filename must start with <code>start_</code>.</div>
           </div>
         </div>
         <div class="step">
           <div class="step-num">2</div>
           <div class="step-body">
-            <div class="step-title">Add a profile block to sglang_profiles.json</div>
-            <div class="step-desc">Edit <code>~/model-manager/sglang_profiles.json</code> and add a new object with a unique <code>id</code>, <code>name</code>, <code>script</code> path, <code>description</code>, and <code>vram_gb</code>.</div>
+            <div class="step-title">Add header comments (optional but recommended)</div>
+            <div class="step-desc">Add <code># Name:</code>, <code># Description:</code>, and <code># VRAM:</code> comments in the first 20 lines. These control what the profile card displays in the UI.</div>
           </div>
         </div>
         <div class="step">
           <div class="step-num">3</div>
           <div class="step-body">
             <div class="step-title">Reload the SGLang tab</div>
-            <div class="step-desc">The new profile appears in the profile selector immediately. No app restart needed.</div>
+            <div class="step-desc">The new profile appears in the selector immediately. No app restart, no JSON editing.</div>
           </div>
         </div>
+      </div>
+
+      <h3>Example SGLang Script</h3>
+
+      <div class="code-wrap">
+        <div class="code-header"><span class="code-title">~/SGLang/start_mistral_small4.sh</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># Name: Mistral Small 4</span>
+<span class="cm"># Description: 119B NVFP4 · ~5 min warm-up</span>
+<span class="cm"># VRAM: 119</span>
+sudo docker run --rm --gpus all --ipc=host \
+  --name my-sglang-container \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+  -p 30000:30000 \
+  lmsysorg/sglang:nightly-dev-cu13 \
+  python3 -m sglang.launch_server \
+    --model-path /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
+    --quantization modelopt_fp4 \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --tool-call-parser mistral</div>
       </div>
 
       <h3>SGLang Flags by Model Family</h3>
@@ -943,62 +968,51 @@ deepseek-ai/DeepSeek-V3</div>
       <div class="eyebrow">09 — Reference</div>
       <h2>Adding vLLM Profiles</h2>
 
-      <p>vLLM profiles work identically to SGLang profiles. When you download a new large model via the HF tab and want to serve it through vLLM:</p>
+      <p>vLLM profiles work the same way as SGLang profiles. The app auto-scans <code>~/vLLM/</code> for any file named <code>start_*.sh</code>. No JSON editing required.</p>
 
       <div class="steps">
         <div class="step">
           <div class="step-num">1</div>
           <div class="step-body">
-            <div class="step-title">Create a startup script</div>
-            <div class="step-desc">Write a shell script that runs <code>docker run --name vllm ...</code> with the correct model path and flags. The container <strong>must</strong> be named <code>vllm</code>.</div>
+            <div class="step-title">Create a startup script in ~/vLLM/</div>
+            <div class="step-desc">Copy the example script placed there by setup, rename it (e.g. <code>start_nemotron3super_vllm.sh</code>), and update the model path and flags. The container can be named anything — the app finds it by port.</div>
           </div>
         </div>
         <div class="step">
           <div class="step-num">2</div>
           <div class="step-body">
-            <div class="step-title">Add a profile block to vllm_profiles.json</div>
-            <div class="step-desc">Edit <code>~/model-manager/vllm_profiles.json</code> and add a new object with a unique <code>id</code>, <code>name</code>, <code>script</code> path, <code>description</code>, and <code>vram_gb</code>.</div>
+            <div class="step-title">Add header comments (optional but recommended)</div>
+            <div class="step-desc">Add <code># Name:</code>, <code># Description:</code>, and <code># VRAM:</code> in the first 20 lines to control the profile card display.</div>
           </div>
         </div>
         <div class="step">
           <div class="step-num">3</div>
           <div class="step-body">
             <div class="step-title">Reload the vLLM tab</div>
-            <div class="step-desc">The new profile appears in the profile selector immediately. No app restart needed.</div>
+            <div class="step-desc">The new profile appears in the selector immediately. No app restart needed.</div>
           </div>
         </div>
-      </div>
-
-      <h3>Example vLLM Profile</h3>
-
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">~/model-manager/vllm_profiles.json</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <div class="code-body">[
-  {
-    <span class="cv">"id"</span>:          <span class="cs">"llama3-70b"</span>,
-    <span class="cv">"name"</span>:        <span class="cs">"Llama 3.3 70B Instruct"</span>,
-    <span class="cv">"script"</span>:      <span class="cs">"~/vllm/start_llama3_70b.sh"</span>,
-    <span class="cv">"description"</span>: <span class="cs">"Meta flagship · BF16 · ~140 GB · ~7 min warm-up"</span>,
-    <span class="cv">"vram_gb"</span>:     <span class="ca">140</span>,
-    <span class="cv">"model_path"</span>:  <span class="cs">"~/.cache/huggingface/hub/..."</span>
-  }
-]</div>
       </div>
 
       <h3>Example vLLM Start Script</h3>
 
       <div class="code-wrap">
-        <div class="code-header"><span class="code-title">~/vllm/start_llama3_70b.sh</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+        <div class="code-header"><span class="code-title">~/vLLM/start_nemotron3super_vllm.sh</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
         <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+<span class="cm"># Name: Nemotron 3 Super</span>
+<span class="cm"># Description: 49B BF16 · Nvidia flagship · ~5 min warm-up</span>
+<span class="cm"># VRAM: 97</span>
 sudo docker run --rm --gpus all --ipc=host \
-  --name <span class="ca">vllm</span> \
+  --name my-vllm-container \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
   vllm/vllm-openai:latest \
-  --model /root/.cache/huggingface/hub/models--meta-llama--Llama-3.3-70B-Instruct/snapshots/main \
+  --model /root/.cache/huggingface/hub/models--nvidia--Nemotron-Super-49B-v1/snapshots/main \
   --host 0.0.0.0 \
   --port 8000 \
-  --tensor-parallel-size 1</div>
+  --tensor-parallel-size 1 \
+  --tool-call-parser mistral \
+  --enable-auto-tool-choice</div>
       </div>
 
       <h3>Common vLLM Flags</h3>
