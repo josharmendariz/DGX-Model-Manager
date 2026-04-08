@@ -31,6 +31,8 @@ LITELLM_CONFIG   = Path(os.path.expanduser("~/litellm/litellm_config.yaml"))
 HOME             = Path.home()
 SGLANG_SCRIPT_DIR = HOME / "SGLang"
 VLLM_SCRIPT_DIR   = HOME / "vLLM"
+HF_CACHE_DIR      = HOME / ".cache" / "huggingface" / "hub"
+CUSTOM_DIRS_FILE  = Path(os.path.expanduser("~/model-manager/custom_dirs.json"))
 
 # Load app config
 _CONFIG_FILE = Path(os.path.expanduser("~/model-manager/config.json"))
@@ -158,6 +160,436 @@ def scan_vllm_profiles() -> list:
     if not VLLM_SCRIPT_DIR.exists():
         return []
     return [_parse_script_meta(s) for s in sorted(VLLM_SCRIPT_DIR.glob("start_*.sh"))]
+
+# ─── HF Inventory helpers ──────────────────────────────────────────────────────
+
+def _load_custom_dirs() -> list:
+    if CUSTOM_DIRS_FILE.exists():
+        try:
+            return json.loads(CUSTOM_DIRS_FILE.read_text())
+        except Exception:
+            pass
+    return []
+
+def _save_custom_dirs(dirs: list) -> None:
+    CUSTOM_DIRS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CUSTOM_DIRS_FILE.write_text(json.dumps(dirs))
+
+def _dir_size_gb(path: Path) -> float:
+    try:
+        total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        return round(total / 1e9, 2)
+    except Exception:
+        return 0.0
+
+import re as _re
+
+# ── Name-token tables ─────────────────────────────────────────────────────────
+# Checked in order; most-specific entries must come first.
+_NAME_DTYPE_TOKENS: list[tuple[str, str]] = [
+    # Exact tokens after splitting on [-_. ]
+    ("nvfp4",    "FP4"),  ("fp4",      "FP4"),
+    ("fp8e4m3",  "FP8"),  ("fp8e5m2",  "FP8"),  ("fp8",  "FP8"),
+    ("bfloat16", "BF16"), ("bf16",     "BF16"),
+    ("float16",  "FP16"), ("fp16",     "FP16"),  ("f16",  "FP16"),
+    ("float32",  "FP32"), ("fp32",     "FP32"),  ("f32",  "FP32"),
+    ("awq",      "INT4"), ("gptq",     "INT4"),  ("bnb4", "INT4"),
+    ("int4",     "INT4"), ("q4",       "INT4"),
+    ("int8",     "INT8"), ("q8",       "INT8"),
+    ("gguf",     "GGUF"),
+]
+
+_NAME_REASONING_TOKENS: frozenset[str] = frozenset({
+    "r1", "qwq", "thinking", "cot", "reasoning",
+    "reflect", "deepthink", "thinker", "o1",
+})
+
+_NAME_VISION_TOKENS: frozenset[str] = frozenset({
+    "vl", "vision", "visual", "pixtral", "llava", "cogvlm",
+    "idefics", "flamingo", "qwenvl", "internvl", "phi4mm",
+})
+# Substrings that don't tokenise cleanly but signal vision
+_NAME_VISION_SUBSTR: tuple[str, ...] = (
+    "llava", "qwen-vl", "cogvlm", "phi-4-mm", "internvl",
+)
+
+_NAME_AUDIO_TOKENS: frozenset[str] = frozenset({
+    "audio", "whisper", "speech", "asr", "voice", "tts",
+})
+
+_NAME_EMBED_TOKENS: frozenset[str] = frozenset({
+    "embed", "embedding", "embeddings",
+    "e5", "bge", "gte", "nomic", "mxbai",
+})
+
+_NAME_MOE_TOKENS: frozenset[str] = frozenset({"moe", "mixture"})
+
+_KNOWN_MOE_MODEL_TYPES: frozenset[str] = frozenset({
+    "qwen2_moe", "mixtral", "deepseek_v2", "deepseek_v3",
+    "olmoe", "phimoe", "jetmoe",
+})
+
+
+def _tokenize(name: str) -> frozenset[str]:
+    """Split model name into lowercase tokens on -, _, ., space."""
+    return frozenset(_re.split(r"[-_.\s]+", name.lower()))
+
+
+def _infer_from_name(model_name: str) -> dict:
+    """
+    Last-resort inference from model name tokens and substrings.
+
+    Returns a dict with keys:
+      dtype            str | None   — e.g. "FP4", "BF16"
+      is_moe           bool | None  — True if MoE signal found; None = no signal
+      is_reasoning     bool | None
+      extra_modalities list[str]    — e.g. ["Image", "Embedding"]
+      params_b         float | None — parameter count in billions
+    """
+    tokens = _tokenize(model_name)
+    name_lower = model_name.lower()
+
+    # ── Dtype ────────────────────────────────────────────────────────────────
+    dtype = None
+    for tok, d in _NAME_DTYPE_TOKENS:
+        if tok in tokens:
+            dtype = d
+            break
+    # GGUF-style quant suffixes:  Q4_K_M, Q5_K_S, IQ3_XXS …
+    if dtype is None:
+        m = _re.search(r"\bq(\d)_k_[a-z]+\b", name_lower)
+        if m:
+            dtype = "INT4" if int(m.group(1)) <= 4 else "INT8"
+        elif _re.search(r"\biq\d", name_lower):
+            dtype = "INT4"
+
+    # ── MoE ──────────────────────────────────────────────────────────────────
+    is_moe: Optional[bool] = None
+    if tokens & _NAME_MOE_TOKENS:
+        is_moe = True
+    # "235B-A22B" style (total params - active params) notation
+    elif _re.search(r"\d+b-?a\d+b", name_lower):
+        is_moe = True
+
+    # ── Reasoning ────────────────────────────────────────────────────────────
+    is_reasoning: Optional[bool] = None
+    if tokens & _NAME_REASONING_TOKENS:
+        is_reasoning = True
+
+    # ── Modalities ───────────────────────────────────────────────────────────
+    extra_modalities: list[str] = []
+    if (tokens & _NAME_VISION_TOKENS
+            or any(s in name_lower for s in _NAME_VISION_SUBSTR)):
+        extra_modalities.append("Image")
+    if tokens & _NAME_AUDIO_TOKENS:
+        extra_modalities.append("Audio")
+    if tokens & _NAME_EMBED_TOKENS:
+        extra_modalities.append("Embedding")
+
+    # ── Params ───────────────────────────────────────────────────────────────
+    params_b: Optional[float] = None
+    m2 = _re.search(r"(\d+(?:\.\d+)?)\s*[Bb](?:[^a-z]|$)", model_name)
+    if m2:
+        params_b = float(m2.group(1))
+
+    return {
+        "dtype":            dtype,
+        "is_moe":           is_moe,
+        "is_reasoning":     is_reasoning,
+        "extra_modalities": extra_modalities,
+        "params_b":         params_b,
+    }
+
+
+def _parse_hf_model_dir(model_dir: Path) -> dict:
+    """Parse a single HF cache model directory (models--owner--name)."""
+    stem = model_dir.name
+    if stem.startswith("models--"):
+        tail = stem[8:]
+        parts = tail.split("--", 1)
+        owner = parts[0] if len(parts) > 1 else ""
+        model_name = parts[1] if len(parts) > 1 else parts[0]
+    else:
+        owner = ""
+        model_name = stem
+    full_name = f"{owner}/{model_name}" if owner else model_name
+
+    # Pre-compute name-based inference — used as fallback throughout
+    name_hints = _infer_from_name(model_name)
+
+    # Find config.json inside snapshots/
+    config: dict = {}
+    snapshots_dir = model_dir / "snapshots"
+    snapshot_used: Optional[Path] = None
+    if snapshots_dir.exists():
+        for snap in sorted(snapshots_dir.iterdir()):
+            cfg_path = snap / "config.json"
+            if cfg_path.exists():
+                try:
+                    config = json.loads(cfg_path.read_text())
+                    snapshot_used = snap
+                    break
+                except Exception:
+                    pass
+
+    # ── Dtype ────────────────────────────────────────────────────────────────
+    raw_dtype = config.get("torch_dtype", "")
+    _dtype_map = {"float32": "FP32", "float16": "FP16", "bfloat16": "BF16",
+                  "float8":  "FP8",  "float4":  "FP4"}
+    dtype = _dtype_map.get(raw_dtype, raw_dtype.upper() if raw_dtype else None)
+
+    quant = config.get("quantization_config", {}) or {}
+    qt = str(quant.get("quant_type", quant.get("quant_method", ""))).lower()
+    bits = quant.get("bits", 0) or quant.get("num_bits", 0)
+    if "fp4" in qt or "nvfp4" in qt:
+        dtype = "FP4"
+    elif "fp8" in qt:
+        dtype = "FP8"
+    elif "int4" in qt or bits == 4:
+        dtype = "INT4"
+    elif "int8" in qt or bits == 8:
+        dtype = "INT8"
+    elif quant.get("load_in_4bit"):
+        dtype = "INT4"
+    elif quant.get("load_in_8bit"):
+        dtype = "INT8"
+
+    # Fallback: name-based dtype
+    if not dtype or dtype == "Unknown":
+        dtype = name_hints["dtype"] or "Unknown"
+
+    # ── Architecture / MoE ───────────────────────────────────────────────────
+    archs = config.get("architectures", [])
+    arch_str = " ".join(archs).lower()
+    is_moe = (
+        config.get("num_experts") is not None
+        or config.get("num_local_experts") is not None
+        or config.get("num_experts_per_tok") is not None
+        or "moe" in arch_str
+        or config.get("model_type", "").lower() in _KNOWN_MOE_MODEL_TYPES
+        # Fallback: name-based MoE signal
+        or bool(name_hints["is_moe"])
+    )
+
+    # ── Parameter count ───────────────────────────────────────────────────────
+    params_b: Optional[float] = None
+    if snapshot_used:
+        for idx_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            idx_path = snapshot_used / idx_name
+            if idx_path.exists():
+                try:
+                    idx = json.loads(idx_path.read_text())
+                    total_bytes = idx.get("metadata", {}).get("total_size", 0)
+                    if total_bytes:
+                        bytes_per = {"FP32": 4, "FP16": 2, "BF16": 2, "FP8": 1}.get(dtype, 2)
+                        params_b = round(total_bytes / bytes_per / 1e9, 1)
+                        break
+                except Exception:
+                    pass
+    # Fallback: name-based params
+    if params_b is None:
+        params_b = name_hints["params_b"]
+
+    # ── Size on disk (blobs dir avoids symlink double-counting) ───────────────
+    blobs_dir = model_dir / "blobs"
+    if blobs_dir.exists():
+        try:
+            size_gb = round(
+                sum(f.stat().st_size for f in blobs_dir.iterdir() if f.is_file()) / 1e9, 1
+            )
+        except Exception:
+            size_gb = _dir_size_gb(model_dir)
+    else:
+        size_gb = _dir_size_gb(model_dir)
+
+    # ── Reasoning ────────────────────────────────────────────────────────────
+    is_reasoning = (
+        # Config signals (rare but some models set this)
+        config.get("is_thinking", False)
+        # Fallback: name-based reasoning signal
+        or bool(name_hints["is_reasoning"])
+    )
+
+    # ── Modalities ───────────────────────────────────────────────────────────
+    modalities: list[str] = ["Text"]
+    has_vision = (
+        config.get("vision_config") is not None
+        or "vision" in arch_str
+        or "llava" in arch_str
+        or "Image" in name_hints["extra_modalities"]
+    )
+    has_audio = (
+        config.get("audio_config") is not None
+        or "audio" in arch_str
+        or "whisper" in arch_str
+        or "Audio" in name_hints["extra_modalities"]
+    )
+    has_embed = "Embedding" in name_hints["extra_modalities"]
+    if has_vision:
+        modalities.append("Image")
+    if has_audio:
+        modalities.append("Audio")
+    if has_embed:
+        modalities.append("Embedding")
+
+    # ── Script cross-reference ────────────────────────────────────────────────
+    name_lower = model_name.lower()
+    has_script = False
+    script_engine: Optional[str] = None
+    search_term = name_lower.replace("-", "_")
+    for profiles, engine_label in (
+        (scan_sglang_profiles(), "SGLang"),
+        (scan_vllm_profiles(), "vLLM"),
+    ):
+        for p in profiles:
+            try:
+                content = Path(p["script"]).read_text().lower()
+                if name_lower in content or search_term in content:
+                    has_script = True
+                    script_engine = engine_label
+                    break
+            except Exception:
+                pass
+        if has_script:
+            break
+
+    return {
+        "name":          model_name,
+        "owner":         owner,
+        "full_name":     full_name,
+        "dtype":         dtype,
+        "params_b":      params_b,
+        "model_arch":    "MoE" if is_moe else "Dense",
+        "size_gb":       size_gb,
+        "is_reasoning":  is_reasoning,
+        "has_script":    has_script,
+        "script_engine": script_engine,
+        "modalities":    modalities,
+    }
+
+
+def _parse_flat_model_dir(model_dir: Path) -> dict:
+    """Parse a flat model directory (not HF cache format) that contains config.json."""
+    model_name = model_dir.name
+    name_hints = _infer_from_name(model_name)
+
+    config: dict = {}
+    cfg_path = model_dir / "config.json"
+    if cfg_path.exists():
+        try:
+            config = json.loads(cfg_path.read_text())
+        except Exception:
+            pass
+
+    # ── Dtype ────────────────────────────────────────────────────────────────
+    raw_dtype = config.get("torch_dtype", "")
+    _dtype_map = {"float32": "FP32", "float16": "FP16", "bfloat16": "BF16"}
+    dtype = _dtype_map.get(raw_dtype, raw_dtype.upper() if raw_dtype else None)
+    quant = config.get("quantization_config", {}) or {}
+    qt = str(quant.get("quant_type", quant.get("quant_method", ""))).lower()
+    bits = quant.get("bits", 0) or quant.get("num_bits", 0)
+    if "fp4" in qt or "nvfp4" in qt:
+        dtype = "FP4"
+    elif "fp8" in qt:
+        dtype = "FP8"
+    elif "int4" in qt or bits == 4 or quant.get("load_in_4bit"):
+        dtype = "INT4"
+    elif "int8" in qt or bits == 8 or quant.get("load_in_8bit"):
+        dtype = "INT8"
+    if not dtype or dtype == "Unknown":
+        dtype = name_hints["dtype"] or "Unknown"
+
+    # ── Architecture / MoE ───────────────────────────────────────────────────
+    archs = config.get("architectures", [])
+    arch_str = " ".join(archs).lower()
+    is_moe = (
+        config.get("num_experts") is not None
+        or config.get("num_local_experts") is not None
+        or "moe" in arch_str
+        or config.get("model_type", "").lower() in _KNOWN_MOE_MODEL_TYPES
+        or bool(name_hints["is_moe"])
+    )
+
+    # ── Params, size ─────────────────────────────────────────────────────────
+    params_b = name_hints["params_b"]
+    size_gb = _dir_size_gb(model_dir)
+
+    # ── Reasoning ────────────────────────────────────────────────────────────
+    is_reasoning = config.get("is_thinking", False) or bool(name_hints["is_reasoning"])
+
+    # ── Modalities ───────────────────────────────────────────────────────────
+    modalities: list[str] = ["Text"]
+    if (config.get("vision_config") or "vision" in arch_str
+            or "Image" in name_hints["extra_modalities"]):
+        modalities.append("Image")
+    if (config.get("audio_config") or "audio" in arch_str
+            or "Audio" in name_hints["extra_modalities"]):
+        modalities.append("Audio")
+    if "Embedding" in name_hints["extra_modalities"]:
+        modalities.append("Embedding")
+
+    # ── Script cross-reference ────────────────────────────────────────────────
+    name_lower = model_name.lower()
+    has_script = False
+    script_engine = None
+    for profiles, engine_label in (
+        (scan_sglang_profiles(), "SGLang"),
+        (scan_vllm_profiles(), "vLLM"),
+    ):
+        for p in profiles:
+            try:
+                content = Path(p["script"]).read_text().lower()
+                if name_lower in content or name_lower.replace("-", "_") in content:
+                    has_script = True
+                    script_engine = engine_label
+                    break
+            except Exception:
+                pass
+        if has_script:
+            break
+
+    return {
+        "name":          model_name,
+        "owner":         "",
+        "full_name":     model_name,
+        "dtype":         dtype,
+        "params_b":      params_b,
+        "model_arch":    "MoE" if is_moe else "Dense",
+        "size_gb":       size_gb,
+        "is_reasoning":  is_reasoning,
+        "has_script":    has_script,
+        "script_engine": script_engine,
+        "modalities":    modalities,
+    }
+
+
+def _scan_directory(directory: Path) -> dict:
+    """Scan a directory for models. Returns {path, is_hf_cache, models}."""
+    models = []
+    is_hf_cache = False
+
+    if not directory.exists():
+        return {"path": str(directory), "is_hf_cache": False, "models": [], "error": "Directory not found"}
+
+    # HF cache format: contains models--* subdirs
+    hf_dirs = [d for d in sorted(directory.iterdir()) if d.is_dir() and d.name.startswith("models--")]
+    if hf_dirs:
+        is_hf_cache = True
+        for d in hf_dirs:
+            try:
+                models.append(_parse_hf_model_dir(d))
+            except Exception:
+                pass
+    else:
+        # Flat format: look for subdirectories with config.json
+        for d in sorted(directory.iterdir()):
+            if d.is_dir() and (d / "config.json").exists():
+                try:
+                    models.append(_parse_flat_model_dir(d))
+                except Exception:
+                    pass
+
+    return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models}
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -491,6 +923,15 @@ async def hf_download(req: HFDownloadRequest):
     default_dir = os.path.expanduser(f"~/.cache/huggingface/hub/{safe_repo.replace('/', '--')}")
     local_dir = req.local_dir or default_dir
 
+    # Track custom dir so inventory can scan it later
+    if req.local_dir:
+        custom_dirs = _load_custom_dirs()
+        expanded = os.path.expanduser(req.local_dir)
+        parent = str(Path(expanded).parent)
+        if parent not in custom_dirs and parent != str(HF_CACHE_DIR):
+            custom_dirs.append(parent)
+            _save_custom_dirs(custom_dirs)
+
     script = f"""
 import sys, json
 sys.stdout.reconfigure(line_buffering=True)
@@ -528,6 +969,47 @@ except Exception as e:
         stream(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/hf/inventory")
+async def hf_inventory():
+    """Scan HF cache + custom dirs and return model inventory."""
+    custom_dirs = _load_custom_dirs()
+    directories = []
+
+    # Always include the default HF cache
+    directories.append(_scan_directory(HF_CACHE_DIR))
+
+    # Custom dirs (skip if same as default)
+    default_str = str(HF_CACHE_DIR)
+    for d in custom_dirs:
+        d_expanded = os.path.expanduser(d)
+        if d_expanded != default_str:
+            directories.append(_scan_directory(Path(d_expanded)))
+
+    return {"directories": directories}
+
+
+class AddDirRequest(BaseModel):
+    path: str
+
+@app.post("/api/hf/inventory/dirs")
+async def add_inventory_dir(req: AddDirRequest):
+    """Add a custom directory to the inventory scan list."""
+    expanded = os.path.expanduser(req.path.strip())
+    dirs = _load_custom_dirs()
+    if expanded not in dirs:
+        dirs.append(expanded)
+        _save_custom_dirs(dirs)
+    return {"ok": True, "dirs": dirs}
+
+@app.delete("/api/hf/inventory/dirs")
+async def remove_inventory_dir(path: str):
+    """Remove a custom directory from the inventory scan list."""
+    expanded = os.path.expanduser(path.strip())
+    dirs = [d for d in _load_custom_dirs() if os.path.expanduser(d) != expanded]
+    _save_custom_dirs(dirs)
+    return {"ok": True, "dirs": dirs}
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 
@@ -935,7 +1417,108 @@ body::before{
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-</style>
+
+/* ── Inventory table ── */
+.inv-dir-block{margin-bottom:24px}
+.inv-dir-header{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 14px;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:8px 8px 0 0;
+  border-bottom:1px solid var(--border2);
+}
+.inv-dir-path{
+  font-family:var(--mono);font-size:11px;color:var(--amber);flex:1;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.inv-dir-badge{
+  font-family:var(--mono);font-size:9px;
+  padding:2px 7px;border-radius:3px;
+  background:rgba(240,160,52,.12);border:1px solid rgba(240,160,52,.25);
+  color:var(--amber);white-space:nowrap;
+}
+.inv-dir-badge.custom{
+  background:rgba(90,154,245,.1);border-color:rgba(90,154,245,.25);color:var(--blue);
+}
+.inv-table-wrap{
+  border:1px solid var(--border);border-top:none;
+  border-radius:0 0 8px 8px;overflow:hidden;
+}
+.inv-table{width:100%;border-collapse:collapse;font-size:12px;}
+.inv-table th{
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);background:var(--s2);
+  padding:7px 10px;text-align:left;
+  border-bottom:1px solid var(--border);
+  white-space:nowrap;
+}
+.inv-table td{
+  padding:9px 10px;border-bottom:1px solid var(--border);
+  vertical-align:middle;
+  color:var(--text);
+}
+.inv-table tr:last-child td{border-bottom:none}
+.inv-table tr:hover td{background:rgba(255,255,255,.02)}
+.inv-model-name{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--text)}
+.inv-owner{font-size:10px;color:var(--muted);margin-top:1px}
+.inv-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.05em;white-space:nowrap;
+  margin:1px;
+}
+.inv-fp32{background:#0a1830;color:#6090e0;border:1px solid #1030508}
+.inv-fp16{background:#0e1a30;color:#5a9af5;border:1px solid #1a2a50}
+.inv-bf16{background:#0e1a30;color:#5a9af5;border:1px solid #1a2a50}
+.inv-fp8{background:#12200e;color:#5cc480;border:1px solid #1a3a18}
+.inv-fp4{background:#1a1200;color:var(--amber);border:1px solid #2a2000}
+.inv-int4{background:#1a1200;color:#d09030;border:1px solid #2a1800}
+.inv-int8{background:#0e1818;color:#40b0b0;border:1px solid #183030}
+.inv-unknown{background:var(--s3);color:var(--muted);border:1px solid var(--border)}
+.inv-moe{background:#1a0a28;color:#a06af5;border:1px solid #2a1040}
+.inv-dense{background:var(--s3);color:var(--muted);border:1px solid var(--border)}
+.inv-yes{color:var(--green)}
+.inv-no{color:var(--muted)}
+.inv-engine{
+  font-family:var(--mono);font-size:10px;
+  padding:2px 6px;border-radius:3px;
+}
+.inv-engine-sg{background:#101828;color:#6898e8;border:1px solid #1a2a40}
+.inv-engine-vl{background:#0e1a14;color:#5cc480;border:1px solid #1a3020}
+.inv-modality{
+  display:inline-block;padding:1px 5px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;
+  background:var(--s3);color:var(--muted);border:1px solid var(--border);
+  margin:1px;
+}
+.inv-modality.embed{
+  background:#10102a;color:#8888e0;border-color:#20205a;
+}
+.inv-empty{
+  text-align:center;padding:28px;color:var(--muted);
+  font-size:12px;
+  background:var(--s1);border:1px solid var(--border);
+  border-top:none;border-radius:0 0 8px 8px;
+}
+.inv-custom-dirs{
+  display:flex;flex-direction:column;gap:6px;
+  margin-bottom:14px;
+}
+.inv-custom-dir-row{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 12px;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:6px;
+}
+.inv-custom-dir-path{font-family:var(--mono);font-size:11px;color:var(--blue);flex:1}
+.inv-remove-btn{
+  background:none;border:1px solid var(--border);
+  color:var(--muted);font-size:11px;
+  border-radius:4px;padding:2px 8px;cursor:pointer;
+  transition:all .12s;
+}
+.inv-remove-btn:hover{color:var(--red);border-color:var(--red)}</style>
 </head>
 <body>
 
@@ -1030,6 +1613,27 @@ body::before{
       <div class="progress-wrap" id="hf-progress">
         <div class="prog-bar-outer"><div class="prog-bar spin" id="hf-bar"></div></div>
         <div class="prog-log" id="hf-log"></div>
+      </div>
+
+      <!-- ── Model Inventory ── -->
+      <div style="display:flex;align-items:center;gap:10px;margin:24px 0 14px">
+        <div class="sec-label" style="margin:0;flex:1">Model Inventory</div>
+        <button class="btn btn-sm btn-ghost" id="inv-refresh-btn" onclick="loadInventory()">↻ Refresh</button>
+      </div>
+
+      <!-- Custom directory management -->
+      <div class="card" style="margin-bottom:14px;padding:14px 16px">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px">Additional Scan Directories</div>
+        <div class="inv-custom-dirs" id="inv-custom-dirs"></div>
+        <div class="input-row" style="margin-bottom:0">
+          <input class="input" id="inv-add-dir" placeholder="/home/user/models  or  ~/models" style="font-size:12px"
+            onkeydown="if(event.key==='Enter')addInventoryDir()">
+          <button class="btn btn-sm" onclick="addInventoryDir()">+ Add Directory</button>
+        </div>
+      </div>
+
+      <div id="inv-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div><div style="font-size:12px;color:var(--muted)">Loading inventory…</div></div>
       </div>
     </div>
 
@@ -1235,6 +1839,7 @@ function switchTab(name) {
   if (name === 'sglang')  { loadSGLangStatus(); loadProfiles(); }
   if (name === 'vllm')    { loadVLLMStatus(); loadVLLMProfiles(); }
   if (name === 'ollama')  { loadOllamaModels(); }
+  if (name === 'hf')      { loadInventory(); loadCustomDirs(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1744,6 +2349,160 @@ async function hfDownload() {
   } finally {
     btn.disabled = false;
     btn.innerHTML = '⬇ Download';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HF Inventory
+// ─────────────────────────────────────────────────────────────────────────────
+
+function dtypeClass(dtype) {
+  const m = {
+    'FP32':'inv-fp32','FP16':'inv-fp16','BF16':'inv-bf16',
+    'FP8':'inv-fp8','FP4':'inv-fp4','INT4':'inv-int4','INT8':'inv-int8',
+    'GGUF':'inv-int4',
+  };
+  return m[dtype] || 'inv-unknown';
+}
+
+function renderInventoryDir(dirData, isFirst) {
+  const { path, is_hf_cache, models, error } = dirData;
+  const shortPath = path.replace(/^\/home\/[^/]+/, '~');
+
+  let html = `<div class="inv-dir-block">
+    <div class="inv-dir-header">
+      <span class="inv-dir-path" title="${path}">${shortPath}</span>`;
+
+  if (isFirst) {
+    html += `<span class="inv-dir-badge">HF Cache · Default</span>`;
+  } else {
+    html += `<span class="inv-dir-badge custom">Custom</span>`;
+  }
+  html += `<span style="font-family:var(--mono);font-size:10px;color:var(--muted)">${models.length} model${models.length !== 1 ? 's' : ''}</span>`;
+  html += `</div>`;
+
+  if (error) {
+    html += `<div class="inv-empty">⚠ ${error}</div></div>`;
+    return html;
+  }
+  if (!models.length) {
+    html += `<div class="inv-empty">No models found in this directory</div></div>`;
+    return html;
+  }
+
+  html += `<div class="inv-table-wrap"><table class="inv-table">
+    <thead><tr>
+      <th>Model</th>
+      <th>Dtype</th>
+      <th>Params</th>
+      <th>Arch</th>
+      <th>Size</th>
+      <th>Reasoning</th>
+      <th>Script</th>
+      <th>Modalities</th>
+    </tr></thead>
+    <tbody>`;
+
+  for (const m of models) {
+    const params = m.params_b != null ? m.params_b + 'B' : '—';
+    const size   = m.size_gb  ? m.size_gb + ' GB' : '—';
+    const dc     = dtypeClass(m.dtype);
+    const archBadge = m.model_arch === 'MoE'
+      ? `<span class="inv-badge inv-moe">MoE</span>`
+      : `<span class="inv-badge inv-dense">Dense</span>`;
+    const reasonBadge = m.is_reasoning
+      ? `<span class="inv-yes">✓ Yes</span>`
+      : `<span class="inv-no">—</span>`;
+    let scriptBadge = `<span class="inv-no">—</span>`;
+    if (m.has_script && m.script_engine) {
+      const cls = m.script_engine === 'SGLang' ? 'inv-engine-sg' : 'inv-engine-vl';
+      scriptBadge = `<span class="inv-engine ${cls}">${m.script_engine}</span>`;
+    }
+    const modBadges = m.modalities.map(mod => {
+      const cls = mod === 'Embedding' ? ' embed' : '';
+      return `<span class="inv-modality${cls}">${mod}</span>`;
+    }).join('');
+
+    html += `<tr>
+      <td>
+        <div class="inv-model-name">${m.name}</div>
+        ${m.owner ? `<div class="inv-owner">${m.owner}</div>` : ''}
+      </td>
+      <td><span class="inv-badge ${dc}">${m.dtype}</span></td>
+      <td style="font-family:var(--mono);font-size:11px">${params}</td>
+      <td>${archBadge}</td>
+      <td style="font-family:var(--mono);font-size:11px;white-space:nowrap">${size}</td>
+      <td>${reasonBadge}</td>
+      <td>${scriptBadge}</td>
+      <td>${modBadges}</td>
+    </tr>`;
+  }
+
+  html += `</tbody></table></div></div>`;
+  return html;
+}
+
+async function loadInventory() {
+  const root = document.getElementById('inv-root');
+  if (!root) return;
+  root.innerHTML = '<div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div><div style="font-size:12px;color:var(--muted)">Scanning model directories…</div></div>';
+  try {
+    const d = await apiFetch('/api/hf/inventory');
+    const dirs = d.directories || [];
+    if (!dirs.length || dirs.every(dir => !dir.models.length && !dir.error)) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">📭</div><div class="empty-text">No models found. Pull or download a model to get started.</div></div>';
+      return;
+    }
+    root.innerHTML = dirs.map((dir, i) => renderInventoryDir(dir, i === 0)).join('');
+  } catch(e) {
+    root.innerHTML = `<div class="empty"><div class="empty-icon">⚠</div><div class="empty-text">Could not load inventory: ${e.message}</div></div>`;
+  }
+}
+
+async function loadCustomDirs() {
+  // Reload custom dirs display by fetching inventory and reading dirs
+  try {
+    const d = await apiFetch('/api/hf/inventory');
+    const customDirsEl = document.getElementById('inv-custom-dirs');
+    if (!customDirsEl) return;
+    const customDirs = (d.directories || []).slice(1); // skip default
+    if (!customDirs.length) {
+      customDirsEl.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:2px 0">No additional directories added</div>';
+      return;
+    }
+    customDirsEl.innerHTML = customDirs.map(dir => {
+      const safe = encodeURIComponent(dir.path);
+      return `<div class="inv-custom-dir-row">
+        <span class="inv-custom-dir-path">${dir.path.replace(/^\/home\/[^/]+/, '~')}</span>
+        <button class="inv-remove-btn" onclick="removeInventoryDir('${dir.path.replace(/'/g,"\\'")}')">✕ Remove</button>
+      </div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function addInventoryDir() {
+  const input = document.getElementById('inv-add-dir');
+  const path = input.value.trim();
+  if (!path) { input.focus(); return; }
+  try {
+    await apiFetch('/api/hf/inventory/dirs', 'POST', {path});
+    input.value = '';
+    toast('✓ Directory added', 'ok');
+    await loadCustomDirs();
+    await loadInventory();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
+  }
+}
+
+async function removeInventoryDir(path) {
+  try {
+    await fetch('/api/hf/inventory/dirs?' + new URLSearchParams({path}), {method:'DELETE'});
+    toast('✓ Directory removed', 'ok');
+    await loadCustomDirs();
+    await loadInventory();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
   }
 }
 
