@@ -1,4 +1,4 @@
-# DGX Spark Model Manager
+# 🔰DGX Spark Model Manager
 
 A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX Nano G1n** (GB10, 128 GB unified memory). Pull Ollama models, download from HuggingFace, manage LiteLLM routing, and control SGLang or vLLM — all from one browser tab.
 
