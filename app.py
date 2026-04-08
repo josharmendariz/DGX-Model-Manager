@@ -367,21 +367,35 @@ async def sglang_status():
     return {"running": running, "model": model, "container_info": result.stdout.strip()}
 
 
+def _find_container_by_port(port: int) -> Optional[str]:
+    """Return the container ID listening on the given host port, or None."""
+    result = subprocess.run(
+        ["docker", "ps", "--filter", f"publish={port}", "--format", "{{.ID}}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    cid = result.stdout.strip().splitlines()[0].strip() if result.stdout.strip() else None
+    return cid or None
+
+
+def _docker_stop(container_id: str) -> tuple[bool, str]:
+    """Stop a container by ID, falling back to sudo if needed."""
+    r = subprocess.run(["docker", "stop", container_id],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode == 0:
+        return True, (r.stdout + r.stderr).strip()
+    r2 = subprocess.run(["sudo", "docker", "stop", container_id],
+                        capture_output=True, text=True, timeout=60)
+    return r2.returncode == 0, (r2.stdout + r2.stderr).strip()
+
+
 @app.post("/api/sglang/stop")
 async def stop_sglang():
-    result = subprocess.run(
-        ["docker", "stop", "sglang"],
-        capture_output=True, text=True, timeout=60,
-    )
-    ok = result.returncode == 0
-    if not ok:
-        # try with sudo as fallback
-        result = subprocess.run(
-            ["sudo", "docker", "stop", "sglang"],
-            capture_output=True, text=True, timeout=60,
-        )
-        ok = result.returncode == 0
-    return {"ok": ok, "output": (result.stdout + result.stderr).strip()}
+    port = int(SGLANG_BASE.rsplit(":", 1)[-1])
+    cid = _find_container_by_port(port)
+    if not cid:
+        raise HTTPException(404, "No container found listening on SGLang port — already stopped?")
+    ok, output = _docker_stop(cid)
+    return {"ok": ok, "output": output}
 
 
 @app.post("/api/sglang/start")
@@ -434,18 +448,12 @@ async def vllm_status():
 
 @app.post("/api/vllm/stop")
 async def stop_vllm():
-    result = subprocess.run(
-        ["docker", "stop", "vllm"],
-        capture_output=True, text=True, timeout=60,
-    )
-    ok = result.returncode == 0
-    if not ok:
-        result = subprocess.run(
-            ["sudo", "docker", "stop", "vllm"],
-            capture_output=True, text=True, timeout=60,
-        )
-        ok = result.returncode == 0
-    return {"ok": ok, "output": (result.stdout + result.stderr).strip()}
+    port = int(VLLM_BASE.rsplit(":", 1)[-1])
+    cid = _find_container_by_port(port)
+    if not cid:
+        raise HTTPException(404, "No container found listening on vLLM port — already stopped?")
+    ok, output = _docker_stop(cid)
+    return {"ok": ok, "output": output}
 
 
 @app.post("/api/vllm/start")
