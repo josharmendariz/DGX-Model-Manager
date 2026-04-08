@@ -27,9 +27,10 @@ OLLAMA_BASE    = "http://127.0.0.1:11434"
 LITELLM_BASE   = "http://127.0.0.1:4000"
 SGLANG_BASE    = "http://127.0.0.1:30000"
 VLLM_BASE      = "http://127.0.0.1:8000"
-LITELLM_CONFIG = Path(os.path.expanduser("~/litellm/litellm_config.yaml"))
-PROFILES_FILE  = Path(os.path.expanduser("~/model-manager/sglang_profiles.json"))
-VLLM_PROFILES  = Path(os.path.expanduser("~/model-manager/vllm_profiles.json"))
+LITELLM_CONFIG   = Path(os.path.expanduser("~/litellm/litellm_config.yaml"))
+HOME             = Path.home()
+SGLANG_SCRIPT_DIR = HOME / "SGLang"
+VLLM_SCRIPT_DIR   = HOME / "vLLM"
 
 # Load app config
 _CONFIG_FILE = Path(os.path.expanduser("~/model-manager/config.json"))
@@ -104,18 +105,59 @@ def save_litellm_config(cfg: dict):
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
 
-def load_profiles() -> list:
-    if PROFILES_FILE.exists():
-        with open(PROFILES_FILE) as f:
-            return json.load(f)
-    return []
+def _parse_script_meta(script_path: Path) -> dict:
+    """Derive profile metadata from a start_*.sh script.
+
+    Optional header comments (in the first 20 lines) override defaults:
+        # Name: Mistral Small 4
+        # Description: 119B NVFP4 quantized
+        # VRAM: 119
+    Falls back to a human-readable name derived from the filename.
+    """
+    name = description = None
+    vram_gb = None
+    try:
+        for line in script_path.read_text().splitlines()[:20]:
+            line = line.strip()
+            if line.startswith("# Name:"):
+                name = line[7:].strip()
+            elif line.startswith("# Description:"):
+                description = line[14:].strip()
+            elif line.startswith("# VRAM:"):
+                try:
+                    vram_gb = int(line[7:].strip().upper().rstrip("GB").strip())
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if not name:
+        stem = script_path.stem  # e.g. "start_mistral_small4"
+        if stem.startswith("start_"):
+            stem = stem[6:]
+        name = stem.replace("_", " ").replace("-", " ").title()
+
+    return {
+        "id":          script_path.stem,
+        "name":        name,
+        "script":      str(script_path),
+        "description": description or f"Script: {script_path.name}",
+        "vram_gb":     vram_gb,
+    }
 
 
-def load_vllm_profiles() -> list:
-    if VLLM_PROFILES.exists():
-        with open(VLLM_PROFILES) as f:
-            return json.load(f)
-    return []
+def scan_sglang_profiles() -> list:
+    """Scan ~/SGLang/start_*.sh and return profile list."""
+    if not SGLANG_SCRIPT_DIR.exists():
+        return []
+    return [_parse_script_meta(s) for s in sorted(SGLANG_SCRIPT_DIR.glob("start_*.sh"))]
+
+
+def scan_vllm_profiles() -> list:
+    """Scan ~/vLLM/start_*.sh and return profile list."""
+    if not VLLM_SCRIPT_DIR.exists():
+        return []
+    return [_parse_script_meta(s) for s in sorted(VLLM_SCRIPT_DIR.glob("start_*.sh"))]
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -300,16 +342,13 @@ async def restart_litellm():
 
 @app.get("/api/sglang/profiles")
 async def get_sglang_profiles():
-    return load_profiles()
+    return scan_sglang_profiles()
 
 
 @app.get("/api/sglang/status")
 async def sglang_status():
-    result = subprocess.run(
-        ["docker", "ps", "--filter", "name=^sglang$", "--format", "{{.Names}}\t{{.Status}}"],
-        capture_output=True, text=True, timeout=5,
-    )
-    running = bool(result.stdout.strip())
+    # Primary: HTTP health check — reliable regardless of container name
+    running = await service_ok(SGLANG_BASE, "/health")
     model = None
     if running:
         try:
@@ -320,6 +359,11 @@ async def sglang_status():
                     model = d[0]["id"]
         except Exception:
             pass
+    # Secondary: docker ps for container_info display only
+    result = subprocess.run(
+        ["docker", "ps", "--filter", "name=sglang", "--format", "{{.Names}}\t{{.Status}}"],
+        capture_output=True, text=True, timeout=5,
+    )
     return {"running": running, "model": model, "container_info": result.stdout.strip()}
 
 
@@ -342,7 +386,7 @@ async def stop_sglang():
 
 @app.post("/api/sglang/start")
 async def start_sglang(req: SGLangStartRequest):
-    profiles = load_profiles()
+    profiles = scan_sglang_profiles()
     profile = next((p for p in profiles if p["id"] == req.profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req.profile}' not found")
@@ -363,23 +407,13 @@ async def start_sglang(req: SGLangStartRequest):
 
 @app.get("/api/vllm/profiles")
 async def get_vllm_profiles():
-    return load_vllm_profiles()
+    return scan_vllm_profiles()
 
 
 @app.get("/api/vllm/status")
 async def vllm_status():
-    result = subprocess.run(
-        ["docker", "ps", "--filter", "name=vllm", "--format", "{{.Names}}\t{{.Status}}"],
-        capture_output=True, text=True, timeout=5,
-    )
-    container_info = result.stdout.strip()
-    running = bool(container_info)
-
-    # Fallback: if docker ps finds nothing, check the HTTP endpoint directly
-    # (handles cases where the container name doesn't match, or vLLM runs outside Docker)
-    if not running:
-        running = await service_ok(VLLM_BASE, "/health")
-
+    # Primary: HTTP health check — reliable regardless of container name
+    running = await service_ok(VLLM_BASE, "/health")
     model = None
     if running:
         try:
@@ -390,7 +424,12 @@ async def vllm_status():
                     model = d[0]["id"]
         except Exception:
             pass
-    return {"running": running, "model": model, "container_info": container_info}
+    # Secondary: docker ps for container_info display only
+    result = subprocess.run(
+        ["docker", "ps", "--filter", "name=vllm", "--format", "{{.Names}}\t{{.Status}}"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return {"running": running, "model": model, "container_info": result.stdout.strip()}
 
 
 @app.post("/api/vllm/stop")
@@ -411,7 +450,7 @@ async def stop_vllm():
 
 @app.post("/api/vllm/start")
 async def start_vllm(req: VLLMStartRequest):
-    profiles = load_vllm_profiles()
+    profiles = scan_vllm_profiles()
     profile = next((p for p in profiles if p["id"] == req.profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req.profile}' not found")
@@ -1428,7 +1467,7 @@ function renderProfiles(profiles) {
         <div class="p-name">${p.name}</div>
         <div class="p-desc">${p.description}</div>
       </div>
-      <div class="p-vram">${p.vram_gb} GB</div>
+      <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '—'}</div>
     </div>
   `).join('');
 }
@@ -1522,7 +1561,7 @@ async function loadVLLMProfiles() {
   try {
     const profiles = await apiFetch('/api/vllm/profiles');
     if (!profiles.length) {
-      el.innerHTML = '<div class="empty"><div class="empty-text">No vLLM profiles defined — add them to <code style="font-family:var(--mono);color:var(--amber);font-size:11px">~/model-manager/vllm_profiles.json</code></div></div>';
+      el.innerHTML = '<div class="empty"><div class="empty-text">No vLLM start scripts found — add <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> scripts to <code style="font-family:var(--mono);color:var(--amber);font-size:11px">~/vLLM/</code></div></div>';
       return;
     }
     if (!selectedVLLMProfile) selectedVLLMProfile = profiles[0].id;
@@ -1541,7 +1580,7 @@ function renderVLLMProfiles(profiles) {
         <div class="p-name">${p.name}</div>
         <div class="p-desc">${p.description}</div>
       </div>
-      <div class="p-vram">${p.vram_gb} GB</div>
+      <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '—'}</div>
     </div>
   `).join('');
 }
