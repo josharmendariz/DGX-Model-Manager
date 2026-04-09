@@ -1106,6 +1106,13 @@ sudo docker run --rm --gpus all --ipc=host \
         <tr><td>Script not found</td><td>Profile script paths support <code>~/</code> but must point to an existing file. Verify with <code>ls ~/vllm/start_*.sh</code>.</td></tr>
       </table>
 
+      <h3>Mistral Returns HTTP 400 / "Message Ordering Conflict"</h3>
+      <table class="param-table">
+        <tr><td>Consecutive same-role messages</td><td>Mistral enforces strict user/assistant role alternation. Any middleware, agent framework, or callback that injects consecutive messages with the same role (e.g. two <code>user</code> turns in a row) will trigger an HTTP 400. Audit your LiteLLM callbacks and any agent boot hooks.</td></tr>
+        <tr><td>Subagent tool-call injection</td><td>Subagent tool-call/result sequences may violate the alternation rule if injected raw into the conversation. Ensure tool results are wrapped in the expected alternating structure before forwarding to Mistral.</td></tr>
+        <tr><td>Session compaction</td><td>Context compaction that merges or reorders messages can also break alternation. If the error fires mid-conversation, check your compaction logic.</td></tr>
+      </table>
+
       <h3>App Not Loading</h3>
       <table class="param-table">
         <tr><td>Check service</td><td><code>sudo systemctl status model-manager</code></td></tr>
