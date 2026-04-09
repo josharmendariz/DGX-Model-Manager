@@ -12,9 +12,9 @@ A lightweight web UI for managing AI models on the **NVIDIA DGX Spark / HP ZGX N
 - **LiteLLM Routing** — one-click wildcard routing so every Ollama model is auto-exposed to all your apps
 - **SGLang Engine** — start/stop the SGLang Docker container via configurable launch profiles
 - **vLLM Engine** — start/stop the vLLM Docker container via configurable launch profiles
-- **HuggingFace Download** — download any model from HF Hub directly to the device
+- **HuggingFace Download** — download any model from HF Hub and manage them directly on the device
 - **Live Status Bar** — real-time health indicators for SGLang, vLLM, Ollama, and LiteLLM
-- **Built-in Help Page** — documentation at `/help`
+- **Built-in Help Page** — documentation at `/help` or Docs button (upper-right corner) 
 
 Both SGLang and vLLM are fully supported as inference engines. Use whichever you prefer — or both, on different ports with different models. Each engine has its own tab, profiles, and status indicator.
 
@@ -102,26 +102,37 @@ Place your SGLang startup scripts in `~/SGLang/`. Any file named `start_*.sh` is
   ...
 ```
 
+Example (working) SGLang startup script for Mistral Small 4 NVFP4 w/ 256K context window:
 Add optional header comments to control what the profile card displays:
 
 ```bash
 #!/usr/bin/env bash
 # Name: Mistral Small 4
-# Description: 119B NVFP4 · ~5 min warm-up
-# VRAM: 119
+# Description: 119B NVFP4 · ~15 min warm-up
+# VRAM: 100 GB
 
-sudo docker run --rm --gpus all --ipc=host \
-  --name my-sglang-container \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+sudo docker run --gpus all -d --rm \
+  --name sglang \
   -p 30000:30000 \
-  lmsysorg/sglang:nightly-dev-cu13 \
-  python3 -m sglang.launch_server \
-    --model-path /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
-    --quantization modelopt_fp4 \
+  -v /tmp:/tmp \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --ipc=host \
+  -e SGLANG_ENABLE_SPEC_V2=True \
+  -e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+  lmsysorg/sglang:nightly-dev-cu13-20260325-37420dce \
+  sglang serve \
+    --model-path mistralai/Mistral-Small-4-119B-2603-NVFP4 \
     --host 0.0.0.0 \
     --port 30000 \
-    --tool-call-parser mistral
+    --tp 1 \
+    --attention-backend triton \
+    --moe-runner-backend flashinfer_cutlass \
+    --reasoning-parser mistral \
+    --tool-call-parser mistral \
+    --mem-fraction-static 0.75 \
+    --context-length 262144 \
+    --served-model-name Mistral-Small-4 \
+    --enable-metrics
 ```
 
 The `setup.sh` script creates `~/SGLang/` and drops an annotated example script there to use as a starting point.
@@ -152,25 +163,66 @@ Place your vLLM startup scripts in `~/vLLM/`. Any file named `start_*.sh` is aut
   ...
 ```
 
+Example (working) vLLM startup script for Nemotron 3 Super NVFP4 w/ 256K context window:
 Same header comment format as SGLang:
 
 ```bash
 #!/usr/bin/env bash
-# Name: Nemotron 3 Super
-# Description: 49B BF16 · Nvidia flagship · ~5 min warm-up
-# VRAM: 97
+# Start Nemotron-3-Super-120B-A12B-NVFP4 via vLLM on DGX Spark
+# Port: 8000 (vLLM default, matches Model Manager config)
+# IMPORTANT: Cannot run simultaneously with SGLang (combined VRAM > 128 GB)
 
-sudo docker run --rm --gpus all --ipc=host \
-  --name my-vllm-container \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PARSER_PATH="$SCRIPT_DIR/super_v3_reasoning_parser.py"
+
+# Download reasoning parser if not present
+if [ ! -f "$PARSER_PATH" ]; then
+  echo "[nemotron] Downloading reasoning parser..."
+  wget -q -O "$PARSER_PATH" \
+    https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/raw/main/super_v3_reasoning_parser.py
+fi
+
+echo "[nemotron] Starting vLLM with Nemotron-3-Super (NVFP4)..."
+
+docker run --gpus all -d --rm \
+  --name vllm-nemotron \
   -p 8000:8000 \
-  vllm/vllm-openai:latest \
-  --model /root/.cache/huggingface/hub/models--nvidia--Nemotron-Super-49B-v1/snapshots/main \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tensor-parallel-size 1 \
-  --tool-call-parser mistral \
-  --enable-auto-tool-choice
+  --ipc=host \
+  -e VLLM_NVFP4_GEMM_BACKEND=marlin \
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
+  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v "$PARSER_PATH":/app/super_v3_reasoning_parser.py \
+  vllm/vllm-openai:cu130-nightly \
+    --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+    --served-model-name Nemotron-3-Super \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --async-scheduling \
+    --dtype auto \
+    --kv-cache-dtype fp8 \
+    --tensor-parallel-size 1 \
+    --pipeline-parallel-size 1 \
+    --data-parallel-size 1 \
+    --trust-remote-code \
+    --gpu-memory-utilization 0.90 \
+    --enable-chunked-prefill \
+    --max-num-seqs 4 \
+    --max-model-len 1000000 \
+    --moe-backend marlin \
+    --mamba_ssm_cache_dtype float32 \
+    --quantization fp4 \
+    --speculative_config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
+    --reasoning-parser-plugin /app/super_v3_reasoning_parser.py \
+    --reasoning-parser super_v3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder
+
+echo "[nemotron] Container started. Waiting for model load..."
+echo "[nemotron] Monitor with: docker logs -f vllm-nemotron"
 ```
 
 The `setup.sh` script creates `~/vLLM/` and drops an annotated example script there to use as a starting point.
