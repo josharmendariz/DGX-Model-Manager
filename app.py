@@ -112,8 +112,8 @@ def _parse_script_meta(script_path: Path) -> dict:
 
     Optional header comments (in the first 20 lines) override defaults:
         # Name: Mistral Small 4
-        # Description: 119B NVFP4 quantized
-        # VRAM: 119
+        # Description: 120B NVFP4 quantized
+        # VRAM: 100 GB
     Falls back to a human-readable name derived from the filename.
     """
     name = description = None
@@ -1702,7 +1702,7 @@ body::before{
         <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="sglang-script-dir-banner">~/SGLang/</span></div>
         Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
         Name, description, and VRAM are read from optional header comments in the script:<br>
-        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 119B NVFP4 &nbsp;·&nbsp; # VRAM: 119</code>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 120B NVFP4 &nbsp;·&nbsp; # VRAM: 100 GB</code>
       </div>
 
       <div class="sec-label">Profiles</div>
@@ -1746,7 +1746,7 @@ body::before{
         <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="vllm-script-dir-banner">~/vLLM/</span></div>
         Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
         Name, description, and VRAM are read from optional header comments in the script:<br>
-        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 49B BF16 &nbsp;·&nbsp; # VRAM: 97</code>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 30B BF16 &nbsp;·&nbsp; # VRAM: 80 GB</code>
       </div>
 
       <div class="sec-label">Profiles</div>
