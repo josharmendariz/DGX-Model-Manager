@@ -1613,6 +1613,9 @@ body::before{
 .inv-modality.embed{
   background:#10102a;color:#8888e0;border-color:#20205a;
 }
+.inv-modality.audio{
+  background:#0e1a1a;color:#50c8b8;border-color:#183838;
+}
 .inv-empty{
   text-align:center;padding:28px;color:var(--muted);
   font-size:12px;
@@ -2439,7 +2442,8 @@ async function hfDownload() {
   prog.classList.add('show');
   bar.className = 'prog-bar spin';
   bar.style.width = '';
-  log.textContent = 'Starting download: ' + repo;
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
 
   try {
     const resp = await fetch('/api/hf/download', {
@@ -2464,28 +2468,29 @@ async function hfDownload() {
             if (ev.avg_speed) parts.push('Avg: ' + ev.avg_speed);
             if (ev.elapsed) parts.push('Time: ' + ev.elapsed);
             if (ev.errors > 0) parts.push('⚠ ' + ev.errors + ' error(s)');
-            log.textContent = parts.join('  ·  ');
+            lines.push(parts.join('  ·  '));
             toast('✓ Downloaded: ' + repo, 'ok');
           } else if (ev.status === 'error') {
             bar.className = 'prog-bar';
             bar.style.width = '0';
             toast('Error: ' + ev.error, 'err');
-            log.textContent = '✗ ' + ev.error;
+            lines.push('✗ ' + ev.error);
           } else if (ev.progress) {
             const p = ev.progress;
             bar.className = 'prog-bar';
             bar.style.width = p.pct + '%';
-            log.textContent = '[' + p.idx + '/' + p.total_files + '] ' + p.file
-              + '\n' + p.pct + '% · '
-              + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB · ' + p.speed;
+            lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file
+              + '  ·  ' + p.pct + '%  ·  '
+              + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
           } else if (ev.file_start) {
             const f = ev.file_start;
-            log.textContent = '[' + f.idx + '/' + f.total + '] Downloading ' + f.name + ' (' + f.size_str + ')';
+            lines.push('[' + f.idx + '/' + f.total + '] ' + f.name + ' (' + f.size_str + ')');
           } else if (ev.file_error) {
-            log.textContent += '\n⚠ Failed: ' + ev.file_error.name + ' — ' + ev.file_error.error;
+            lines[lines.length - 1] = '⚠ Failed: ' + ev.file_error.name + ' — ' + ev.file_error.error;
           } else if (ev.status) {
-            log.textContent = ev.status;
+            lines.push(ev.status);
           }
+          log.textContent = lines.join('\n');
           log.scrollTop = log.scrollHeight;
         } catch(e) {}
       }
@@ -2566,7 +2571,7 @@ function renderInventoryDir(dirData, isFirst) {
       scriptBadge = `<span class="inv-engine ${cls}">${m.script_engine}</span>`;
     }
     const modBadges = m.modalities.map(mod => {
-      const cls = mod === 'Embedding' ? ' embed' : '';
+      const cls = mod === 'Embedding' ? ' embed' : mod === 'Audio' ? ' audio' : '';
       return `<span class="inv-modality${cls}">${mod}</span>`;
     }).join('');
 
