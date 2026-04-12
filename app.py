@@ -11,6 +11,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -112,8 +113,8 @@ def _parse_script_meta(script_path: Path) -> dict:
 
     Optional header comments (in the first 20 lines) override defaults:
         # Name: Mistral Small 4
-        # Description: 120B NVFP4 quantized
-        # VRAM: 100 GB
+        # Description: 119B NVFP4 quantized
+        # VRAM: 119
     Falls back to a human-readable name derived from the filename.
     """
     name = description = None
@@ -933,13 +934,31 @@ async def hf_download(req: HFDownloadRequest):
             _save_custom_dirs(custom_dirs)
 
     script = f"""
-import sys, json
+import sys, json, os
 sys.stdout.reconfigure(line_buffering=True)
-from huggingface_hub import snapshot_download
-print(json.dumps({{"status": "starting", "repo": "{safe_repo}"}}), flush=True)
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+from huggingface_hub import list_repo_files, hf_hub_download
+
+repo = "{safe_repo}"
+local_dir = "{local_dir}"
+print(json.dumps({{"status": "starting", "repo": repo}}), flush=True)
+
 try:
-    path = snapshot_download(repo_id="{safe_repo}", local_dir="{local_dir}")
-    print(json.dumps({{"status": "complete", "path": path}}), flush=True)
+    files = list_repo_files(repo)
+    files = [f for f in files if not f.startswith('.')]
+    total = len(files)
+    print(json.dumps({{"status": f"Found {{total}} files"}}), flush=True)
+    errors = []
+    for i, fname in enumerate(files, 1):
+        try:
+            print(json.dumps({{"status": f"[{{i}}/{{total}}] {{fname}}"}}), flush=True)
+            hf_hub_download(repo_id=repo, filename=fname, local_dir=local_dir)
+        except Exception as e:
+            errors.append(f"{{fname}}: {{e}}")
+            print(json.dumps({{"status": f"⚠ Failed: {{fname}} — {{e}}"}}), flush=True)
+    if errors:
+        print(json.dumps({{"status": f"Done with {{len(errors)}} error(s)", "path": local_dir}}), flush=True)
+    print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
 except Exception as e:
     print(json.dumps({{"status": "error", "error": str(e)}}), flush=True)
 """
@@ -947,7 +966,7 @@ except Exception as e:
     async def stream() -> AsyncGenerator[str, None]:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "python3", "-c", script,
+                sys.executable, "-c", script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1702,7 +1721,7 @@ body::before{
         <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="sglang-script-dir-banner">~/SGLang/</span></div>
         Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
         Name, description, and VRAM are read from optional header comments in the script:<br>
-        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 120B NVFP4 &nbsp;·&nbsp; # VRAM: 100 GB</code>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 119B NVFP4 &nbsp;·&nbsp; # VRAM: 119</code>
       </div>
 
       <div class="sec-label">Profiles</div>
@@ -1746,7 +1765,7 @@ body::before{
         <div style="color:var(--amber);font-weight:700;font-size:13px;margin-bottom:4px">📁 Script directory: <span id="vllm-script-dir-banner">~/vLLM/</span></div>
         Place scripts named <code style="font-family:var(--mono);color:var(--amber);font-size:11px">start_*.sh</code> in this folder — each one becomes a profile card below.
         Name, description, and VRAM are read from optional header comments in the script:<br>
-        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 30B BF16 &nbsp;·&nbsp; # VRAM: 80 GB</code>
+        <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;·&nbsp; # Description: 49B BF16 &nbsp;·&nbsp; # VRAM: 97</code>
       </div>
 
       <div class="sec-label">Profiles</div>
