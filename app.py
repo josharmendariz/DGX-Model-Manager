@@ -12,6 +12,7 @@ import platform
 import socket
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
@@ -216,11 +217,13 @@ _NAME_VISION_SUBSTR: tuple[str, ...] = (
 
 _NAME_AUDIO_TOKENS: frozenset[str] = frozenset({
     "audio", "whisper", "speech", "asr", "voice", "tts",
+    "hubert", "wav2vec", "wav2vec2", "wavlm",
 })
 
 _NAME_EMBED_TOKENS: frozenset[str] = frozenset({
     "embed", "embedding", "embeddings",
     "e5", "bge", "gte", "nomic", "mxbai",
+    "minilm", "sbert",
 })
 
 _NAME_MOE_TOKENS: frozenset[str] = frozenset({"moe", "mixture"})
@@ -358,6 +361,10 @@ def _parse_hf_model_dir(model_dir: Path) -> dict:
     # Fallback: name-based dtype
     if not dtype or dtype == "Unknown":
         dtype = name_hints["dtype"] or "Unknown"
+    # Name-based quantized dtype overrides config's unquantized torch_dtype
+    # (common when torch_dtype reports original precision but model is quantized)
+    elif name_hints["dtype"] in ("FP4", "INT4", "FP8", "INT8") and dtype in ("FP32", "FP16", "BF16"):
+        dtype = name_hints["dtype"]
 
     # ── Architecture / MoE ───────────────────────────────────────────────────
     archs = config.get("architectures", [])
@@ -374,7 +381,11 @@ def _parse_hf_model_dir(model_dir: Path) -> dict:
 
     # ── Parameter count ───────────────────────────────────────────────────────
     params_b: Optional[float] = None
-    if snapshot_used:
+    # For quantized dtypes, index file total_size is unreliable (includes scales/overhead)
+    # Prefer name-based params when available
+    if name_hints["params_b"] and dtype in ("FP4", "INT4", "FP8", "INT8"):
+        params_b = name_hints["params_b"]
+    elif snapshot_used:
         for idx_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
             idx_path = snapshot_used / idx_name
             if idx_path.exists():
@@ -382,7 +393,8 @@ def _parse_hf_model_dir(model_dir: Path) -> dict:
                     idx = json.loads(idx_path.read_text())
                     total_bytes = idx.get("metadata", {}).get("total_size", 0)
                     if total_bytes:
-                        bytes_per = {"FP32": 4, "FP16": 2, "BF16": 2, "FP8": 1}.get(dtype, 2)
+                        bytes_per = {"FP32": 4, "FP16": 2, "BF16": 2, "FP8": 1,
+                                     "FP4": 0.5, "INT4": 0.5, "INT8": 1}.get(dtype, 2)
                         params_b = round(total_bytes / bytes_per / 1e9, 1)
                         break
                 except Exception:
@@ -458,6 +470,7 @@ def _parse_hf_model_dir(model_dir: Path) -> dict:
         "name":          model_name,
         "owner":         owner,
         "full_name":     full_name,
+        "dir_path":      str(model_dir),
         "dtype":         dtype,
         "params_b":      params_b,
         "model_arch":    "MoE" if is_moe else "Dense",
@@ -471,7 +484,16 @@ def _parse_hf_model_dir(model_dir: Path) -> dict:
 
 def _parse_flat_model_dir(model_dir: Path) -> dict:
     """Parse a flat model directory (not HF cache format) that contains config.json."""
-    model_name = model_dir.name
+    stem = model_dir.name
+    # Handle owner--name format (from old-style downloads)
+    if "--" in stem:
+        parts = stem.split("--", 1)
+        owner = parts[0]
+        model_name = parts[1]
+    else:
+        owner = ""
+        model_name = stem
+    full_name = f"{owner}/{model_name}" if owner else model_name
     name_hints = _infer_from_name(model_name)
 
     config: dict = {}
@@ -499,6 +521,8 @@ def _parse_flat_model_dir(model_dir: Path) -> dict:
         dtype = "INT8"
     if not dtype or dtype == "Unknown":
         dtype = name_hints["dtype"] or "Unknown"
+    elif name_hints["dtype"] in ("FP4", "INT4", "FP8", "INT8") and dtype in ("FP32", "FP16", "BF16"):
+        dtype = name_hints["dtype"]
 
     # ── Architecture / MoE ───────────────────────────────────────────────────
     archs = config.get("architectures", [])
@@ -551,8 +575,9 @@ def _parse_flat_model_dir(model_dir: Path) -> dict:
 
     return {
         "name":          model_name,
-        "owner":         "",
-        "full_name":     model_name,
+        "owner":         owner,
+        "full_name":     full_name,
+        "dir_path":      str(model_dir),
         "dtype":         dtype,
         "params_b":      params_b,
         "model_arch":    "MoE" if is_moe else "Dense",
@@ -581,14 +606,28 @@ def _scan_directory(directory: Path) -> dict:
                 models.append(_parse_hf_model_dir(d))
             except Exception:
                 pass
-    else:
-        # Flat format: look for subdirectories with config.json
-        for d in sorted(directory.iterdir()):
-            if d.is_dir() and (d / "config.json").exists():
-                try:
-                    models.append(_parse_flat_model_dir(d))
-                except Exception:
-                    pass
+    # Also scan flat model dirs (subdirs with config.json) even alongside HF cache dirs
+    for d in sorted(directory.iterdir()):
+        if d.is_dir() and not d.name.startswith("models--") and (d / "config.json").exists():
+            try:
+                models.append(_parse_flat_model_dir(d))
+            except Exception:
+                pass
+
+    # Deduplicate: if same full_name appears from both HF cache and flat dir, keep HF cache version
+    seen: dict[str, int] = {}
+    deduped: list[dict] = []
+    for m in models:
+        key = m.get("full_name", m["name"]).lower()
+        if key in seen:
+            # Keep the one with more data (size_gb > 0 preferred)
+            existing = deduped[seen[key]]
+            if not existing.get("size_gb") and m.get("size_gb"):
+                deduped[seen[key]] = m
+        else:
+            seen[key] = len(deduped)
+            deduped.append(m)
+    models = deduped
 
     return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models}
 
@@ -921,11 +960,11 @@ async def start_vllm(req: VLLMStartRequest):
 @app.post("/api/hf/download")
 async def hf_download(req: HFDownloadRequest):
     safe_repo = req.repo_id.replace("'", "").replace('"', "")
-    default_dir = os.path.expanduser(f"~/.cache/huggingface/hub/{safe_repo.replace('/', '--')}")
-    local_dir = req.local_dir or default_dir
+    use_custom_dir = bool(req.local_dir)
+    local_dir = req.local_dir or ""
 
     # Track custom dir so inventory can scan it later
-    if req.local_dir:
+    if use_custom_dir:
         custom_dirs = _load_custom_dirs()
         expanded = os.path.expanduser(req.local_dir)
         parent = str(Path(expanded).parent)
@@ -934,33 +973,66 @@ async def hf_download(req: HFDownloadRequest):
             _save_custom_dirs(custom_dirs)
 
     script = f"""
-import sys, json, os
+import sys, json, os, time
 sys.stdout.reconfigure(line_buffering=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-from huggingface_hub import list_repo_files, hf_hub_download
+from huggingface_hub import list_repo_tree, hf_hub_download
+from pathlib import Path
 
 repo = "{safe_repo}"
-local_dir = "{local_dir}"
-print(json.dumps({{"status": "starting", "repo": repo}}), flush=True)
+use_custom_dir = {use_custom_dir}
+local_dir = "{local_dir}" if use_custom_dir else None
+J = lambda **kw: print(json.dumps(kw), flush=True)
+J(status="starting", repo=repo)
 
 try:
-    files = list_repo_files(repo)
-    files = [f for f in files if not f.startswith('.')]
-    total = len(files)
-    print(json.dumps({{"status": f"Found {{total}} files"}}), flush=True)
+    entries = [e for e in list_repo_tree(repo, recursive=True)
+               if hasattr(e, 'size') and not e.path.startswith('.')]
+    total_files = len(entries)
+    total_bytes = sum(e.size or 0 for e in entries)
+    J(status=f"Found {{total_files}} files ({{total_bytes/1024**3:.1f}} GB)")
+    done_bytes = 0
+    dl_start = time.time()
     errors = []
-    for i, fname in enumerate(files, 1):
+    result_path = None
+    for i, entry in enumerate(entries, 1):
+        fname = entry.path
+        fsize = entry.size or 0
+        sz_str = f"{{fsize/1024**2:.0f}} MB" if fsize > 1024**2 else f"{{fsize/1024:.0f}} KB" if fsize > 1024 else f"{{fsize}} B"
+        J(file_start=dict(idx=i, total=total_files, name=fname, size_str=sz_str))
+        t0 = time.time()
         try:
-            print(json.dumps({{"status": f"[{{i}}/{{total}}] {{fname}}"}}), flush=True)
-            hf_hub_download(repo_id=repo, filename=fname, local_dir=local_dir)
-        except Exception as e:
-            errors.append(f"{{fname}}: {{e}}")
-            print(json.dumps({{"status": f"⚠ Failed: {{fname}} — {{e}}"}}), flush=True)
-    if errors:
-        print(json.dumps({{"status": f"Done with {{len(errors)}} error(s)", "path": local_dir}}), flush=True)
-    print(json.dumps({{"status": "complete", "path": local_dir}}), flush=True)
+            dl_kw = dict(repo_id=repo, filename=fname)
+            if local_dir:
+                dl_kw["local_dir"] = local_dir
+            fpath = hf_hub_download(**dl_kw)
+            if result_path is None:
+                result_path = str(Path(fpath).parent)
+        except Exception as exc:
+            errors.append(fname)
+            J(file_error=dict(idx=i, name=fname, error=str(exc)))
+            continue
+        done_bytes += fsize
+        elapsed = max(time.time() - t0, 0.001)
+        total_elapsed = max(time.time() - dl_start, 0.001)
+        speed = fsize / elapsed
+        avg_speed = done_bytes / total_elapsed
+        pct = done_bytes / total_bytes * 100 if total_bytes else 100
+        if speed >= 1024**2:    spd = f"{{speed/1024**2:.0f}} MiB/s"
+        elif speed >= 1024:     spd = f"{{speed/1024:.0f}} KiB/s"
+        else:                   spd = f"{{speed:.0f}} B/s"
+        J(progress=dict(pct=round(pct,1), done_mb=round(done_bytes/1024**2,1),
+                        total_mb=round(total_bytes/1024**2,1), speed=spd,
+                        idx=i, total_files=total_files, file=fname))
+    total_elapsed = time.time() - dl_start
+    avg = done_bytes / max(total_elapsed, 0.001)
+    avg_str = f"{{avg/1024**2:.0f}} MiB/s" if avg >= 1024**2 else f"{{avg/1024:.0f}} KiB/s"
+    out_path = local_dir or result_path or "HF cache"
+    J(status="complete", path=out_path, avg_speed=avg_str,
+      elapsed=f"{{total_elapsed/60:.1f}} min" if total_elapsed > 60 else f"{{total_elapsed:.0f}}s",
+      errors=len(errors))
 except Exception as e:
-    print(json.dumps({{"status": "error", "error": str(e)}}), flush=True)
+    J(status="error", error=str(e))
 """
 
     async def stream() -> AsyncGenerator[str, None]:
@@ -1029,6 +1101,33 @@ async def remove_inventory_dir(path: str):
     dirs = [d for d in _load_custom_dirs() if os.path.expanduser(d) != expanded]
     _save_custom_dirs(dirs)
     return {"ok": True, "dirs": dirs}
+
+
+class DeleteModelRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/hf/inventory/delete")
+async def delete_inventory_model(req: DeleteModelRequest):
+    """Delete a downloaded model directory from disk."""
+    target = Path(os.path.expanduser(req.path.strip())).resolve()
+
+    # Safety: only allow deletion under HF cache or known custom dirs
+    allowed_roots = [HF_CACHE_DIR.resolve()]
+    for d in _load_custom_dirs():
+        allowed_roots.append(Path(os.path.expanduser(d)).resolve())
+    if not any(str(target).startswith(str(r)) for r in allowed_roots):
+        raise HTTPException(400, f"Path is not under a known model directory")
+    if not target.exists():
+        raise HTTPException(404, "Directory not found")
+    if not target.is_dir():
+        raise HTTPException(400, "Path is not a directory")
+
+    try:
+        shutil.rmtree(target)
+        return {"ok": True, "deleted": str(target)}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete: {e}")
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 
@@ -1520,6 +1619,13 @@ body::before{
   background:var(--s1);border:1px solid var(--border);
   border-top:none;border-radius:0 0 8px 8px;
 }
+.btn-icon-del{
+  background:none;border:1px solid transparent;border-radius:4px;
+  color:var(--muted);font-size:13px;cursor:pointer;
+  width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  transition:all .12s;padding:0;
+}
+.btn-icon-del:hover{color:var(--red);border-color:var(--red);background:#180808}
 .inv-custom-dirs{
   display:flex;flex-direction:column;gap:6px;
   margin-bottom:14px;
@@ -2325,11 +2431,14 @@ async function hfDownload() {
 
   const btn  = document.getElementById('hf-btn');
   const prog = document.getElementById('hf-progress');
+  const bar  = document.getElementById('hf-bar');
   const log  = document.getElementById('hf-log');
 
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Downloading…';
   prog.classList.add('show');
+  bar.className = 'prog-bar spin';
+  bar.style.width = '';
   log.textContent = 'Starting download: ' + repo;
 
   try {
@@ -2349,15 +2458,33 @@ async function hfDownload() {
         try {
           const ev = JSON.parse(line.slice(6));
           if (ev.status === 'complete') {
-            toast('✓ Downloaded: ' + ev.path, 'ok');
-            log.textContent += '\n✓ Complete → ' + ev.path;
+            bar.className = 'prog-bar';
+            bar.style.width = '100%';
+            const parts = ['✓ Complete → ' + ev.path];
+            if (ev.avg_speed) parts.push('Avg: ' + ev.avg_speed);
+            if (ev.elapsed) parts.push('Time: ' + ev.elapsed);
+            if (ev.errors > 0) parts.push('⚠ ' + ev.errors + ' error(s)');
+            log.textContent = parts.join('  ·  ');
+            toast('✓ Downloaded: ' + repo, 'ok');
           } else if (ev.status === 'error') {
+            bar.className = 'prog-bar';
+            bar.style.width = '0';
             toast('Error: ' + ev.error, 'err');
-            log.textContent += '\n✗ ' + ev.error;
-          } else if (ev.log) {
-            log.textContent += '\n' + ev.log;
+            log.textContent = '✗ ' + ev.error;
+          } else if (ev.progress) {
+            const p = ev.progress;
+            bar.className = 'prog-bar';
+            bar.style.width = p.pct + '%';
+            log.textContent = '[' + p.idx + '/' + p.total_files + '] ' + p.file
+              + '\n' + p.pct + '% · '
+              + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB · ' + p.speed;
+          } else if (ev.file_start) {
+            const f = ev.file_start;
+            log.textContent = '[' + f.idx + '/' + f.total + '] Downloading ' + f.name + ' (' + f.size_str + ')';
+          } else if (ev.file_error) {
+            log.textContent += '\n⚠ Failed: ' + ev.file_error.name + ' — ' + ev.file_error.error;
           } else if (ev.status) {
-            log.textContent += '\n' + ev.status;
+            log.textContent = ev.status;
           }
           log.scrollTop = log.scrollHeight;
         } catch(e) {}
@@ -2419,6 +2546,7 @@ function renderInventoryDir(dirData, isFirst) {
       <th>Reasoning</th>
       <th>Script</th>
       <th>Modalities</th>
+      <th style="width:36px"></th>
     </tr></thead>
     <tbody>`;
 
@@ -2454,6 +2582,7 @@ function renderInventoryDir(dirData, isFirst) {
       <td>${reasonBadge}</td>
       <td>${scriptBadge}</td>
       <td>${modBadges}</td>
+      <td><button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel('${m.dir_path}','${m.full_name || m.name}')">✕</button></td>
     </tr>`;
   }
 
@@ -2522,6 +2651,17 @@ async function removeInventoryDir(path) {
     await loadInventory();
   } catch(e) {
     toast('Failed: ' + e.message, 'err');
+  }
+}
+
+async function deleteInventoryModel(dirPath, modelName) {
+  if (!confirm('Delete "' + modelName + '" from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
+  try {
+    await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath});
+    toast('✓ Deleted: ' + modelName, 'ok');
+    await loadInventory();
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
   }
 }
 
