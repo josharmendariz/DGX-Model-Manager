@@ -1604,10 +1604,12 @@ async def auth_check(request: Request):
 async def sudo_check():
     """Check if passwordless sudo works for the commands the app needs."""
     checks = {}
-    # LiteLLM restart
+    # LiteLLM restart — use `sudo -ln` to check permission without executing.
+    # Matches the exact command setup.sh grants in /etc/sudoers.d/model-manager-litellm.
     try:
-        r = await _run("sudo", "-n", "systemctl", "restart", "--dry-run", "litellm", timeout=5)
+        r = await _run("sudo", "-ln", "/bin/systemctl", "restart", "litellm", timeout=5)
         if r.returncode != 0:
+            # Fall back to blanket passwordless check (covers users with broader sudo access)
             r = await _run("sudo", "-n", "true", timeout=5)
         checks["systemctl"] = r.returncode == 0
     except Exception:
@@ -2613,7 +2615,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
   <div class="status-cluster">
     <div class="pill" id="pill-ollama"><div class="dot"></div><span>Ollama</span></div>
     <div class="pill" id="pill-litellm"><div class="dot"></div><span>LiteLLM</span></div>
-""" + "".join(f'    <div class="pill" id="pill-{k}"><div class="dot"></div><span>{e["name"]}</span></div>\n' for k, e in _ENGINES.items()) + r"""
+""" + "".join(f'    <div class="pill" id="pill-{k}"><div class="dot"></div><span>{e["name"]}</span></div>\n' for k, e in _ENGINES.items()) + """
     <button class="refresh-btn" onclick="pollStatus()" title="Refresh status">↻</button>
     <a href="/help" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--muted);text-decoration:none;padding:4px 10px;border:1px solid var(--border);border-radius:5px;transition:all .15s;" onmouseover="this.style.color='var(--amber)';this.style.borderColor='var(--amber)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">? Docs</a>
   </div>
@@ -2642,7 +2644,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       <span class="nav-badge" id="badge-litellm">—</span>
     </div>
     <div class="nav-section-label">Engines</div>
-""" + "".join(f'    <div class="nav-item" id="nav-{k}" onclick="switchTab(\'{k}\')">\n      <span class="nav-icon">{e["icon"]}</span>{e["name"]}\n    </div>\n' for k, e in _ENGINES.items()) + r"""
+""" + "".join(f'    <div class="nav-item" id="nav-{k}" onclick="switchTab(\'{k}\')">\n      <span class="nav-icon">{e["icon"]}</span>{e["name"]}\n    </div>\n' for k, e in _ENGINES.items()) + """
     <div class="nav-section-label">System</div>
     <div class="nav-item" id="nav-settings" onclick="switchTab('settings')">
       <span class="nav-icon">&#9881;</span>Settings
@@ -2882,7 +2884,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
         <div class="prog-log" id="{k}-log"></div>
       </div>
     </div>
-''' for k, e in _ENGINES.items()) + r"""
+''' for k, e in _ENGINES.items()) + """
     <!-- ─── SETTINGS ─── -->
     <div class="tab" id="tab-settings">
       <div class="page-hdr">
@@ -2934,7 +2936,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
           <button class="btn btn-sm" onclick="testService('{k}')">Test</button>
         </div>
       </div>
-''' for k, e in _ENGINES.items()) + r"""
+''' for k, e in _ENGINES.items()) + """
 
       <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
         <button class="btn btn-primary" onclick="saveConfig()">Save Configuration</button>
@@ -2989,7 +2991,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
         <div id="debug-cfg-{k}" class="config-block" style="margin-top:10px">Loading...</div>
         </details>
       </div>
-''' for k, e in _ENGINES.items()) + r"""
+''' for k, e in _ENGINES.items()) + """
 
       <div class="sec-label">Application Logs</div>
       <div class="card" style="margin-bottom:18px">
@@ -3016,7 +3018,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       <div class="card" style="margin-bottom:18px">
         <div class="log-toolbar">
           <div class="log-tab-bar">
-""" + "".join(f'            <button class="btn btn-sm log-tab-btn{" active" if i == 0 else ""}" id="eng-tab-{k}" onclick="switchEngineLog(\'{k}\')">{e["name"]}</button>\n' for i, (k, e) in enumerate(_ENGINES.items())) + r"""          </div>
+""" + "".join(f'            <button class="btn btn-sm log-tab-btn{" active" if i == 0 else ""}" id="eng-tab-{k}" onclick="switchEngineLog(\'{k}\')">{e["name"]}</button>\n' for i, (k, e) in enumerate(_ENGINES.items())) + """          </div>
           <input class="input" id="engine-log-search" placeholder="Search..." style="flex:1" onkeydown="if(event.key==='Enter')loadEngineLog()">
           <label class="log-auto-label"><input type="checkbox" id="engine-auto-refresh"> Auto</label>
           <button class="btn btn-sm" onclick="loadEngineLog()">Refresh</button>
@@ -3430,7 +3432,7 @@ const engines = {
            card: '{k}-engine-card', stop: '{k}-stop-btn', start: '{k}-start-btn',
            profiles: '{k}-profile-list', prog: '{k}-progress', log: '{k}-log',
            footer: '{k}-engine-footer'{(", webui: '" + k + "-webui-btn'") if e.get("webui") else ""} }}
-  }}''' for k, e in _ENGINES.items()) + r"""
+  }}''' for k, e in _ENGINES.items()) + """
 };
 
 async function loadEngineStatus(eng) {
@@ -3808,7 +3810,7 @@ async function loadCustomDirs() {
     }
     customDirsEl.innerHTML = customDirs.map(dir => {
       return '<div class="inv-custom-dir-row">'
-        + '<span class="inv-custom-dir-path">' + dir.path.replace(/^\/home\/[^/]+/, '~') + '</span>'
+        + '<span class="inv-custom-dir-path">' + dir.path.replace(/^\\/home\\/[^/]+/, '~') + '</span>'
         + '<button class="inv-remove-btn" onclick="removeInventoryDir(\'' + dir.path.replace(/'/g,"\\'") + '\')">&#10005; Remove</button>'
         + '</div>';
     }).join('');
@@ -3902,7 +3904,7 @@ function renderHFBCard(m) {
     .map(t => '<span class="hfb-tag">' + t + '</span>').join('');
   const safeId = m.id.replace(/'/g, "\\'");
 
-  return '<div class="hfb-card" id="hfb-card-' + m.id.replace(/\//g, '--') + '">'
+  return '<div class="hfb-card" id="hfb-card-' + m.id.replace(/\\//g, '--') + '">'
     + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + m.id + '</div>' + taskBadge + '</div>'
     + '<div class="hfb-card-meta">'
     + '<span class="dl">&#11015; ' + fmtNum(m.downloads) + '</span>'
@@ -3914,12 +3916,12 @@ function renderHFBCard(m) {
     + '<button class="btn btn-sm btn-primary" onclick="hfbDownload(\'' + safeId + '\')">Download</button>'
     + '<button class="hfb-expand-toggle" onclick="hfbToggleExpand(\'' + safeId + '\')">&#9660; Files &amp; Variants</button>'
     + '</div>'
-    + '<div class="hfb-expand" id="hfb-exp-' + m.id.replace(/\//g, '--') + '" style="display:none"></div>'
+    + '<div class="hfb-expand" id="hfb-exp-' + m.id.replace(/\\//g, '--') + '" style="display:none"></div>'
     + '</div>';
 }
 
 async function hfbToggleExpand(modelId) {
-  const elId = 'hfb-exp-' + modelId.replace(/\//g, '--');
+  const elId = 'hfb-exp-' + modelId.replace(/\\//g, '--');
   const el = document.getElementById(elId);
   if (!el) return;
   if (el.style.display !== 'none') { el.style.display = 'none'; return; }
@@ -4016,7 +4018,7 @@ async function loadSystemOverview() {
     const hfDisk = d.disk?.hf_cache;
     if (hfDisk && !hfDisk.error) {
       html += '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:10px">'
-        + 'Disk: <span style="color:var(--text)">' + hfDisk.path.replace(/^\/home\/[^/]+/,'~') + '</span>'
+        + 'Disk: <span style="color:var(--text)">' + hfDisk.path.replace(/^\\/home\\/[^/]+/,'~') + '</span>'
         + ' &mdash; <span style="color:var(--amber)">' + (hfDisk.total_gb - hfDisk.free_gb).toFixed(1) + '</span> / ' + hfDisk.total_gb + ' GB'
         + ' (' + hfDisk.used_pct + '%)</div>';
     }
@@ -4163,7 +4165,7 @@ async function loadEngineLog() {
     pane.innerHTML = d.lines.map(l => '<div class="log-entry">' + _escHtml(l) + '</div>').join('');
     if (atBottom) pane.scrollTop = pane.scrollHeight;
     if (footer) {
-      const shortFile = d.file.replace(/^\/tmp\//, '/tmp/');
+      const shortFile = d.file.replace(/^\\/tmp\\//, '/tmp/');
       footer.textContent = shortFile + ' \u00B7 ' + d.total_lines + ' total lines'
         + (d.available_files.length > 1 ? ' \u00B7 ' + d.available_files.length + ' log files' : '');
     }
