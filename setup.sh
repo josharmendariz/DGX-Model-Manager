@@ -81,9 +81,15 @@ echo "==> Creating engine script directories"
 
 SGLANG_DIR="$HOME/SGLang"
 VLLM_DIR="$HOME/vLLM"
+LLAMACPP_DIR="$HOME/llama.cpp"
+LOCALAI_DIR="$HOME/LocalAI"
+COMFYUI_DIR="$HOME/ComfyUI"
 
 mkdir -p "$SGLANG_DIR"
 mkdir -p "$VLLM_DIR"
+mkdir -p "$LLAMACPP_DIR"
+mkdir -p "$LOCALAI_DIR"
+mkdir -p "$COMFYUI_DIR"
 
 # Write SGLang example script only if none exist yet
 if ! ls "$SGLANG_DIR"/start_*.sh &>/dev/null; then
@@ -170,8 +176,116 @@ else
   echo "    $VLLM_DIR already has start_*.sh scripts — skipping example"
 fi
 
-echo "    SGLang scripts → $SGLANG_DIR/"
-echo "    vLLM scripts   → $VLLM_DIR/"
+# Write llama.cpp example script only if none exist yet
+if ! ls "$LLAMACPP_DIR"/start_*.sh &>/dev/null; then
+  cat > "$LLAMACPP_DIR/start_example_llamacpp.sh" <<'LLAMACPP_SCRIPT'
+#!/usr/bin/env bash
+# Name: Example llama.cpp Model
+# Description: Replace with your GGUF model description
+# VRAM: 8
+#
+# ── How this file works ───────────────────────────────────────────────────────
+# DGX Model Manager scans ~/llama.cpp/ for files named start_*.sh and lists them
+# as selectable profiles on the llama.cpp tab. The three header comments above
+# (Name, Description, VRAM) control what the UI displays. Remove this file and
+# add your own start_<modelname>.sh scripts to this folder.
+#
+# ── Example: llama-server with a GGUF model ───────────────────────────────────
+# ./llama-server \
+#   --model ~/.cache/huggingface/hub/models--TheBloke--Llama-2-7B-GGUF/llama-2-7b.Q4_K_M.gguf \
+#   --host 0.0.0.0 \
+#   --port 8080 \
+#   --n-gpu-layers 99 \
+#   --ctx-size 4096
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# llama.cpp uses llama-server (formerly server) for OpenAI-compatible inference.
+# Health endpoint: /health    Models endpoint: /v1/models
+# Build from source: cmake -B build && cmake --build build --config Release
+
+echo "Replace this script with your actual llama.cpp launch command."
+echo "See the comments above for an example."
+LLAMACPP_SCRIPT
+  chmod +x "$LLAMACPP_DIR/start_example_llamacpp.sh"
+  echo "    Created $LLAMACPP_DIR/start_example_llamacpp.sh"
+else
+  echo "    $LLAMACPP_DIR already has start_*.sh scripts — skipping example"
+fi
+
+# Write LocalAI example script only if none exist yet
+if ! ls "$LOCALAI_DIR"/start_*.sh &>/dev/null; then
+  cat > "$LOCALAI_DIR/start_example_localai.sh" <<'LOCALAI_SCRIPT'
+#!/usr/bin/env bash
+# Name: Example LocalAI
+# Description: Replace with your LocalAI configuration
+# VRAM: 16
+#
+# ── How this file works ───────────────────────────────────────────────────────
+# DGX Model Manager scans ~/LocalAI/ for files named start_*.sh and lists them
+# as selectable profiles on the LocalAI tab. The three header comments above
+# (Name, Description, VRAM) control what the UI displays. Remove this file and
+# add your own start_<modelname>.sh scripts to this folder.
+#
+# ── Example: LocalAI via Docker ───────────────────────────────────────────────
+# sudo docker run --rm --gpus all \
+#   --name localai \
+#   -v ~/LocalAI/models:/models \
+#   -p 9090:8080 \
+#   localai/localai:latest-gpu-nvidia-cuda-12
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# LocalAI supports LLM, TTS, STT, and image generation in one service.
+# Health endpoint: /readyz    Models endpoint: /v1/models
+
+echo "Replace this script with your actual LocalAI launch command."
+echo "See the comments above for an example."
+LOCALAI_SCRIPT
+  chmod +x "$LOCALAI_DIR/start_example_localai.sh"
+  echo "    Created $LOCALAI_DIR/start_example_localai.sh"
+else
+  echo "    $LOCALAI_DIR already has start_*.sh scripts — skipping example"
+fi
+
+# Write ComfyUI example script only if none exist yet
+if ! ls "$COMFYUI_DIR"/start_*.sh &>/dev/null; then
+  cat > "$COMFYUI_DIR/start_example_comfyui.sh" <<'COMFYUI_SCRIPT'
+#!/usr/bin/env bash
+# Name: Example ComfyUI
+# Description: Replace with your ComfyUI configuration
+# VRAM: 8
+#
+# ── How this file works ───────────────────────────────────────────────────────
+# DGX Model Manager scans ~/ComfyUI/ for files named start_*.sh and lists them
+# as selectable profiles on the ComfyUI tab. The three header comments above
+# (Name, Description, VRAM) control what the UI displays. Remove this file and
+# add your own start_<modelname>.sh scripts to this folder.
+#
+# ── Example: ComfyUI via Docker ───────────────────────────────────────────────
+# sudo docker run --rm --gpus all \
+#   --name comfyui \
+#   -v ~/ComfyUI/models:/comfyui/models \
+#   -v ~/ComfyUI/output:/comfyui/output \
+#   -p 8188:8188 \
+#   comfyanonymous/comfyui:latest
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# ComfyUI provides its own web UI at port 8188. When running, the "Open UI"
+# button on the ComfyUI tab links directly to the ComfyUI interface.
+
+echo "Replace this script with your actual ComfyUI launch command."
+echo "See the comments above for an example."
+COMFYUI_SCRIPT
+  chmod +x "$COMFYUI_DIR/start_example_comfyui.sh"
+  echo "    Created $COMFYUI_DIR/start_example_comfyui.sh"
+else
+  echo "    $COMFYUI_DIR already has start_*.sh scripts — skipping example"
+fi
+
+echo "    SGLang   scripts → $SGLANG_DIR/"
+echo "    vLLM     scripts → $VLLM_DIR/"
+echo "    llama.cpp scripts → $LLAMACPP_DIR/"
+echo "    LocalAI  scripts → $LOCALAI_DIR/"
+echo "    ComfyUI  scripts → $COMFYUI_DIR/"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 PORT=$(python3 -c "import json; d=json.load(open('$SCRIPT_DIR/config.json')); print(d.get('app',{}).get('port',8090))" 2>/dev/null || echo 8090)
