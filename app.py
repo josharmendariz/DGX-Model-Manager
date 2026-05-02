@@ -1052,19 +1052,72 @@ async def _docker_stop(container_id: str) -> tuple[bool, str]:
 async def _engine_status(base_url: str, docker_name: str,
                          health_path: str = "/health",
                          models_path: str | None = "/v1/models") -> dict:
-    """Get running status, loaded model, and container info for an engine."""
-    running = await service_ok(base_url, health_path)
-    model = None
-    if running and models_path:
-        try:
-            r = await _http.get(base_url + models_path, timeout=3.0)
-            d = r.json().get("data", [])
-            if d:
-                model = d[0]["id"]
-        except Exception:
-            pass
-    result = await _run("docker", "ps", "--filter", f"name={docker_name}", "--format", "{{.Names}}\t{{.Status}}", timeout=5)
-    return {"running": running, "model": model, "container_info": result.stdout.strip()}
+    """Get running status, loaded model, and container info for an engine.
+
+    Discovers all Docker containers matching docker_name and health-checks
+    each on its actual published port — handles multi-instance setups
+    (e.g., dual vLLM on ports 8000 + 8001).
+    """
+    import re as _re
+
+    # Discover all matching containers with their published ports
+    result = await _run(
+        "docker", "ps", "--filter", f"name={docker_name}",
+        "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}", timeout=5)
+
+    instances = []
+    for line in (result.stdout.strip().split("\n") if result.stdout.strip() else []):
+        parts = line.split("\t")
+        name = parts[0]
+        status = parts[1] if len(parts) > 1 else ""
+        ports_str = parts[2] if len(parts) > 2 else ""
+
+        # Extract first host port from "0.0.0.0:8001->8001/tcp, ..."
+        port_match = _re.search(r"0\.0\.0\.0:(\d+)->", ports_str)
+        host_port = int(port_match.group(1)) if port_match else None
+
+        inst_url = f"http://127.0.0.1:{host_port}" if host_port else base_url
+        inst_running = await service_ok(inst_url, health_path)
+        inst_model = None
+        if inst_running and models_path:
+            try:
+                r = await _http.get(inst_url + models_path, timeout=3.0)
+                d = r.json().get("data", [])
+                if d:
+                    inst_model = d[0]["id"]
+            except Exception:
+                pass
+
+        instances.append({
+            "name": name, "status": status, "port": host_port,
+            "running": inst_running, "model": inst_model,
+        })
+
+    # No containers found — fall back to direct health check (non-Docker engine)
+    if not instances:
+        running = await service_ok(base_url, health_path)
+        model = None
+        if running and models_path:
+            try:
+                r = await _http.get(base_url + models_path, timeout=3.0)
+                d = r.json().get("data", [])
+                if d:
+                    model = d[0]["id"]
+            except Exception:
+                pass
+        return {"running": running, "model": model, "container_info": "", "instances": []}
+
+    # Aggregate: running if ANY instance is healthy
+    any_running = any(i["running"] for i in instances)
+    primary_model = next((i["model"] for i in instances if i["running"] and i["model"]), None)
+    legacy_info = "\n".join(f"{i['name']}\t{i['status']}" for i in instances)
+
+    return {
+        "running": any_running,
+        "model": primary_model,
+        "container_info": legacy_info,
+        "instances": instances,
+    }
 
 
 def _extract_port(url: str) -> int:
