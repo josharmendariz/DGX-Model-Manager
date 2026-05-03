@@ -1,4 +1,4 @@
-# DGX Model Manager
+# <img src="misc/modman.png" width="26"> DGX Model Manager
 
 A single-file web UI for managing AI models and inference engines on **NVIDIA DGX Spark** and compatible aarch64 GPU systems. Pull Ollama models, browse HuggingFace, manage your local model inventory, route through LiteLLM, and control five inference engines — all from one browser tab.
 
