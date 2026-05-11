@@ -4530,7 +4530,7 @@ async def root():
 
 @app.get("/favicon.png")
 async def favicon():
-    path = Path(os.path.expanduser("~/model-manager/favicon.png"))
+    path = Path(os.path.expanduser("~/DGX-Model-Manager/favicon.png"))
     if not path.exists():
         raise HTTPException(404)
     return FileResponse(path, media_type="image/png")
@@ -4538,9 +4538,9 @@ async def favicon():
 
 @app.get("/help", response_class=HTMLResponse)
 async def help_page():
-    docs_path = Path(os.path.expanduser("~/model-manager/docs.html"))
+    docs_path = Path(os.path.expanduser("~/DGX-Model-Manager/docs.html"))
     if not docs_path.exists():
-        raise HTTPException(404, "docs.html not found in ~/model-manager/")
+        raise HTTPException(404, "docs.html not found in ~/DGX-Model-Manager/")
     return HTMLResponse(docs_path.read_text())
 
 
