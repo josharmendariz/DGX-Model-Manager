@@ -6,6 +6,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.2] - 2026-05-02
+
+### Fixed
+
+- **Multi-instance vLLM detection** — `_engine_status` now discovers all running vLLM containers dynamically via `docker ps`, parses each container's actual published port, and health-checks independently. Previously only checked the single configured base URL (port 8000), so containers on alternate ports (e.g., dual-mode Coder-30B on port 8001) showed `running: false` despite being healthy.
+
+### Changed
+
+- Status response includes a new `instances` array with per-container name, port, running state, and loaded model. Top-level `running`, `model`, and `container_info` fields remain backward-compatible.
+
+---
+
+## [0.1.1] - 2026-04-23
+
+### Fixed
+
+- **Passwordless sudo check false negative** — the LiteLLM tab showed a "Passwordless sudo not configured" warning even when the sudoers rule from `setup.sh` was correctly installed. The check ran `sudo -n systemctl restart --dry-run litellm`, which didn't match the exact command granted in `/etc/sudoers.d/model-manager-litellm` (sudo matches arguments strictly, and `--dry-run` isn't part of the grant). Replaced with `sudo -ln /bin/systemctl restart litellm`, which asks sudo whether the command would be permitted without actually executing anything and matches the installed rule exactly.
+
+---
+
 ## [0.1.0] - 2026-04-23
 
 ### Added
