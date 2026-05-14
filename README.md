@@ -31,12 +31,12 @@ DGX Model Manager is a **lightweight control panel** for AI infrastructure. It d
 Your Apps (Open WebUI, agents, scripts, any OpenAI-compatible client)
          |
          v
-   LiteLLM :4000  ────────────────────┬────────────┬──────────────┐
-         |                            |            |              |
-         v                            v            v              v
-  SGLang :30000                 Ollama :11434   vLLM :8000    llama.cpp :8080
-  (large models,                (small/medium,  (alternative   (GGUF models)
-   NVFP4, MoE)                  hot-swap)        engine)
+   LiteLLM :4000  ──────────────────┬────────────┬──────────────┐
+         |                          |            |              |
+         v                          v            v              v
+  SGLang :30000               Ollama :11434   vLLM :8000    llama.cpp :8080
+  (large models)              (small/medium,  (alternative   (GGUF models)
+                               hot-swap)       engine)
 
   Also managed:  LocalAI :9090 (multi-modal)  |  ComfyUI :8188 (image gen UI)
 
@@ -101,8 +101,7 @@ Copy `config.example.json` to `config.json` and edit as needed. The repo ships w
 {
   "app": {
     "host": "0.0.0.0",
-    "port": 8090,
-    "display_name": "DGX Spark"
+    "port": 8090
   },
   "services": {
     "ollama_base":   "http://127.0.0.1:11434",
@@ -171,22 +170,19 @@ All five engines (SGLang, vLLM, llama.cpp, LocalAI, ComfyUI) share the same prof
 
 ```bash
 #!/usr/bin/env bash
-# Name: Mistral Small 4
-# Description: 119B NVFP4 -- ~5 min warm-up
-# VRAM: 119
+# Name: My Model
+# Description: Brief description of this profile
+# VRAM: 48
 
 sudo docker run --rm --gpus all --ipc=host \
   --name my-sglang-container \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
   -p 30000:30000 \
-  lmsysorg/sglang:nightly-dev-cu13 \
+  lmsysorg/sglang:latest \
   python3 -m sglang.launch_server \
-    --model-path /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
-    --quantization modelopt_fp4 \
+    --model-path /root/.cache/huggingface/hub/models--owner--model/snapshots/main \
     --host 0.0.0.0 \
-    --port 30000 \
-    --tool-call-parser mistral
+    --port 30000
 ```
 
 The three header fields (`# Name:`, `# Description:`, `# VRAM:`) are optional. Without them, the name is derived from the filename and VRAM shows as `--`.
@@ -248,7 +244,7 @@ Search HuggingFace Hub without leaving the app. Filter by pipeline type, sort by
 
 ## HuggingFace Download
 
-Stream any model from HuggingFace Hub to your local cache with real-time progress and resume support.
+Stream any model from HuggingFace Hub to your local cache with real-time progress and resume support. Downloads to the default HF cache by default. To download to a custom directory, register it first under **Inventory → Scan Directories**.
 
 <img src="misc/hf_download.png" alt="HuggingFace Download tab" width="900">
 
@@ -256,7 +252,7 @@ Stream any model from HuggingFace Hub to your local cache with real-time progres
 
 ## Settings
 
-Centralized configuration for display name, all 7 service URLs, and API key management. One-click connectivity testing for every service.
+Centralized configuration for all 7 service URLs and API key management. One-click connectivity testing for every service.
 
 <img src="misc/settings.png" alt="Settings tab" width="900">
 
@@ -264,13 +260,14 @@ Centralized configuration for display name, all 7 service URLs, and API key mana
 
 ## Security
 
-API key authentication is **optional** and can be enabled from the Settings tab:
+API key authentication is **optional** and can be enabled from the Settings tab.
 
-- When enabled, all mutating endpoints (start/stop engines, pull/delete models, update config) require the key via `Authorization: Bearer <key>` header
-- Read-only endpoints (status, inventory, profiles) remain accessible without auth
-- The key is stored in `config.json` as a SHA-256 hash — the plaintext key is never written to disk
-- Verification uses constant-time `hmac.compare_digest()` on the hashes to prevent timing attacks
+- When set, all mutating operations and sensitive read endpoints require the key via `Authorization: Bearer <key>`
+- Basic status, inventory, and profile endpoints remain accessible without auth
+- The key is stored in `config.json` as a SHA-256 hash — the plaintext is never written to disk
+- Verification uses constant-time `hmac.compare_digest()` to prevent timing attacks
 - Legacy plaintext keys from older versions are auto-upgraded to hashes on first load
+- If the app starts bound to a non-loopback address with no key set, it emits a warning to the systemd journal and waits 10 seconds before accepting connections. Set `MODEL_MANAGER_ALLOW_UNAUTH=1` to suppress this.
 
 ---
 
@@ -295,7 +292,7 @@ Application logs are in-memory only (no disk writes). The buffer clears on app r
 
 ## Built-in Documentation
 
-Full user manual served at `/help` covering every feature, the profile system, security setup, and API reference.
+Full user manual served at `/help` covering every feature, the profile system, security setup, and troubleshooting.
 
 <img src="misc/docs.png" alt="Documentation page" width="900">
 
@@ -332,45 +329,11 @@ sudo systemctl disable model-manager
 
 ---
 
-## Model Recommendations for DGX Spark (128 GB)
-
-### With a large-model engine running (~31 GB available for Ollama)
-
-| Model | Pull Name | Size | Use Case |
-|-------|-----------|------|----------|
-| Qwen2.5 Coder 32B | `qwen2.5-coder:32b` | ~20 GB | Coding |
-| QwQ 32B | `qwq:32b` | ~20 GB | Reasoning |
-| Phi-4 | `phi4` | ~8 GB | General, fast |
-| DeepSeek-R1 14B | `deepseek-r1:14b` | ~9 GB | Reasoning |
-| Nomic Embed | `nomic-embed-text` | <1 GB | Embeddings/RAG |
-
-### With engines stopped (full 128 GB)
-
-| Model | Pull Name | Size | Use Case |
-|-------|-----------|------|----------|
-| Qwen3 Coder Next | `qwen3-coder-next` | ~54 GB | Agentic coding, 256K context |
-| DeepSeek-R1 70B | `deepseek-r1:70b` | ~43 GB | Heavy reasoning |
-| Qwen2.5 72B | `qwen2.5:72b` | ~45 GB | General, large |
-
----
-
-## GB10 / SM121A Notes
-
-The GB10 chip uses the `sm_121a` architecture. Two workarounds for the PTXAS compatibility issue:
-
-**Option A (recommended):** Set `TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas` in your Docker environment. This tells Triton to use the system CUDA `ptxas` which natively supports SM121A, and allows use of the FlashInfer attention backend.
-
-**Option B (fallback):** Add `--attention-backend triton` to your SGLang launch flags. This bypasses the broken ptxas path entirely.
-
-See [triton-lang/triton#8539](https://github.com/triton-lang/triton/issues/8539) for upstream tracking.
-
----
-
 ## Project Structure
 
 ```
-model-manager/
-  app.py              # The entire application (~4,400 lines)
+DGX-Model-Manager/
+  app.py              # The entire application (~4,500 lines)
   config.example.json # Default config — copy to config.json
   config.json         # Your runtime config (gitignored)
   requirements.txt    # Python dependencies
@@ -388,7 +351,7 @@ The app is a **single Python file** by design. All HTML, CSS, and JavaScript are
 
 ## API Reference
 
-All endpoints are under `/api/`. Read-only endpoints are unauthenticated. Mutating endpoints require the API key header when auth is enabled.
+All endpoints are under `/api/`. Basic status and inventory endpoints are unauthenticated. Mutating and diagnostic endpoints require the API key when auth is enabled.
 
 <details>
 <summary>Click to expand endpoint list</summary>
@@ -401,9 +364,10 @@ All endpoints are under `/api/`. Read-only endpoints are unauthenticated. Mutati
 | PUT | `/api/config` | Yes | Update configuration |
 | GET | `/api/ollama/models` | No | List installed Ollama models |
 | POST | `/api/ollama/pull` | Yes | Pull an Ollama model (streaming) |
-| DELETE | `/api/ollama/model/{name}` | Yes | Delete an Ollama model |
-| GET | `/api/litellm/routes` | No | Active LiteLLM routes |
-| POST | `/api/litellm/wildcard` | Yes | Apply wildcard routing |
+| DELETE | `/api/ollama/models/{name}` | Yes | Delete an Ollama model |
+| GET | `/api/litellm/models` | No | Active LiteLLM routes |
+| GET | `/api/litellm/config` | Yes | LiteLLM config file |
+| POST | `/api/litellm/apply-wildcard` | Yes | Apply wildcard routing |
 | POST | `/api/litellm/restart` | Yes | Restart LiteLLM service |
 | GET | `/api/{engine}/profiles` | No | List engine profiles |
 | GET | `/api/{engine}/status` | No | Engine health + running model |
@@ -412,11 +376,17 @@ All endpoints are under `/api/`. Read-only endpoints are unauthenticated. Mutati
 | GET | `/api/inventory` | No | Unified model inventory |
 | GET | `/api/hf/search` | No | Search HuggingFace Hub |
 | POST | `/api/hf/download` | Yes | Download from HF Hub (streaming) |
-| GET | `/api/debug/system` | No | System diagnostics |
-| GET | `/api/debug/config` | No | Running configuration |
-| GET | `/api/logs/app` | No | Application log buffer |
-| GET | `/api/logs/engine/{engine}` | No | Engine log files |
-| GET | `/api/debug/docker` | No | Docker container state |
+| GET | `/api/hf/inventory/dirs` | No | List custom scan directories |
+| POST | `/api/hf/inventory/dirs` | Yes | Add a custom directory |
+| DELETE | `/api/hf/inventory/dirs` | Yes | Remove a custom directory |
+| POST | `/api/hf/inventory/delete` | Yes | Delete a model from disk |
+| GET | `/api/debug/system` | Yes | System diagnostics |
+| GET | `/api/debug/config` | Yes | Running configuration |
+| GET | `/api/debug/docker` | Yes | Docker container state |
+| GET | `/api/logs/app` | Yes | Application log buffer |
+| DELETE | `/api/logs/app` | Yes | Clear log buffer |
+| GET | `/api/logs/engine/{engine}` | Yes | Engine log files |
+| GET | `/api/logs/litellm` | Yes | LiteLLM journalctl output |
 
 `{engine}` is one of: `sglang`, `vllm`, `llamacpp`, `localai`, `comfyui`
 
