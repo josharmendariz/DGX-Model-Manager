@@ -87,10 +87,11 @@ _app_config: dict = {}
 if _CONFIG_FILE.exists():
     try:
         _app_config = json.loads(_CONFIG_FILE.read_text())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"WARNING: failed to parse {_CONFIG_FILE}: {e} — starting with defaults", flush=True)
 
 APP_PORT = _app_config.get("app", {}).get("port", 8090)
+APP_HOST = _app_config.get("app", {}).get("host", "0.0.0.0")
 
 
 def _hash_key(key: str) -> str:
@@ -832,6 +833,19 @@ _http: httpx.AsyncClient = None  # type: ignore[assignment]
 async def _lifespan(app):
     global _http
     _http = httpx.AsyncClient(timeout=10.0)
+    if APP_HOST not in ("127.0.0.1", "::1", "localhost") and not _API_KEY_HASH:
+        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+            msg = (f"SECURITY WARNING: binding to {APP_HOST} with no API key set — "
+                   "the management UI is open to anyone on this network. "
+                   "Set an API key in Settings, or set MODEL_MANAGER_ALLOW_UNAUTH=1 to suppress this warning. "
+                   "Waiting 10 seconds before accepting connections...")
+            _logger.warning(msg)
+            print(msg, flush=True)
+            await asyncio.sleep(10)
+        else:
+            msg = "SECURITY NOTICE: no API key set and MODEL_MANAGER_ALLOW_UNAUTH=1 — open access acknowledged."
+            _logger.warning(msg)
+            print(msg, flush=True)
     _logger.info("App started on port %s", APP_PORT)
     yield
     _logger.info("App shutting down")
@@ -966,7 +980,7 @@ async def list_litellm_models():
         raise HTTPException(502, str(e))
 
 
-@app.get("/api/litellm/config")
+@app.get("/api/litellm/config", dependencies=[Depends(verify_auth)])
 async def get_litellm_config():
     if not LITELLM_CONFIG.exists():
         return {"model_list": [], "_raw": "# config file not found"}
@@ -1157,7 +1171,12 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str) -> dict:
     safe_id = _re.sub(r"[^a-zA-Z0-9._-]", "_", req_profile)
     log_path = f"/tmp/{engine_name.lower()}_{safe_id}.log"
     _logger.info("%s starting profile '%s' — script: %s", engine_name, profile["name"], script)
-    with open(log_path, "w") as logf:
+    try:
+        _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        os.unlink(log_path)
+        _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(_fd, "w") as logf:
         subprocess.Popen(
             ["bash", script],
             stdout=logf, stderr=subprocess.STDOUT,
@@ -1282,8 +1301,14 @@ async def hf_download(req: HFDownloadRequest):
     local_dir = (req.local_dir or "").strip()
     if local_dir and ("\0" in local_dir or "\n" in local_dir):
         raise HTTPException(400, "Invalid characters in local directory path")
-    if local_dir and ".." in Path(local_dir).parts:
-        raise HTTPException(400, "Path traversal not allowed in local directory")
+    if local_dir:
+        _expanded = os.path.expanduser(local_dir)
+        _resolved = Path(_expanded).resolve()
+        _allowed = [HF_CACHE_DIR.resolve()] + [
+            Path(os.path.expanduser(d)).resolve() for d in _load_custom_dirs()
+        ]
+        if not any(_resolved == r or _resolved.is_relative_to(r) for r in _allowed):
+            raise HTTPException(403, "Download directory is not under any allowed root")
 
     # Track custom dir so inventory can scan it later
     if local_dir:
@@ -1727,7 +1752,9 @@ async def update_config(req: ConfigUpdate):
 
     try:
         _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+        _tmp = _CONFIG_FILE.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(cfg, indent=2))
+        os.replace(_tmp, _CONFIG_FILE)
     except OSError as e:
         _logger.error("Failed to write config: %s", e)
         raise HTTPException(500, f"Config applied in memory but failed to save to disk: {e}")
@@ -1766,7 +1793,7 @@ async def test_service(req: TestServiceRequest):
 
 # ── Debug & Logs ─────────────────────────────────────────────────────────────
 
-@app.get("/api/debug/system")
+@app.get("/api/debug/system", dependencies=[Depends(verify_auth)])
 async def debug_system():
     """Comprehensive system overview for diagnostics."""
     # Service health checks with response time (parallel)
@@ -1832,7 +1859,7 @@ async def debug_system():
     }
 
 
-@app.get("/api/debug/config")
+@app.get("/api/debug/config", dependencies=[Depends(verify_auth)])
 async def debug_config():
     """Return organized running configuration."""
     litellm_cfg = None
@@ -1863,7 +1890,7 @@ async def debug_config():
     }
 
 
-@app.get("/api/logs/app")
+@app.get("/api/logs/app", dependencies=[Depends(verify_auth)])
 async def get_app_logs(level: str = None, search: str = None, limit: int = 200):
     """Return recent application log entries from the in-memory ring buffer."""
     entries = _log_handler.get_entries(level=level, search=search, limit=limit)
@@ -1878,7 +1905,7 @@ async def clear_app_logs():
     return {"ok": True}
 
 
-@app.get("/api/logs/engine/{engine}")
+@app.get("/api/logs/engine/{engine}", dependencies=[Depends(verify_auth)])
 async def get_engine_logs(engine: str, lines: int = 150, search: str = None):
     """Read log files for SGLang or vLLM engine."""
     if engine not in _ENGINES:
@@ -1917,7 +1944,7 @@ async def get_litellm_logs(lines: int = 100, search: str = None):
     return {"lines": [], "available": False, "error": "journalctl access denied — add user to systemd-journal group or configure sudo"}
 
 
-@app.get("/api/debug/docker")
+@app.get("/api/debug/docker", dependencies=[Depends(verify_auth)])
 async def debug_docker():
     """Return running Docker container state."""
     r = await _run("docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.CreatedAt}}", timeout=10)
@@ -4530,19 +4557,18 @@ async def root():
 
 @app.get("/favicon.png")
 async def favicon():
-    path = Path(os.path.expanduser("~/DGX-Model-Manager/favicon.png"))
+    path = _APP_DIR / "favicon.png"
     if not path.exists():
         raise HTTPException(404)
     return FileResponse(path, media_type="image/png")
 
-
 @app.get("/help", response_class=HTMLResponse)
 async def help_page():
-    docs_path = Path(os.path.expanduser("~/DGX-Model-Manager/docs.html"))
+    docs_path = _APP_DIR / "docs.html"
     if not docs_path.exists():
-        raise HTTPException(404, "docs.html not found in ~/DGX-Model-Manager/")
+        raise HTTPException(404, "docs.html not found")
     return HTMLResponse(docs_path.read_text())
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=APP_PORT, log_level="info")
+    uvicorn.run(app, host=APP_HOST, port=APP_PORT, log_level="info")
