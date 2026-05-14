@@ -6,6 +6,75 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.2.0] - 2026-05-14
+
+### Security
+
+Thanks to [@DavRodSwede](https://github.com/DavRodSwede) for a thorough static
+security audit that drove all changes in this release.
+See [issue #3](https://github.com/calico88x/DGX-Model-Manager/issues/3) for the full report.
+
+- **Authenticated debug and log endpoints** — `GET /api/debug/config`,
+  `/api/debug/system`, `/api/debug/docker`, `/api/logs/app`,
+  `/api/logs/litellm`, `/api/logs/engine/{engine}`, and `/api/litellm/config`
+  now require auth. These endpoints previously exposed LiteLLM YAML (including
+  upstream API keys), journalctl output, engine launch parameters, and host
+  fingerprint data to anyone reaching port 8090.
+
+- **Startup warning on open LAN** — app now emits a loud warning to the
+  systemd journal and waits 10 seconds before accepting connections if binding
+  to a non-loopback address with no API key configured. Suppressed by setting
+  `MODEL_MANAGER_ALLOW_UNAUTH=1` in the service environment.
+
+- **Configurable bind host** — `host` is now read from `config.json`
+  (`app.host`) and passed to uvicorn, replacing the hardcoded `0.0.0.0`.
+
+- **Atomic config write** — `config.json` is now written to a `.tmp` file and
+  renamed atomically via `os.replace()`. A crash or power loss mid-write
+  previously produced a truncated config that silently dropped the API key hash
+  on next boot, re-opening unauthenticated access.
+
+- **Config load errors now logged** — a corrupted `config.json` at startup
+  previously silently fell back to empty defaults. The error is now printed to
+  stdout and visible in the systemd journal.
+
+- **HF download path containment** — the `local_dir` parameter is now resolved
+  via `Path.resolve()` and validated against the HF cache and registered custom
+  directories, mirroring the protection already on the delete endpoint. Symlink-
+  based traversal is no longer possible.
+
+- **Engine log symlink hardening** — `/tmp/{engine}_*.log` files are now
+  created with `O_EXCL | O_NOFOLLOW`, preventing a symlink attack where a
+  pre-created symlink could cause the log write to clobber an arbitrary file.
+
+- **Relative paths for static files** — `favicon.png` and `docs.html` are now
+  resolved relative to `app.py` via `_APP_DIR`, removing the hardcoded
+  `~/DGX-Model-Manager/` folder name assumption.
+
+### Changed
+
+- **HF download destination validation** — downloads to a custom directory now
+  require the directory to be pre-registered under Inventory → Scan Directories.
+  Unregistered paths are rejected with a 403. Documented in the help page.
+
+### Fixed
+
+- **HF download error handling** — a 403 or other HTTP error response from the
+  download endpoint previously caused the progress UI to spin silently with no
+  feedback. Errors are now surfaced as a toast and the progress bar is hidden.
+
+### Documentation
+
+- Security section updated to reflect the expanded auth scope and first-boot
+  warning behaviour.
+- HF Download section documents the custom directory pre-registration
+  requirement.
+- Troubleshooting section adds entries for HF download 403 errors and silent
+  download failures.
+- Removed non-existent Display Name setting from the Settings section.
+
+---
+
 ## [0.1.2a] - 2026-05-10
 
 ### Fixed
