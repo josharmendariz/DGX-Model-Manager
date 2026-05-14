@@ -1302,13 +1302,12 @@ async def hf_download(req: HFDownloadRequest):
     if local_dir and ("\0" in local_dir or "\n" in local_dir):
         raise HTTPException(400, "Invalid characters in local directory path")
     if local_dir:
-        _expanded = os.path.expanduser(local_dir)
-        _resolved = Path(_expanded).resolve()
+        _target = Path(os.path.expanduser(local_dir)).resolve()
         _allowed = [HF_CACHE_DIR.resolve()] + [
             Path(os.path.expanduser(d)).resolve() for d in _load_custom_dirs()
         ]
-        if not any(_resolved == r or _resolved.is_relative_to(r) for r in _allowed):
-            raise HTTPException(403, "Download directory is not under any allowed root")
+        if not any(_target == r or _target.is_relative_to(r) for r in _allowed):
+            raise HTTPException(403, "Download directory must be the HF cache or a registered custom directory")
 
     # Track custom dir so inventory can scan it later
     if local_dir:
@@ -1927,7 +1926,7 @@ async def get_engine_logs(engine: str, lines: int = 150, search: str = None):
     return {"file": target, "lines": result, "total_lines": len(all_lines), "available_files": log_files}
 
 
-@app.get("/api/logs/litellm")
+@app.get("/api/logs/litellm", dependencies=[Depends(verify_auth)])
 async def get_litellm_logs(lines: int = 100, search: str = None):
     """Read LiteLLM service logs from journalctl."""
     for cmd in (
@@ -3672,6 +3671,11 @@ async function hfDownload() {
       headers: authHeaders(),
       body: JSON.stringify({repo_id: repo, local_dir: dir || undefined}),
     });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
     const reader = resp.body.getReader();
     const dec = new TextDecoder();
 
@@ -3718,6 +3722,7 @@ async function hfDownload() {
     }
   } catch(e) {
     toast('Download failed: ' + e.message, 'err');
+    prog.classList.remove('show');
   } finally {
     btn.disabled = false;
     btn.innerHTML = '⬇ Download';
