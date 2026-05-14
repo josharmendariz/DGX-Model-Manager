@@ -1,1341 +1,1939 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DGX Model Manager · Documentation</title>
-<link rel="icon" type="image/png" href="/favicon.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet">
-<style>
-:root {
-  --bg:       #07080b;
-  --s1:       #0d0f14;
-  --s2:       #131620;
-  --s3:       #1a1e2c;
-  --border:   #1e2234;
-  --border2:  #2a3050;
-  --text:     #c8cce0;
-  --muted:    #565c80;
-  --dim:      #363c58;
-  --amber:    #f0a034;
-  --amber2:   #b87820;
-  --amber-lo: rgba(240,160,52,.08);
-  --green:    #3dba78;
-  --red:      #e05050;
-  --blue:     #5a9af5;
-  --teal:     #3ab8c8;
-  --display:  'Chakra Petch', sans-serif;
-  --mono:     'JetBrains Mono', monospace;
-  --body:     'DM Sans', sans-serif;
-  --sidebar-w: 240px;
-}
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DGX Model Manager · Documentation</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07080b;
+      --s1: #0d0f14;
+      --s2: #131620;
+      --s3: #1a1e2c;
+      --border: #1e2234;
+      --border2: #2a3050;
+      --text: #c8cce0;
+      --muted: #565c80;
+      --dim: #363c58;
+      --amber: #f0a034;
+      --amber2: #b87820;
+      --amber-lo: rgba(240, 160, 52, .08);
+      --green: #3dba78;
+      --red: #e05050;
+      --blue: #5a9af5;
+      --teal: #3ab8c8;
+      --display: 'Chakra Petch', sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+      --body: 'DM Sans', sans-serif;
+      --sidebar-w: 240px;
+    }
 
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { scroll-behavior: smooth; }
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
 
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--body);
-  font-size: 14px;
-  line-height: 1.65;
-  min-height: 100vh;
-}
+    html {
+      scroll-behavior: smooth;
+    }
 
-/* Grid texture overlay */
-body::before {
-  content: '';
-  position: fixed; inset: 0;
-  background-image:
-    linear-gradient(rgba(30,34,52,.4) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(30,34,52,.4) 1px, transparent 1px);
-  background-size: 40px 40px;
-  pointer-events: none;
-  z-index: 0;
-}
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--body);
+      font-size: 14px;
+      line-height: 1.65;
+      min-height: 100vh;
+    }
 
-/* ── TOP NAV ── */
-.topnav {
-  position: fixed; top: 0; left: 0; right: 0;
-  height: 50px;
-  background: rgba(7,8,11,.92);
-  border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(8px);
-  display: flex; align-items: center;
-  padding: 0 24px;
-  gap: 20px;
-  z-index: 100;
-}
-.topnav-brand {
-  font-family: var(--display);
-  font-size: 12px; font-weight: 700;
-  letter-spacing: .14em;
-  color: var(--amber);
-  text-transform: uppercase;
-  text-decoration: none;
-}
-.topnav-sep { width: 1px; height: 20px; background: var(--border); }
-.topnav-title {
-  font-family: var(--mono);
-  font-size: 11px; color: var(--muted);
-  letter-spacing: .06em;
-}
-.topnav-right { margin-left: auto; }
-.topnav-link {
-  font-family: var(--mono);
-  font-size: 11px; color: var(--muted);
-  text-decoration: none;
-  padding: 5px 12px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  transition: all .15s;
-}
-.topnav-link:hover { color: var(--amber); border-color: var(--amber); }
+    /* Grid texture overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(30, 34, 52, .4) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(30, 34, 52, .4) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events: none;
+      z-index: 0;
+    }
 
-/* ── LAYOUT ── */
-.layout {
-  display: flex;
-  margin-top: 50px;
-  min-height: calc(100vh - 50px);
-  position: relative; z-index: 1;
-}
+    /* ── TOP NAV ── */
+    .topnav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 50px;
+      background: rgba(7, 8, 11, .92);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      padding: 0 24px;
+      gap: 20px;
+      z-index: 100;
+    }
 
-/* ── SIDEBAR ── */
-.sidebar {
-  width: var(--sidebar-w);
-  flex-shrink: 0;
-  position: fixed;
-  top: 50px; bottom: 0; left: 0;
-  overflow-y: auto;
-  border-right: 1px solid var(--border);
-  background: var(--s1);
-  padding: 24px 0 40px;
-}
-.sidebar-section {
-  margin-bottom: 6px;
-}
-.sidebar-label {
-  font-family: var(--mono);
-  font-size: 9px; font-weight: 600;
-  letter-spacing: .16em;
-  text-transform: uppercase;
-  color: var(--dim);
-  padding: 10px 20px 4px;
-}
-.sidebar-link {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 20px;
-  font-size: 12px; color: var(--muted);
-  text-decoration: none;
-  border-left: 2px solid transparent;
-  transition: all .12s;
-  line-height: 1.4;
-}
-.sidebar-link:hover { color: var(--text); background: var(--s2); }
-.sidebar-link.active {
-  color: var(--amber);
-  border-left-color: var(--amber);
-  background: var(--amber-lo);
-}
-.sidebar-link .num {
-  font-family: var(--mono);
-  font-size: 9px; color: var(--dim);
-  flex-shrink: 0; width: 18px;
-}
+    .topnav-brand {
+      font-family: var(--display);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .14em;
+      color: var(--amber);
+      text-transform: uppercase;
+      text-decoration: none;
+    }
 
-/* ── MAIN CONTENT ── */
-.content {
-  margin-left: var(--sidebar-w);
-  flex: 1;
-  max-width: 860px;
-  padding: 48px 48px 100px;
-}
+    .topnav-sep {
+      width: 1px;
+      height: 20px;
+      background: var(--border);
+    }
 
-/* ── SECTIONS ── */
-.doc-section {
-  margin-bottom: 72px;
-  animation: fadein .3s ease both;
-}
-@keyframes fadein { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform:none; } }
+    .topnav-title {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      letter-spacing: .06em;
+    }
 
-/* Section eyebrow */
-.eyebrow {
-  font-family: var(--mono);
-  font-size: 10px; font-weight: 600;
-  letter-spacing: .18em;
-  text-transform: uppercase;
-  color: var(--amber);
-  margin-bottom: 8px;
-  display: flex; align-items: center; gap: 10px;
-}
-.eyebrow::after {
-  content: '';
-  flex: 0 0 40px; height: 1px;
-  background: var(--amber2);
-  opacity: .5;
-}
+    .topnav-right {
+      margin-left: auto;
+    }
 
-/* Section title */
-.doc-section h2 {
-  font-family: var(--display);
-  font-size: 26px; font-weight: 700;
-  letter-spacing: -.01em;
-  color: #e8eaf8;
-  margin-bottom: 14px;
-  line-height: 1.2;
-}
+    .topnav-link {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 5px 12px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      transition: all .15s;
+    }
 
-.doc-section h3 {
-  font-family: var(--display);
-  font-size: 14px; font-weight: 600;
-  letter-spacing: .04em;
-  color: #b0b4d0;
-  text-transform: uppercase;
-  margin: 28px 0 10px;
-  display: flex; align-items: center; gap: 8px;
-}
-.doc-section h3::after {
-  content: ''; flex: 1; height: 1px;
-  background: var(--border);
-}
+    .topnav-link:hover {
+      color: var(--amber);
+      border-color: var(--amber);
+    }
 
-.doc-section p {
-  color: var(--text);
-  margin-bottom: 14px;
-  max-width: 680px;
-  font-size: 14px;
-  font-weight: 300;
-  line-height: 1.75;
-}
+    /* ── LAYOUT ── */
+    .layout {
+      display: flex;
+      margin-top: 50px;
+      min-height: calc(100vh - 50px);
+      position: relative;
+      z-index: 1;
+    }
 
-.doc-section p code, li code {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--amber);
-  background: rgba(240,160,52,.1);
-  border: 1px solid rgba(240,160,52,.2);
-  padding: 1px 5px;
-  border-radius: 3px;
-}
+    /* ── SIDEBAR ── */
+    .sidebar {
+      width: var(--sidebar-w);
+      flex-shrink: 0;
+      position: fixed;
+      top: 50px;
+      bottom: 0;
+      left: 0;
+      overflow-y: auto;
+      border-right: 1px solid var(--border);
+      background: var(--s1);
+      padding: 24px 0 40px;
+    }
 
-/* ── HERO ── */
-.hero {
-  padding: 0 0 48px;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 56px;
-}
-.hero-tag {
-  font-family: var(--mono);
-  font-size: 10px; font-weight: 600;
-  letter-spacing: .18em;
-  text-transform: uppercase;
-  color: var(--amber);
-  margin-bottom: 16px;
-  display: flex; align-items: center; gap: 8px;
-}
-.hero-tag::before {
-  content: '';
-  width: 20px; height: 1px;
-  background: var(--amber);
-}
-.hero h1 {
-  font-family: var(--display);
-  font-size: 42px; font-weight: 700;
-  letter-spacing: -.02em;
-  line-height: 1.1;
-  color: #f0f2ff;
-  margin-bottom: 16px;
-}
-.hero h1 span { color: var(--amber); }
-.hero-sub {
-  font-size: 15px; font-weight: 300;
-  color: var(--muted);
-  max-width: 560px;
-  line-height: 1.7;
-  margin-bottom: 28px;
-}
+    .sidebar-section {
+      margin-bottom: 6px;
+    }
 
-/* ── ARCH DIAGRAM ── */
-.arch {
-  background: var(--s1);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 24px;
-  margin: 20px 0;
-  font-family: var(--mono);
-  font-size: 11px;
-  overflow-x: auto;
-}
-.arch-row {
-  display: flex; align-items: center;
-  gap: 8px; margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-.arch-box {
-  border: 1px solid var(--border2);
-  border-radius: 5px;
-  padding: 6px 12px;
-  background: var(--s2);
-  color: var(--text);
-  white-space: nowrap;
-  font-size: 11px;
-}
-.arch-box.client { border-color: #2a3050; color: #8090c0; }
-.arch-box.gateway { border-color: var(--amber2); color: var(--amber); background: rgba(240,160,52,.06); padding: 8px 20px; font-weight: 600; }
-.arch-box.backend { border-color: #1a3028; color: #6cc898; background: rgba(60,186,120,.06); }
-.arch-arrow { color: var(--dim); font-size: 16px; }
-.arch-label {
-  font-size: 9px; letter-spacing: .1em;
-  text-transform: uppercase; color: var(--dim);
-  margin-bottom: 6px;
-}
-.arch-center { display: flex; justify-content: center; margin: 6px 0; }
+    .sidebar-label {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      color: var(--dim);
+      padding: 10px 20px 4px;
+    }
 
-/* ── CALLOUTS ── */
-.callout {
-  border-left: 3px solid var(--border2);
-  background: var(--s2);
-  border-radius: 0 6px 6px 0;
-  padding: 12px 16px;
-  margin: 16px 0;
-  font-size: 13px;
-  line-height: 1.65;
-}
-.callout.tip { border-color: var(--green); }
-.callout.warn { border-color: var(--amber); }
-.callout.info { border-color: var(--blue); }
-.callout-label {
-  font-family: var(--mono);
-  font-size: 9px; font-weight: 600;
-  letter-spacing: .14em; text-transform: uppercase;
-  margin-bottom: 5px;
-}
-.callout.tip .callout-label { color: var(--green); }
-.callout.warn .callout-label { color: var(--amber); }
-.callout.info .callout-label { color: var(--blue); }
-.callout p { margin-bottom: 0; font-size: 13px; max-width: none; }
+    .sidebar-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 20px;
+      font-size: 12px;
+      color: var(--muted);
+      text-decoration: none;
+      border-left: 2px solid transparent;
+      transition: all .12s;
+      line-height: 1.4;
+    }
 
-/* ── CODE BLOCKS ── */
-.code-wrap {
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  overflow: hidden;
-  margin: 14px 0;
-}
-.code-header {
-  display: flex; align-items: center;
-  padding: 7px 14px;
-  background: var(--s2);
-  border-bottom: 1px solid var(--border);
-  gap: 8px;
-}
-.code-title {
-  font-family: var(--mono);
-  font-size: 10px; color: var(--muted);
-  letter-spacing: .06em;
-  flex: 1;
-}
-.copy-btn {
-  font-family: var(--mono);
-  font-size: 9px; font-weight: 600;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  background: none; border: 1px solid var(--border);
-  border-radius: 4px; padding: 2px 8px;
-  cursor: pointer;
-  transition: all .12s;
-}
-.copy-btn:hover { color: var(--amber); border-color: var(--amber); }
-.code-body {
-  background: #04050a;
-  padding: 14px 16px;
-  font-family: var(--mono);
-  font-size: 12px; line-height: 1.85;
-  color: #a0a8c8;
-  overflow-x: auto;
-  white-space: pre;
-}
-.code-body .cm { color: var(--dim); }
-.code-body .ck { color: var(--teal); }
-.code-body .cv { color: #8898e0; }
-.code-body .cs { color: #7cc8a0; }
-.code-body .ca { color: var(--amber); }
+    .sidebar-link:hover {
+      color: var(--text);
+      background: var(--s2);
+    }
 
-/* ── MODEL TABLE ── */
-.model-table-wrap {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  margin: 16px 0;
-}
-.model-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-.model-table th {
-  font-family: var(--mono);
-  font-size: 9px; font-weight: 600;
-  letter-spacing: .14em; text-transform: uppercase;
-  color: var(--dim);
-  background: var(--s2);
-  padding: 9px 14px;
-  text-align: left;
-  border-bottom: 1px solid var(--border);
-}
-.model-table td {
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-  vertical-align: top;
-}
-.model-table tr:last-child td { border-bottom: none; }
-.model-table tr:hover td { background: var(--s2); }
-.model-table td:first-child {
-  font-family: var(--mono);
-  font-size: 12px; color: var(--amber);
-  white-space: nowrap;
-}
-.rec-badge {
-  display: inline-block;
-  padding: 1px 7px;
-  border-radius: 3px;
-  font-family: var(--mono);
-  font-size: 9px; font-weight: 600;
-  letter-spacing: .06em; text-transform: uppercase;
-}
-.rec-star { background: #1e1400; color: #d09030; border: 1px solid #2e2000; }
-.rec-fit  { background: #0a1e14; color: #4caf7d; border: 1px solid #0e2a1c; }
-.rec-big  { background: #0a1020; color: #5a7adf; border: 1px solid #0e1830; }
+    .sidebar-link.active {
+      color: var(--amber);
+      border-left-color: var(--amber);
+      background: var(--amber-lo);
+    }
 
-/* ── STEP LIST ── */
-.steps { margin: 16px 0; }
-.step {
-  display: flex; gap: 16px;
-  margin-bottom: 16px;
-}
-.step-num {
-  width: 26px; height: 26px;
-  border-radius: 50%;
-  background: var(--s2); border: 1px solid var(--border2);
-  font-family: var(--mono);
-  font-size: 11px; font-weight: 600;
-  color: var(--amber);
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-.step-body { flex: 1; }
-.step-title {
-  font-family: var(--display);
-  font-size: 13px; font-weight: 600;
-  color: #d0d4f0;
-  margin-bottom: 4px;
-  letter-spacing: .02em;
-}
-.step-desc { font-size: 13px; color: var(--muted); line-height: 1.65; }
+    .sidebar-link .num {
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--dim);
+      flex-shrink: 0;
+      width: 18px;
+    }
 
-/* ── PARAM TABLE ── */
-.param-table { width: 100%; border-collapse: collapse; margin: 14px 0; }
-.param-table td {
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-  vertical-align: top;
-}
-.param-table tr:last-child td { border-bottom: none; }
-.param-table td:first-child {
-  font-family: var(--mono); font-size: 11px;
-  color: var(--teal); white-space: nowrap;
-  width: 180px;
-}
-.param-table td:last-child { color: var(--muted); }
+    /* ── MAIN CONTENT ── */
+    .content {
+      margin-left: var(--sidebar-w);
+      flex: 1;
+      max-width: 860px;
+      padding: 48px 48px 100px;
+    }
 
-/* ── SCROLLBAR ── */
-::-webkit-scrollbar { width: 5px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+    /* ── SECTIONS ── */
+    .doc-section {
+      margin-bottom: 72px;
+      animation: fadein .3s ease both;
+    }
 
-/* ── FOOTER ── */
-.footer {
-  margin-top: 80px;
-  padding-top: 24px;
-  border-top: 1px solid var(--border);
-  font-family: var(--mono);
-  font-size: 10px; color: var(--dim);
-  letter-spacing: .06em;
-  display: flex; justify-content: space-between;
-}
+    @keyframes fadein {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
 
-/* ── Live config values ── */
-.live {
-  background: rgba(240,160,52,.12);
-  border-radius: 3px;
-  padding: 0 3px;
-  border-bottom: 1px solid rgba(240,160,52,.35);
-  transition: background .3s;
-}
-.live.loaded {
-  background: rgba(240,160,52,.18);
-}
-</style>
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    /* Section eyebrow */
+    .eyebrow {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: var(--amber);
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .eyebrow::after {
+      content: '';
+      flex: 0 0 40px;
+      height: 1px;
+      background: var(--amber2);
+      opacity: .5;
+    }
+
+    /* Section title */
+    .doc-section h2 {
+      font-family: var(--display);
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -.01em;
+      color: #e8eaf8;
+      margin-bottom: 14px;
+      line-height: 1.2;
+    }
+
+    .doc-section h3 {
+      font-family: var(--display);
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      color: #b0b4d0;
+      text-transform: uppercase;
+      margin: 28px 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .doc-section h3::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    .doc-section p {
+      color: var(--text);
+      margin-bottom: 14px;
+      max-width: 680px;
+      font-size: 14px;
+      font-weight: 300;
+      line-height: 1.75;
+    }
+
+    .doc-section p code,
+    li code {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--amber);
+      background: rgba(240, 160, 52, .1);
+      border: 1px solid rgba(240, 160, 52, .2);
+      padding: 1px 5px;
+      border-radius: 3px;
+    }
+
+    /* ── HERO ── */
+    .hero {
+      padding: 0 0 48px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 56px;
+    }
+
+    .hero-tag {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      color: var(--amber);
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .hero-tag::before {
+      content: '';
+      width: 20px;
+      height: 1px;
+      background: var(--amber);
+    }
+
+    .hero h1 {
+      font-family: var(--display);
+      font-size: 42px;
+      font-weight: 700;
+      letter-spacing: -.02em;
+      line-height: 1.1;
+      color: #f0f2ff;
+      margin-bottom: 16px;
+    }
+
+    .hero h1 span {
+      color: var(--amber);
+    }
+
+    .hero-sub {
+      font-size: 15px;
+      font-weight: 300;
+      color: var(--muted);
+      max-width: 560px;
+      line-height: 1.7;
+      margin-bottom: 28px;
+    }
+
+    /* ── ARCH DIAGRAM ── */
+    .arch {
+      background: var(--s1);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      margin: 20px 0;
+      font-family: var(--mono);
+      font-size: 11px;
+      overflow-x: auto;
+    }
+
+    .arch-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    .arch-box {
+      border: 1px solid var(--border2);
+      border-radius: 5px;
+      padding: 6px 12px;
+      background: var(--s2);
+      color: var(--text);
+      white-space: nowrap;
+      font-size: 11px;
+    }
+
+    .arch-box.client {
+      border-color: #2a3050;
+      color: #8090c0;
+    }
+
+    .arch-box.gateway {
+      border-color: var(--amber2);
+      color: var(--amber);
+      background: rgba(240, 160, 52, .06);
+      padding: 8px 20px;
+      font-weight: 600;
+    }
+
+    .arch-box.backend {
+      border-color: #1a3028;
+      color: #6cc898;
+      background: rgba(60, 186, 120, .06);
+    }
+
+    .arch-arrow {
+      color: var(--dim);
+      font-size: 16px;
+    }
+
+    .arch-label {
+      font-size: 9px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--dim);
+      margin-bottom: 6px;
+    }
+
+    .arch-center {
+      display: flex;
+      justify-content: center;
+      margin: 6px 0;
+    }
+
+    /* ── CALLOUTS ── */
+    .callout {
+      border-left: 3px solid var(--border2);
+      background: var(--s2);
+      border-radius: 0 6px 6px 0;
+      padding: 12px 16px;
+      margin: 16px 0;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .callout.tip {
+      border-color: var(--green);
+    }
+
+    .callout.warn {
+      border-color: var(--amber);
+    }
+
+    .callout.info {
+      border-color: var(--blue);
+    }
+
+    .callout-label {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      margin-bottom: 5px;
+    }
+
+    .callout.tip .callout-label {
+      color: var(--green);
+    }
+
+    .callout.warn .callout-label {
+      color: var(--amber);
+    }
+
+    .callout.info .callout-label {
+      color: var(--blue);
+    }
+
+    .callout p {
+      margin-bottom: 0;
+      font-size: 13px;
+      max-width: none;
+    }
+
+    /* ── CODE BLOCKS ── */
+    .code-wrap {
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      overflow: hidden;
+      margin: 14px 0;
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      padding: 7px 14px;
+      background: var(--s2);
+      border-bottom: 1px solid var(--border);
+      gap: 8px;
+    }
+
+    .code-title {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      letter-spacing: .06em;
+      flex: 1;
+    }
+
+    .copy-btn {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 8px;
+      cursor: pointer;
+      transition: all .12s;
+    }
+
+    .copy-btn:hover {
+      color: var(--amber);
+      border-color: var(--amber);
+    }
+
+    .code-body {
+      background: #04050a;
+      padding: 14px 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.85;
+      color: #a0a8c8;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .code-body .cm {
+      color: var(--dim);
+    }
+
+    .code-body .ck {
+      color: var(--teal);
+    }
+
+    .code-body .cv {
+      color: #8898e0;
+    }
+
+    .code-body .cs {
+      color: #7cc8a0;
+    }
+
+    .code-body .ca {
+      color: var(--amber);
+    }
+
+    /* ── MODEL TABLE ── */
+    .model-table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      margin: 16px 0;
+    }
+
+    .model-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .model-table th {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--dim);
+      background: var(--s2);
+      padding: 9px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .model-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      vertical-align: top;
+    }
+
+    .model-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .model-table tr:hover td {
+      background: var(--s2);
+    }
+
+    .model-table td:first-child {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--amber);
+      white-space: nowrap;
+    }
+
+    .rec-badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 3px;
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .rec-star {
+      background: #1e1400;
+      color: #d09030;
+      border: 1px solid #2e2000;
+    }
+
+    .rec-fit {
+      background: #0a1e14;
+      color: #4caf7d;
+      border: 1px solid #0e2a1c;
+    }
+
+    .rec-big {
+      background: #0a1020;
+      color: #5a7adf;
+      border: 1px solid #0e1830;
+    }
+
+    /* ── STEP LIST ── */
+    .steps {
+      margin: 16px 0;
+    }
+
+    .step {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .step-num {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: var(--s2);
+      border: 1px solid var(--border2);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--amber);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .step-body {
+      flex: 1;
+    }
+
+    .step-title {
+      font-family: var(--display);
+      font-size: 13px;
+      font-weight: 600;
+      color: #d0d4f0;
+      margin-bottom: 4px;
+      letter-spacing: .02em;
+    }
+
+    .step-desc {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    /* ── PARAM TABLE ── */
+    .param-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+    }
+
+    .param-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      vertical-align: top;
+    }
+
+    .param-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .param-table td:first-child {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--teal);
+      white-space: nowrap;
+      width: 180px;
+    }
+
+    .param-table td:last-child {
+      color: var(--muted);
+    }
+
+    /* ── SCROLLBAR ── */
+    ::-webkit-scrollbar {
+      width: 5px;
+    }
+
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border2);
+      border-radius: 3px;
+    }
+
+    /* ── FOOTER ── */
+    .footer {
+      margin-top: 80px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--dim);
+      letter-spacing: .06em;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* ── Live config values ── */
+    .live {
+      background: rgba(240, 160, 52, .12);
+      border-radius: 3px;
+      padding: 0 3px;
+      border-bottom: 1px solid rgba(240, 160, 52, .35);
+      transition: background .3s;
+    }
+
+    .live.loaded {
+      background: rgba(240, 160, 52, .18);
+    }
+  </style>
 </head>
+
 <body>
 
-<nav class="topnav">
-  <a class="topnav-brand" href="/">DGX</a>
-  <div class="topnav-sep"></div>
-  <span class="topnav-title">Model Manager · Documentation</span>
-  <div class="topnav-right">
-    <a class="topnav-link" href="/">← Back to App</a>
-  </div>
-</nav>
-
-<div class="layout">
-
-  <!-- SIDEBAR -->
-  <nav class="sidebar">
-    <div class="sidebar-section">
-      <div class="sidebar-label">Overview</div>
-      <a class="sidebar-link active" href="#overview"><span class="num">00</span>Introduction</a>
-      <a class="sidebar-link" href="#architecture"><span class="num">01</span>Architecture</a>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">Model Management</div>
-      <a class="sidebar-link" href="#ollama"><span class="num">02</span>Ollama Models</a>
-      <a class="sidebar-link" href="#inventory"><span class="num">03</span>Model Inventory</a>
-      <a class="sidebar-link" href="#hf-browse"><span class="num">04</span>HF Browse</a>
-      <a class="sidebar-link" href="#hf"><span class="num">05</span>HF Download</a>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">Services</div>
-      <a class="sidebar-link" href="#litellm"><span class="num">06</span>LiteLLM Routing</a>
-      <a class="sidebar-link" href="#engines"><span class="num">07</span>Inference Engines</a>
-      <a class="sidebar-link" href="#profiles"><span class="num">08</span>Engine Profiles</a>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">System</div>
-      <a class="sidebar-link" href="#settings"><span class="num">09</span>Settings</a>
-      <a class="sidebar-link" href="#security"><span class="num">10</span>Security</a>
-      <a class="sidebar-link" href="#diagnostics"><span class="num">11</span>Logs &amp; Debug</a>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">Reference</div>
-      <a class="sidebar-link" href="#models"><span class="num">12</span>Model Recommendations</a>
-      <a class="sidebar-link" href="#troubleshooting"><span class="num">13</span>Troubleshooting</a>
+  <nav class="topnav">
+    <a class="topnav-brand" href="/">DGX</a>
+    <div class="topnav-sep"></div>
+    <span class="topnav-title">Model Manager · Documentation</span>
+    <div class="topnav-right">
+      <a class="topnav-link" href="/">← Back to App</a>
     </div>
   </nav>
 
-  <!-- CONTENT -->
-  <main class="content">
+  <div class="layout">
 
-    <!-- HERO -->
-    <div class="hero" id="overview">
-      <div class="hero-tag">DGX Model Manager · Field Manual</div>
-      <h1>Model<br><span>Management</span><br>Reference</h1>
-      <p class="hero-sub">A unified interface for managing AI models and inference engines on the NVIDIA DGX Spark. Pull Ollama models, browse HuggingFace, manage your local model inventory, route through LiteLLM, and control SGLang, vLLM, llama.cpp, LocalAI, and ComfyUI — all from one browser tab.</p>
-    </div>
+    <!-- SIDEBAR -->
+    <nav class="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-label">Overview</div>
+        <a class="sidebar-link active" href="#overview"><span class="num">00</span>Introduction</a>
+        <a class="sidebar-link" href="#architecture"><span class="num">01</span>Architecture</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-label">Model Management</div>
+        <a class="sidebar-link" href="#ollama"><span class="num">02</span>Ollama Models</a>
+        <a class="sidebar-link" href="#inventory"><span class="num">03</span>Model Inventory</a>
+        <a class="sidebar-link" href="#hf-browse"><span class="num">04</span>HF Browse</a>
+        <a class="sidebar-link" href="#hf"><span class="num">05</span>HF Download</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-label">Services</div>
+        <a class="sidebar-link" href="#litellm"><span class="num">06</span>LiteLLM Routing</a>
+        <a class="sidebar-link" href="#engines"><span class="num">07</span>Inference Engines</a>
+        <a class="sidebar-link" href="#profiles"><span class="num">08</span>Engine Profiles</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-label">System</div>
+        <a class="sidebar-link" href="#settings"><span class="num">09</span>Settings</a>
+        <a class="sidebar-link" href="#security"><span class="num">10</span>Security</a>
+        <a class="sidebar-link" href="#diagnostics"><span class="num">11</span>Logs &amp; Debug</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-label">Reference</div>
+        <a class="sidebar-link" href="#models"><span class="num">12</span>Model Recommendations</a>
+        <a class="sidebar-link" href="#troubleshooting"><span class="num">13</span>Troubleshooting</a>
+      </div>
+    </nav>
 
-    <!-- ARCHITECTURE -->
-    <div class="doc-section" id="architecture">
-      <div class="eyebrow">01 — Overview</div>
-      <h2>How the Stack Fits Together</h2>
+    <!-- CONTENT -->
+    <main class="content">
 
-      <p>Every inference request on your device flows through one of several paths. LiteLLM sits in front of OpenAI-compatible backends and presents a single unified API at <code class="live" data-svc="litellm" data-fmt="port">:4000</code> to all clients. Specialized engines like ComfyUI have their own web interface.</p>
+      <!-- HERO -->
+      <div class="hero" id="overview">
+        <div class="hero-tag">DGX Model Manager · Field Manual</div>
+        <h1>Model<br><span>Management</span><br>Reference</h1>
+        <p class="hero-sub">A unified interface for managing AI models and inference engines on the NVIDIA DGX Spark.
+          Pull Ollama models, browse HuggingFace, manage your local model inventory, route through LiteLLM, and control
+          SGLang, vLLM, llama.cpp, LocalAI, and ComfyUI — all from one browser tab.</p>
+      </div>
 
-      <div class="arch">
-        <div class="arch-label">Clients</div>
-        <div class="arch-row">
-          <div class="arch-box client">Your Agents</div>
-          <div class="arch-box client">Open WebUI</div>
-          <div class="arch-box client">Python scripts</div>
-          <div class="arch-box client">Any OpenAI client</div>
+      <!-- ARCHITECTURE -->
+      <div class="doc-section" id="architecture">
+        <div class="eyebrow">01 — Overview</div>
+        <h2>How the Stack Fits Together</h2>
+
+        <p>Every inference request on your device flows through one of several paths. LiteLLM sits in front of
+          OpenAI-compatible backends and presents a single unified API at <code class="live" data-svc="litellm"
+            data-fmt="port">:4000</code> to all clients. Specialized engines like ComfyUI have their own web interface.
+        </p>
+
+        <div class="arch">
+          <div class="arch-label">Clients</div>
+          <div class="arch-row">
+            <div class="arch-box client">Your Agents</div>
+            <div class="arch-box client">Open WebUI</div>
+            <div class="arch-box client">Python scripts</div>
+            <div class="arch-box client">Any OpenAI client</div>
+          </div>
+          <div class="arch-row" style="margin:8px 0 8px 0;justify-content:center">
+            <span class="arch-arrow" style="font-size:13px;color:var(--dim)">▼ all send to <span class="live"
+                data-svc="litellm" data-fmt="port">:4000</span>/v1 ▼</span>
+          </div>
+          <div class="arch-center">
+            <div class="arch-box gateway">LiteLLM Proxy · <span class="live" data-svc="litellm"
+                data-fmt="port">:4000</span></div>
+          </div>
+          <div class="arch-row" style="margin:8px 0 4px 0;justify-content:center;gap:20px">
+            <span class="arch-arrow">↙</span>
+            <span class="arch-arrow">↓</span>
+            <span class="arch-arrow">↓</span>
+            <span class="arch-arrow">↓</span>
+            <span class="arch-arrow">↘</span>
+          </div>
+          <div class="arch-row" style="justify-content:center;gap:16px;flex-wrap:wrap">
+            <div style="text-align:center">
+              <div class="arch-box backend">SGLang · <span class="live" data-svc="sglang" data-fmt="port">:30000</span>
+              </div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">Large models</div>
+            </div>
+            <div style="text-align:center">
+              <div class="arch-box backend">vLLM · <span class="live" data-svc="vllm" data-fmt="port">:8000</span></div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">Large models</div>
+            </div>
+            <div style="text-align:center">
+              <div class="arch-box backend">Ollama · <span class="live" data-svc="ollama" data-fmt="port">:11434</span>
+              </div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">Small/medium</div>
+            </div>
+            <div style="text-align:center">
+              <div class="arch-box backend">llama.cpp · <span class="live" data-svc="llamacpp"
+                  data-fmt="port">:8080</span></div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">GGUF models</div>
+            </div>
+            <div style="text-align:center">
+              <div class="arch-box backend">LocalAI · <span class="live" data-svc="localai" data-fmt="port">:9090</span>
+              </div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">Multi-modal</div>
+            </div>
+          </div>
+          <div class="arch-row" style="justify-content:center;margin-top:12px">
+            <div style="text-align:center">
+              <div class="arch-box backend" style="border-color:#2a2040;color:#a080d0;background:rgba(120,80,200,.06)">
+                ComfyUI · <span class="live" data-svc="comfyui" data-fmt="port">:8188</span></div>
+              <div style="font-size:9px;color:var(--dim);margin-top:4px">Image gen (own web UI)</div>
+            </div>
+          </div>
         </div>
-        <div class="arch-row" style="margin:8px 0 8px 0;justify-content:center">
-          <span class="arch-arrow" style="font-size:13px;color:var(--dim)">▼ all send to <span class="live" data-svc="litellm" data-fmt="port">:4000</span>/v1 ▼</span>
-        </div>
-        <div class="arch-center">
-          <div class="arch-box gateway">LiteLLM Proxy · <span class="live" data-svc="litellm" data-fmt="port">:4000</span></div>
-        </div>
-        <div class="arch-row" style="margin:8px 0 4px 0;justify-content:center;gap:20px">
-          <span class="arch-arrow">↙</span>
-          <span class="arch-arrow">↓</span>
-          <span class="arch-arrow">↓</span>
-          <span class="arch-arrow">↓</span>
-          <span class="arch-arrow">↘</span>
-        </div>
-        <div class="arch-row" style="justify-content:center;gap:16px;flex-wrap:wrap">
-          <div style="text-align:center">
-            <div class="arch-box backend">SGLang · <span class="live" data-svc="sglang" data-fmt="port">:30000</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">Large models</div>
-          </div>
-          <div style="text-align:center">
-            <div class="arch-box backend">vLLM · <span class="live" data-svc="vllm" data-fmt="port">:8000</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">Large models</div>
-          </div>
-          <div style="text-align:center">
-            <div class="arch-box backend">Ollama · <span class="live" data-svc="ollama" data-fmt="port">:11434</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">Small/medium</div>
-          </div>
-          <div style="text-align:center">
-            <div class="arch-box backend">llama.cpp · <span class="live" data-svc="llamacpp" data-fmt="port">:8080</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">GGUF models</div>
-          </div>
-          <div style="text-align:center">
-            <div class="arch-box backend">LocalAI · <span class="live" data-svc="localai" data-fmt="port">:9090</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">Multi-modal</div>
-          </div>
-        </div>
-        <div class="arch-row" style="justify-content:center;margin-top:12px">
-          <div style="text-align:center">
-            <div class="arch-box backend" style="border-color:#2a2040;color:#a080d0;background:rgba(120,80,200,.06)">ComfyUI · <span class="live" data-svc="comfyui" data-fmt="port">:8188</span></div>
-            <div style="font-size:9px;color:var(--dim);margin-top:4px">Image gen (own web UI)</div>
-          </div>
+
+        <p>The Model Manager app (<code class="live" data-svc="app" data-fmt="port">:8090</code>) sits alongside this
+          stack and gives you a GUI to control it — it never sits in the request path. It talks to each service's API
+          and to Docker directly to manage container lifecycle.</p>
+
+        <div class="callout info">
+          <div class="callout-label">Key principle</div>
+          <p>Engines like SGLang and vLLM are each dedicated to one large model at a time and take ~5 minutes to load.
+            Ollama handles smaller models and can switch instantly. ComfyUI has its own web interface for image
+            generation workflows. Use the right tool for the right job.</p>
         </div>
       </div>
 
-      <p>The Model Manager app (<code class="live" data-svc="app" data-fmt="port">:8090</code>) sits alongside this stack and gives you a GUI to control it — it never sits in the request path. It talks to each service's API and to Docker directly to manage container lifecycle.</p>
+      <!-- OLLAMA -->
+      <div class="doc-section" id="ollama">
+        <div class="eyebrow">02 — Model Management</div>
+        <h2>Ollama Models</h2>
 
-      <div class="callout info">
-        <div class="callout-label">Key principle</div>
-        <p>Engines like SGLang and vLLM are each dedicated to one large model at a time and take ~5 minutes to load. Ollama handles smaller models and can switch instantly. ComfyUI has its own web interface for image generation workflows. Use the right tool for the right job.</p>
-      </div>
-    </div>
+        <p>The Ollama tab is your primary model store. Pull any model from the Ollama library by name, see what's
+          installed with disk usage, and delete models you no longer need.</p>
 
-    <!-- OLLAMA -->
-    <div class="doc-section" id="ollama">
-      <div class="eyebrow">02 — Model Management</div>
-      <h2>Ollama Models</h2>
+        <h3>Pulling a Model</h3>
 
-      <p>The Ollama tab is your primary model store. Pull any model from the Ollama library by name, see what's installed with disk usage, and delete models you no longer need.</p>
-
-      <h3>Pulling a Model</h3>
-
-      <div class="steps">
-        <div class="step">
-          <div class="step-num">1</div>
-          <div class="step-body">
-            <div class="step-title">Type the model name</div>
-            <div class="step-desc">Enter the model name in the pull box — use the exact names from <code>ollama.com/library</code>. Include the tag for a specific size, e.g. <code>qwen2.5:7b</code>. Without a tag, Ollama pulls the default (usually the smallest).</div>
+        <div class="steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <div class="step-title">Type the model name</div>
+              <div class="step-desc">Enter the model name in the pull box — use the exact names from
+                <code>ollama.com/library</code>. Include the tag for a specific size, e.g. <code>qwen2.5:7b</code>.
+                Without a tag, Ollama pulls the default (usually the smallest).
+              </div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <div class="step-title">Watch the progress bar</div>
+              <div class="step-desc">The bar shows live download progress with MB counts. Large models (30B+) can take
+                several minutes depending on your connection. Don't close the tab.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <div class="step-title">Model appears in the grid</div>
+              <div class="step-desc">The installed models grid refreshes automatically when the pull completes. If
+                LiteLLM wildcard routing is active, the model is immediately available to all apps at <code class="live"
+                  data-svc="litellm" data-fmt="port">:4000</code>.</div>
+            </div>
           </div>
         </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <div class="step-body">
-            <div class="step-title">Watch the progress bar</div>
-            <div class="step-desc">The bar shows live download progress with MB counts. Large models (30B+) can take several minutes depending on your connection. Don't close the tab.</div>
+
+        <h3>Model Name Format</h3>
+
+        <div class="code-wrap">
+          <div class="code-header"><span class="code-title">Model name patterns</span></div>
+          <div class="code-body"><span class="cm"># Name only — pulls default (smallest) tag</span>
+            llama3.2
+            phi4
+            gemma3
+
+            <span class="cm"># Name:tag — pulls specific size</span>
+            qwen2.5:7b
+            qwen2.5:32b
+            qwen2.5-coder:32b
+            deepseek-r1:14b
+
+            <span class="cm"># Quantization variant</span>
+            qwen2.5:32b-instruct-q4_K_M
+
+            <span class="cm"># Check available tags at:</span>
+            <span class="cm"># https://ollama.com/library/&lt;model-name&gt;</span>
           </div>
         </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <div class="step-body">
-            <div class="step-title">Model appears in the grid</div>
-            <div class="step-desc">The installed models grid refreshes automatically when the pull completes. If LiteLLM wildcard routing is active, the model is immediately available to all apps at <code class="live" data-svc="litellm" data-fmt="port">:4000</code>.</div>
-          </div>
-        </div>
-      </div>
 
-      <h3>Model Name Format</h3>
+        <h3>Deleting a Model</h3>
+        <p>Click the <code>✕</code> button on any model card. You'll be asked to confirm — deletion is permanent and
+          frees the disk space immediately. The model list refreshes automatically.</p>
 
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">Model name patterns</span></div>
-        <div class="code-body"><span class="cm"># Name only — pulls default (smallest) tag</span>
-llama3.2
-phi4
-gemma3
-
-<span class="cm"># Name:tag — pulls specific size</span>
-qwen2.5:7b
-qwen2.5:32b
-qwen2.5-coder:32b
-deepseek-r1:14b
-
-<span class="cm"># Quantization variant</span>
-qwen2.5:32b-instruct-q4_K_M
-
-<span class="cm"># Check available tags at:</span>
-<span class="cm"># https://ollama.com/library/&lt;model-name&gt;</span></div>
-      </div>
-
-      <h3>Deleting a Model</h3>
-      <p>Click the <code>✕</code> button on any model card. You'll be asked to confirm — deletion is permanent and frees the disk space immediately. The model list refreshes automatically.</p>
-
-      <div class="callout warn">
-        <div class="callout-label">VRAM headroom</div>
-        <p>A large model running via SGLang or vLLM can use ~97 GB or more of the 128 GB unified memory. That may leave only ~31 GB for Ollama models. Keep this in mind when pulling large models — stop the engine first if you want to run a 30B+ model via Ollama.</p>
-      </div>
-    </div>
-
-    <!-- INVENTORY -->
-    <div class="doc-section" id="inventory">
-      <div class="eyebrow">03 — Model Management</div>
-      <h2>Model Inventory</h2>
-
-      <p>The Inventory tab provides a unified view of every model on your device — HuggingFace cache models, custom directory models, and Ollama models — all in one searchable, filterable table.</p>
-
-      <h3>Browsing Your Models</h3>
-      <p>The table shows each model's name, task type, format, dtype, parameter count, disk size, source, and any engine profile that references it. Use the toolbar to narrow the view:</p>
-
-      <div class="steps">
-        <div class="step">
-          <div class="step-num">1</div>
-          <div class="step-body">
-            <div class="step-title">Search</div>
-            <div class="step-desc">Type any part of a model name or owner in the search box. Results filter in real-time as you type.</div>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <div class="step-body">
-            <div class="step-title">Filter by Source / Format / Task</div>
-            <div class="step-desc">Use the dropdowns to show only HF Cache, Custom Dir, or Ollama models. Filter by format (safetensors, GGUF, PyTorch) or task type (Text Gen, Vision LLM, Embedding, TTS, etc.).</div>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <div class="step-body">
-            <div class="step-title">Sort</div>
-            <div class="step-desc">Sort the table by Name, Size, or Parameter count using the sort dropdown.</div>
-          </div>
+        <div class="callout warn">
+          <div class="callout-label">VRAM headroom</div>
+          <p>A large model running via SGLang or vLLM can use ~97 GB or more of the 128 GB unified memory. That may
+            leave only ~31 GB for Ollama models. Keep this in mind when pulling large models — stop the engine first if
+            you want to run a 30B+ model via Ollama.</p>
         </div>
       </div>
 
-      <h3>HuggingFace Enrichment</h3>
-      <p>Click <strong>Fetch HF Info</strong> to enrich all HF-sourced models with metadata from HuggingFace: pipeline tags, download counts, and likes. This data is cached locally for 7 days to avoid rate limiting.</p>
+      <!-- INVENTORY -->
+      <div class="doc-section" id="inventory">
+        <div class="eyebrow">03 — Model Management</div>
+        <h2>Model Inventory</h2>
 
-      <h3>Custom Directories</h3>
-      <p>Expand the <strong>Custom Directories</strong> section to add any folder on your device to the inventory scan. Models in custom directories appear alongside HF cache models with a "Custom" source badge. Useful for models stored outside the default HF cache location.</p>
+        <p>The Inventory tab provides a unified view of every model on your device — HuggingFace cache models, custom
+          directory models, and Ollama models — all in one searchable, filterable table.</p>
 
-      <div class="callout info">
-        <div class="callout-label">Stats bar</div>
-        <p>The stats bar at the top of the table shows the total model count, combined disk usage, and a breakdown by source — giving you a quick overview of your model footprint.</p>
-      </div>
-    </div>
+        <h3>Browsing Your Models</h3>
+        <p>The table shows each model's name, task type, format, dtype, parameter count, disk size, source, and any
+          engine profile that references it. Use the toolbar to narrow the view:</p>
 
-    <!-- HF BROWSE -->
-    <div class="doc-section" id="hf-browse">
-      <div class="eyebrow">04 — Model Management</div>
-      <h2>HuggingFace Browse</h2>
+        <div class="steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <div class="step-title">Search</div>
+              <div class="step-desc">Type any part of a model name or owner in the search box. Results filter in
+                real-time as you type.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <div class="step-title">Filter by Source / Format / Task</div>
+              <div class="step-desc">Use the dropdowns to show only HF Cache, Custom Dir, or Ollama models. Filter by
+                format (safetensors, GGUF, PyTorch) or task type (Text Gen, Vision LLM, Embedding, TTS, etc.).</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <div class="step-title">Sort</div>
+              <div class="step-desc">Sort the table by Name, Size, or Parameter count using the sort dropdown.</div>
+            </div>
+          </div>
+        </div>
 
-      <p>Search and discover models on HuggingFace Hub without leaving the app. The HF Browse tab lets you find models, inspect their files, discover quantized variants, and download with one click.</p>
+        <h3>HuggingFace Enrichment</h3>
+        <p>Click <strong>Fetch HF Info</strong> to enrich all HF-sourced models with metadata from HuggingFace: pipeline
+          tags, download counts, and likes. This data is cached locally for 7 days to avoid rate limiting.</p>
 
-      <h3>Searching</h3>
-      <p>Enter a query in the search box, optionally filter by pipeline type (Text Generation, Image Classification, etc.), and sort by downloads, likes, trending, or recent. Results appear as cards with task badges, download counts, and format indicators.</p>
+        <h3>Custom Directories</h3>
+        <p>Expand the <strong>Custom Directories</strong> section to add any folder on your device to the inventory
+          scan. Models in custom directories appear alongside HF cache models with a "Custom" source badge. Useful for
+          models stored outside the default HF cache location.</p>
 
-      <h3>Exploring a Model</h3>
-      <p>Click any result card to expand it. This loads the model's file list with individual file sizes, plus automatically searches for quantized variants — GGUF, GPTQ, and AWQ versions of the same model published by community quantizers.</p>
-
-      <h3>Downloading</h3>
-      <p>Click the <strong>Download</strong> button on any model or variant. This pre-fills the HF Download tab with the repository ID and switches to it, so you can start the download immediately.</p>
-
-      <div class="callout tip">
-        <div class="callout-label">Variant discovery</div>
-        <p>When you expand a model like <code>meta-llama/Llama-3.3-70B-Instruct</code>, the browser automatically searches for community GGUF and quantized versions. This helps you find smaller variants that fit in memory without hunting through HuggingFace manually.</p>
-      </div>
-    </div>
-
-    <!-- HF DOWNLOAD -->
-    <div class="doc-section" id="hf">
-      <div class="eyebrow">05 — Model Management</div>
-      <h2>HuggingFace Download</h2>
-
-      <p>Downloads model weights directly from HuggingFace Hub to your device. Use this for models you want to run via SGLang, vLLM, or other engines — models that need to be loaded at server startup rather than pulled on demand.</p>
-
-      <h3>Repository ID Format</h3>
-
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">HuggingFace repo ID format</span></div>
-        <div class="code-body"><span class="cm"># Format: owner/model-name</span>
-mistralai/Mistral-Small-4-119B-2603-NVFP4
-Qwen/Qwen3-Coder-Next
-meta-llama/Llama-3.3-70B-Instruct
-deepseek-ai/DeepSeek-V3</div>
-      </div>
-
-      <h3>Where Files Land</h3>
-
-      <p>Without a custom local directory, downloads go to <code>~/.cache/huggingface/hub/&lt;owner&gt;--&lt;model&gt;/</code> — the standard HF cache location. Engine startup scripts typically reference this path. If you specify a custom directory, update your startup script to point to that path.</p>
-
-      <div class="callout tip">
-        <div class="callout-label">Large model downloads</div>
-        <p>A 70B model is ~140 GB at BF16. NVFP4 models are much smaller (~70 GB for 119B). The progress log streams stdout from <code>huggingface_hub.snapshot_download</code>. If the connection drops mid-download, re-running will resume from where it left off — HF Hub supports partial downloads.</p>
-      </div>
-    </div>
-
-    <!-- LITELLM -->
-    <div class="doc-section" id="litellm">
-      <div class="eyebrow">06 — Services</div>
-      <h2>LiteLLM Routing</h2>
-
-      <p>LiteLLM is the single API endpoint all your apps talk to. This tab shows you what models are currently routed, lets you apply the wildcard config, and gives you a live view of the config file.</p>
-
-      <h3>Wildcard Routing</h3>
-
-      <p>By default, every Ollama model you pull requires a manual entry in <code>litellm_config.yaml</code> before other apps can see it. The wildcard button fixes this permanently with one click.</p>
-
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">What the wildcard button adds to your config</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <div class="code-body"><span class="ck">model_list</span>:
-  <span class="cm"># Your existing SGLang entry stays unchanged</span>
-  - <span class="ck">model_name</span>: <span class="cs">Mistral-Small-4</span>
-    <span class="ck">litellm_params</span>:
-      <span class="ck">model</span>: <span class="cs">openai/Mistral-Small-4</span>
-      <span class="ck">api_base</span>: <span class="cs live" data-svc="sglang" data-fmt="url/v1">http://127.0.0.1:30000/v1</span>
-
-  <span class="cm"># Wildcard — auto-exposes every Ollama model</span>
-  - <span class="ck">model_name</span>: <span class="cs">ollama/*</span>
-    <span class="ck">litellm_params</span>:
-      <span class="ck">model</span>: <span class="cs">ollama/*</span>
-      <span class="ck">api_base</span>: <span class="cs live" data-svc="ollama" data-fmt="url">http://127.0.0.1:11434</span>
-
-<span class="ck">litellm_settings</span>:
-  <span class="ck">drop_params</span>: <span class="ca">true</span></div>
+        <div class="callout info">
+          <div class="callout-label">Stats bar</div>
+          <p>The stats bar at the top of the table shows the total model count, combined disk usage, and a breakdown by
+            source — giving you a quick overview of your model footprint.</p>
+        </div>
       </div>
 
-      <p>After applying, LiteLLM restarts automatically. Every model you pull into Ollama from that point on is instantly available — no more config edits, ever.</p>
+      <!-- HF BROWSE -->
+      <div class="doc-section" id="hf-browse">
+        <div class="eyebrow">04 — Model Management</div>
+        <h2>HuggingFace Browse</h2>
 
-      <h3>Active Routes</h3>
-      <p>The routes grid shows every model currently exposed at <code class="live" data-svc="litellm" data-fmt="port">:4000</code>. This is what your apps see when they call <code>GET /v1/models</code>. Orange tags are SGLang-backed, green tags are Ollama-backed.</p>
+        <p>Search and discover models on HuggingFace Hub without leaving the app. The HF Browse tab lets you find
+          models, inspect their files, discover quantized variants, and download with one click.</p>
 
-      <h3>Restarting LiteLLM</h3>
-      <p>The Restart button calls <code>sudo systemctl restart litellm</code>. Use this after any manual edits to the config file. LiteLLM takes about 3 seconds to come back up.</p>
-    </div>
+        <h3>Searching</h3>
+        <p>Enter a query in the search box, optionally filter by pipeline type (Text Generation, Image Classification,
+          etc.), and sort by downloads, likes, trending, or recent. Results appear as cards with task badges, download
+          counts, and format indicators.</p>
 
-    <!-- ENGINES -->
-    <div class="doc-section" id="engines">
-      <div class="eyebrow">07 — Services</div>
-      <h2>Inference Engines</h2>
+        <h3>Exploring a Model</h3>
+        <p>Click any result card to expand it. This loads the model's file list with individual file sizes, plus
+          automatically searches for quantized variants — GGUF, GPTQ, and AWQ versions of the same model published by
+          community quantizers.</p>
 
-      <p>The app manages five inference engines through a unified interface. Each engine has its own tab with a status card, profile selector, and start/stop controls. All engines use the same profile system — shell scripts auto-discovered from a directory.</p>
+        <h3>Downloading</h3>
+        <p>Click the <strong>Download</strong> button on any model or variant. This pre-fills the HF Download tab with
+          the repository ID and switches to it, so you can start the download immediately.</p>
 
-      <h3>Engine Overview</h3>
+        <div class="callout tip">
+          <div class="callout-label">Variant discovery</div>
+          <p>When you expand a model like <code>meta-llama/Llama-3.3-70B-Instruct</code>, the browser automatically
+            searches for community GGUF and quantized versions. This helps you find smaller variants that fit in memory
+            without hunting through HuggingFace manually.</p>
+        </div>
+      </div>
 
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Engine</th><th>Port</th><th>Use Case</th><th>API</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>SGLang</td>
-              <td><span class="live" data-svc="sglang" data-fmt="port">:30000</span></td>
-              <td>High-performance LLM inference. RadixAttention, fast structured output, strong MoE support.</td>
-              <td>OpenAI-compatible</td>
-            </tr>
-            <tr>
-              <td>vLLM</td>
-              <td><span class="live" data-svc="vllm" data-fmt="port">:8000</span></td>
-              <td>Production LLM inference. Broad model/quantization support, PagedAttention.</td>
-              <td>OpenAI-compatible</td>
-            </tr>
-            <tr>
-              <td>llama.cpp</td>
-              <td><span class="live" data-svc="llamacpp" data-fmt="port">:8080</span></td>
-              <td>GGUF model inference. Lightweight, ARM-optimized, runs without Docker.</td>
-              <td>OpenAI-compatible</td>
-            </tr>
-            <tr>
-              <td>LocalAI</td>
-              <td><span class="live" data-svc="localai" data-fmt="port">:9090</span></td>
-              <td>Multi-modal AI — LLM, TTS, STT, and image generation in one engine.</td>
-              <td>OpenAI-compatible</td>
-            </tr>
-            <tr>
-              <td>ComfyUI</td>
-              <td><span class="live" data-svc="comfyui" data-fmt="port">:8188</span></td>
-              <td>Image generation workflows with a node-based web UI.</td>
-              <td>Own web UI</td>
-            </tr>
-          </tbody>
+      <!-- HF DOWNLOAD -->
+      <div class="doc-section" id="hf">
+        <div class="eyebrow">05 — Model Management</div>
+        <h2>HuggingFace Download</h2>
+
+        <p>Downloads model weights directly from HuggingFace Hub to your device. Use this for models you want to run via
+          SGLang, vLLM, or other engines — models that need to be loaded at server startup rather than pulled on demand.
+        </p>
+
+        <h3>Repository ID Format</h3>
+
+        <div class="code-wrap">
+          <div class="code-header"><span class="code-title">HuggingFace repo ID format</span></div>
+          <div class="code-body"><span class="cm"># Format: owner/model-name</span>
+            mistralai/Mistral-Small-4-119B-2603-NVFP4
+            Qwen/Qwen3-Coder-Next
+            meta-llama/Llama-3.3-70B-Instruct
+            deepseek-ai/DeepSeek-V3</div>
+        </div>
+
+        <h3>Where Files Land</h3>
+
+        <p>Without a custom local directory, downloads go to
+          <code>~/.cache/huggingface/hub/&lt;owner&gt;--&lt;model&gt;/</code> — the standard HF cache location. Engine
+          startup scripts typically reference this path. If you specify a custom directory, update your startup script
+          to point to that path.
+        </p>
+
+        <div class="callout info">
+          <div class="callout-label">Custom directory requirement</div>
+          <p>To download to a custom path, the directory must first be registered in the <strong>Inventory → Scan
+              Directories</strong> section. The app validates download destinations against the HF cache and your
+            registered directories — unregistered paths are rejected. Add the directory once, then use it for downloads
+            freely.</p>
+        </div>
+
+        <div class="callout tip">
+          <div class="callout-label">Large model downloads</div>
+          <p>A 70B model is ~140 GB at BF16. NVFP4 models are much smaller (~70 GB for 119B). The progress log streams
+            stdout from <code>huggingface_hub.snapshot_download</code>. If the connection drops mid-download, re-running
+            will resume from where it left off — HF Hub supports partial downloads.</p>
+        </div>
+      </div>
+
+      <!-- LITELLM -->
+      <div class="doc-section" id="litellm">
+        <div class="eyebrow">06 — Services</div>
+        <h2>LiteLLM Routing</h2>
+
+        <p>LiteLLM is the single API endpoint all your apps talk to. This tab shows you what models are currently
+          routed, lets you apply the wildcard config, and gives you a live view of the config file.</p>
+
+        <h3>Wildcard Routing</h3>
+
+        <p>By default, every Ollama model you pull requires a manual entry in <code>litellm_config.yaml</code> before
+          other apps can see it. The wildcard button fixes this permanently with one click.</p>
+
+        <div class="code-wrap">
+          <div class="code-header"><span class="code-title">What the wildcard button adds to your config</span><button
+              class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+          <div class="code-body"><span class="ck">model_list</span>:
+            <span class="cm"># Your existing SGLang entry stays unchanged</span>
+            - <span class="ck">model_name</span>: <span class="cs">Mistral-Small-4</span>
+            <span class="ck">litellm_params</span>:
+            <span class="ck">model</span>: <span class="cs">openai/Mistral-Small-4</span>
+            <span class="ck">api_base</span>: <span class="cs live" data-svc="sglang"
+              data-fmt="url/v1">http://127.0.0.1:30000/v1</span>
+
+            <span class="cm"># Wildcard — auto-exposes every Ollama model</span>
+            - <span class="ck">model_name</span>: <span class="cs">ollama/*</span>
+            <span class="ck">litellm_params</span>:
+            <span class="ck">model</span>: <span class="cs">ollama/*</span>
+            <span class="ck">api_base</span>: <span class="cs live" data-svc="ollama"
+              data-fmt="url">http://127.0.0.1:11434</span>
+
+            <span class="ck">litellm_settings</span>:
+            <span class="ck">drop_params</span>: <span class="ca">true</span>
+          </div>
+        </div>
+
+        <p>After applying, LiteLLM restarts automatically. Every model you pull into Ollama from that point on is
+          instantly available — no more config edits, ever.</p>
+
+        <h3>Active Routes</h3>
+        <p>The routes grid shows every model currently exposed at <code class="live" data-svc="litellm"
+            data-fmt="port">:4000</code>. This is what your apps see when they call <code>GET /v1/models</code>. Orange
+          tags are SGLang-backed, green tags are Ollama-backed.</p>
+
+        <h3>Restarting LiteLLM</h3>
+        <p>The Restart button calls <code>sudo systemctl restart litellm</code>. Use this after any manual edits to the
+          config file. LiteLLM takes about 3 seconds to come back up.</p>
+      </div>
+
+      <!-- ENGINES -->
+      <div class="doc-section" id="engines">
+        <div class="eyebrow">07 — Services</div>
+        <h2>Inference Engines</h2>
+
+        <p>The app manages five inference engines through a unified interface. Each engine has its own tab with a status
+          card, profile selector, and start/stop controls. All engines use the same profile system — shell scripts
+          auto-discovered from a directory.</p>
+
+        <h3>Engine Overview</h3>
+
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Engine</th>
+                <th>Port</th>
+                <th>Use Case</th>
+                <th>API</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>SGLang</td>
+                <td><span class="live" data-svc="sglang" data-fmt="port">:30000</span></td>
+                <td>High-performance LLM inference. RadixAttention, fast structured output, strong MoE support.</td>
+                <td>OpenAI-compatible</td>
+              </tr>
+              <tr>
+                <td>vLLM</td>
+                <td><span class="live" data-svc="vllm" data-fmt="port">:8000</span></td>
+                <td>Production LLM inference. Broad model/quantization support, PagedAttention.</td>
+                <td>OpenAI-compatible</td>
+              </tr>
+              <tr>
+                <td>llama.cpp</td>
+                <td><span class="live" data-svc="llamacpp" data-fmt="port">:8080</span></td>
+                <td>GGUF model inference. Lightweight, ARM-optimized, runs without Docker.</td>
+                <td>OpenAI-compatible</td>
+              </tr>
+              <tr>
+                <td>LocalAI</td>
+                <td><span class="live" data-svc="localai" data-fmt="port">:9090</span></td>
+                <td>Multi-modal AI — LLM, TTS, STT, and image generation in one engine.</td>
+                <td>OpenAI-compatible</td>
+              </tr>
+              <tr>
+                <td>ComfyUI</td>
+                <td><span class="live" data-svc="comfyui" data-fmt="port">:8188</span></td>
+                <td>Image generation workflows with a node-based web UI.</td>
+                <td>Own web UI</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Status Card</h3>
+        <p>Each engine tab shows a status card with a colored LED: green when running, red when stopped. For
+          OpenAI-compatible engines, the currently loaded model name is pulled live from the engine's
+          <code>/v1/models</code> endpoint. ComfyUI shows a running/stopped status and an <strong>Open UI</strong>
+          button that links to its web interface.
+        </p>
+
+        <div class="callout warn">
+          <div class="callout-label">Stop before starting</div>
+          <p>Always stop the running container before starting a new profile. Starting a new profile while one is
+            already running will fail — the port will be in use.</p>
+        </div>
+
+        <h3>Starting an Engine</h3>
+        <p>Select a profile from the dropdown and click <strong>Start</strong>. The start script runs in the background
+          — the app polls the engine's health endpoint every 20 seconds and updates the status card when it comes
+          online. The ready toast only fires once the engine is actually serving, not just when the container starts. If
+          the engine doesn't come up within 10 minutes, the poll times out automatically.</p>
+
+        <h3>SGLang vs vLLM</h3>
+        <p>Both are excellent choices for large model inference. SGLang has RadixAttention (prefix caching) and faster
+          structured output. vLLM has broader quantization support and a mature ecosystem. Both expose the same
+          OpenAI-compatible API (<code>/v1/</code>), so your apps don't need to change when switching between them.</p>
+
+        <div class="callout info">
+          <div class="callout-label">Port conflicts</div>
+          <p>Each engine uses a different default port, so they can all run simultaneously — provided you have enough
+            memory. SGLang at <code class="live" data-svc="sglang" data-fmt="port">:30000</code>, vLLM at <code
+              class="live" data-svc="vllm" data-fmt="port">:8000</code>, llama.cpp at <code class="live"
+              data-svc="llamacpp" data-fmt="port">:8080</code>, LocalAI at <code class="live" data-svc="localai"
+              data-fmt="port">:9090</code>, ComfyUI at <code class="live" data-svc="comfyui"
+              data-fmt="port">:8188</code>.</p>
+        </div>
+      </div>
+
+      <!-- PROFILES -->
+      <div class="doc-section" id="profiles">
+        <div class="eyebrow">08 — Services</div>
+        <h2>Engine Profiles</h2>
+
+        <p>All five engines use the same profile system. The app auto-discovers shell scripts named
+          <code>start_*.sh</code> from each engine's directory. No JSON editing required — adding a new profile is just
+          adding a new script.
+        </p>
+
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Engine</th>
+                <th>Script Directory</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>SGLang</td>
+                <td><code>~/SGLang/start_*.sh</code></td>
+              </tr>
+              <tr>
+                <td>vLLM</td>
+                <td><code>~/vLLM/start_*.sh</code></td>
+              </tr>
+              <tr>
+                <td>llama.cpp</td>
+                <td><code>~/llama.cpp/start_*.sh</code></td>
+              </tr>
+              <tr>
+                <td>LocalAI</td>
+                <td><code>~/LocalAI/start_*.sh</code></td>
+              </tr>
+              <tr>
+                <td>ComfyUI</td>
+                <td><code>~/ComfyUI/start_*.sh</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Creating a Profile</h3>
+
+        <div class="steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-body">
+              <div class="step-title">Create a startup script in the engine directory</div>
+              <div class="step-desc">Create a script named <code>start_*.sh</code> in the engine's directory (e.g.
+                <code>~/SGLang/start_qwen3_70b.sh</code>). The filename must start with <code>start_</code> and end with
+                <code>.sh</code>.
+              </div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-body">
+              <div class="step-title">Add header comments (optional but recommended)</div>
+              <div class="step-desc">Add <code># Name:</code>, <code># Description:</code>, and <code># VRAM:</code>
+                comments in the first 20 lines. These control what the profile card displays in the UI. Without them,
+                the name is derived from the filename.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-body">
+              <div class="step-title">Open the engine tab</div>
+              <div class="step-desc">The new profile appears in the selector immediately. No app restart, no config
+                editing. The UI re-scans on every tab load.</div>
+            </div>
+          </div>
+        </div>
+
+        <h3>Example SGLang Script</h3>
+
+        <div class="code-wrap">
+          <div class="code-header"><span class="code-title">~/SGLang/start_mistral_small4.sh</span><button
+              class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+          <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+            <span class="cm"># Name: Mistral Small 4</span>
+            <span class="cm"># Description: 119B NVFP4 · ~5 min warm-up</span>
+            <span class="cm"># VRAM: 119</span>
+            sudo docker run --rm --gpus all --ipc=host \
+            --name my-sglang-container \
+            -v ~/.cache/huggingface:/root/.cache/huggingface \
+            -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+            -p 30000:30000 \
+            lmsysorg/sglang:nightly-dev-cu13 \
+            python3 -m sglang.launch_server \
+            --model-path
+            /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
+            --quantization modelopt_fp4 \
+            --host 0.0.0.0 \
+            --port 30000 \
+            --tool-call-parser mistral
+          </div>
+        </div>
+
+        <h3>Example vLLM Script</h3>
+
+        <div class="code-wrap">
+          <div class="code-header"><span class="code-title">~/vLLM/start_nemotron3super_vllm.sh</span><button
+              class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+          <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
+            <span class="cm"># Name: Nemotron 3 Super</span>
+            <span class="cm"># Description: 49B BF16 · Nvidia flagship · ~5 min warm-up</span>
+            <span class="cm"># VRAM: 97</span>
+            sudo docker run --rm --gpus all --ipc=host \
+            --name my-vllm-container \
+            -v ~/.cache/huggingface:/root/.cache/huggingface \
+            -p 8000:8000 \
+            vllm/vllm-openai:latest \
+            --model /root/.cache/huggingface/hub/models--nvidia--Nemotron-Super-49B-v1/snapshots/main \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --tensor-parallel-size 1 \
+            --tool-call-parser mistral \
+            --enable-auto-tool-choice
+          </div>
+        </div>
+
+        <h3>SGLang Flags by Model Family</h3>
+
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Model Family</th>
+                <th>Required Flags</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Mistral (all)</td>
+                <td><code>--tool-call-parser mistral</code><br><code>--moe-runner-backend flashinfer_cutlass</code></td>
+                <td>MoE runner only needed for MoE variants. Always use <code>--attention-backend triton</code> on GB10.
+                </td>
+              </tr>
+              <tr>
+                <td>Qwen3-Coder-Next</td>
+                <td><code>--tool-call-parser qwen3_coder</code></td>
+                <td>New parser — different from qwen2.5. Requires SGLang >= v0.5.8.</td>
+              </tr>
+              <tr>
+                <td>All models on GB10</td>
+                <td><code>--attention-backend triton</code></td>
+                <td>FlashInfer has GB10 bugs. Never use <code>--quantization modelopt_fp4</code> or
+                  <code>--fp4-gemm-backend</code> on SM121A.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Common vLLM Flags</h3>
+
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Flag</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>--model</td>
+                <td>Path to model weights or HuggingFace repo ID</td>
+              </tr>
+              <tr>
+                <td>--tensor-parallel-size</td>
+                <td>Number of GPUs for tensor parallelism (1 for DGX Spark)</td>
+              </tr>
+              <tr>
+                <td>--max-model-len</td>
+                <td>Maximum context length. Reduce if hitting OOM errors.</td>
+              </tr>
+              <tr>
+                <td>--gpu-memory-utilization</td>
+                <td>Fraction of GPU memory to use (default 0.9). Lower to leave room for Ollama.</td>
+              </tr>
+              <tr>
+                <td>--dtype</td>
+                <td>Data type: <code>auto</code>, <code>float16</code>, <code>bfloat16</code></td>
+              </tr>
+              <tr>
+                <td>--quantization</td>
+                <td>Quantization method: <code>awq</code>, <code>gptq</code>, <code>squeezellm</code>, etc.</td>
+              </tr>
+              <tr>
+                <td>--tool-call-parser</td>
+                <td>Tool calling format: <code>mistral</code>, <code>hermes</code>, <code>llama3_json</code>, etc.</td>
+              </tr>
+              <tr>
+                <td>--enable-auto-tool-choice</td>
+                <td>Auto-detect tool calls from model output</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout tip">
+          <div class="callout-label">LiteLLM integration</div>
+          <p>To route engine models through LiteLLM, add an entry to <code>litellm_config.yaml</code> with
+            <code>model: openai/your-model-name</code> and <code>api_base</code> pointing to the engine's URL. The
+            Ollama wildcard only covers Ollama — each engine model needs an explicit entry.
+          </p>
+        </div>
+      </div>
+
+      <!-- SETTINGS -->
+      <div class="doc-section" id="settings">
+        <div class="eyebrow">09 — System</div>
+        <h2>Settings</h2>
+
+        <p>The Settings tab provides centralized configuration for the app and all connected services.</p>
+
+        <h3>Service URLs</h3>
+        <p>Configure the URL for each service. All seven services (Ollama, LiteLLM, SGLang, vLLM, llama.cpp, LocalAI,
+          ComfyUI) have URL inputs with individual <strong>Test</strong> buttons for connectivity checks. Use
+          <strong>Test All</strong> to verify all services at once. Changes are saved to <code>config.json</code>.
+        </p>
+
+        <h3>API Key</h3>
+        <p>Set or clear the optional API key for authentication. See the <a href="#security">Security</a> section for
+          details.</p>
+
+        <div class="callout info">
+          <div class="callout-label">Runtime changes</div>
+          <p>All settings take effect immediately — no app restart required. Changes are persisted to
+            <code>config.json</code> for next startup.
+          </p>
+        </div>
+      </div>
+
+      <!-- SECURITY -->
+      <div class="doc-section" id="security">
+        <div class="eyebrow">10 — System</div>
+        <h2>Security</h2>
+
+        <p>API key authentication is optional and can be enabled from the Settings tab. When a key is set, all mutating
+          operations require the key.</p>
+
+        <h3>What's Protected</h3>
+        <table class="param-table">
+          <tr>
+            <td>Requires key</td>
+            <td>Start/stop engines, pull/delete Ollama models, HF download, update config, apply wildcard, restart
+              LiteLLM, clear logs, view app/engine/LiteLLM logs, view debug config, view system overview, view Docker
+              containers, view LiteLLM config</td>
+          </tr>
+          <tr>
+            <td>No key needed</td>
+            <td>Status checks, model inventory, profiles, HF search, node info</td>
+          </tr>
         </table>
-      </div>
 
-      <h3>Status Card</h3>
-      <p>Each engine tab shows a status card with a colored LED: green when running, red when stopped. For OpenAI-compatible engines, the currently loaded model name is pulled live from the engine's <code>/v1/models</code> endpoint. ComfyUI shows a running/stopped status and an <strong>Open UI</strong> button that links to its web interface.</p>
+        <h3>First-Boot Warning</h3>
+        <p>If the app starts with no API key set and is binding to a non-loopback address (anything other than
+          <code>127.0.0.1</code>), it emits a loud warning to the systemd journal and waits 10 seconds before accepting
+          connections. This gives you time to notice the open-access condition before the app is reachable. Set
+          <code>MODEL_MANAGER_ALLOW_UNAUTH=1</code> in the service environment to suppress the warning and delay if you
+          intentionally want open access.
+        </p>
 
-      <div class="callout warn">
-        <div class="callout-label">Stop before starting</div>
-        <p>Always stop the running container before starting a new profile. Starting a new profile while one is already running will fail — the port will be in use.</p>
-      </div>
+        <h3>How It Works</h3>
+        <p>The API key is sent as an <code>Authorization: Bearer &lt;key&gt;</code> header with every request that
+          requires authentication.
+          The app stores only the SHA-256 hash of the key in <code>config.json</code> — the plaintext key is never
+          written to disk. Verification uses constant-time <code>hmac.compare_digest()</code> on the hashes to prevent
+          timing attacks.</p>
 
-      <h3>Starting an Engine</h3>
-      <p>Select a profile from the dropdown and click <strong>Start</strong>. The start script runs in the background — the app polls the engine's health endpoint every 20 seconds and updates the status card when it comes online. The ready toast only fires once the engine is actually serving, not just when the container starts. If the engine doesn't come up within 10 minutes, the poll times out automatically.</p>
-
-      <h3>SGLang vs vLLM</h3>
-      <p>Both are excellent choices for large model inference. SGLang has RadixAttention (prefix caching) and faster structured output. vLLM has broader quantization support and a mature ecosystem. Both expose the same OpenAI-compatible API (<code>/v1/</code>), so your apps don't need to change when switching between them.</p>
-
-      <div class="callout info">
-        <div class="callout-label">Port conflicts</div>
-        <p>Each engine uses a different default port, so they can all run simultaneously — provided you have enough memory. SGLang at <code class="live" data-svc="sglang" data-fmt="port">:30000</code>, vLLM at <code class="live" data-svc="vllm" data-fmt="port">:8000</code>, llama.cpp at <code class="live" data-svc="llamacpp" data-fmt="port">:8080</code>, LocalAI at <code class="live" data-svc="localai" data-fmt="port">:9090</code>, ComfyUI at <code class="live" data-svc="comfyui" data-fmt="port">:8188</code>.</p>
-      </div>
-    </div>
-
-    <!-- PROFILES -->
-    <div class="doc-section" id="profiles">
-      <div class="eyebrow">08 — Services</div>
-      <h2>Engine Profiles</h2>
-
-      <p>All five engines use the same profile system. The app auto-discovers shell scripts named <code>start_*.sh</code> from each engine's directory. No JSON editing required — adding a new profile is just adding a new script.</p>
-
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Engine</th><th>Script Directory</th></tr></thead>
-          <tbody>
-            <tr><td>SGLang</td><td><code>~/SGLang/start_*.sh</code></td></tr>
-            <tr><td>vLLM</td><td><code>~/vLLM/start_*.sh</code></td></tr>
-            <tr><td>llama.cpp</td><td><code>~/llama.cpp/start_*.sh</code></td></tr>
-            <tr><td>LocalAI</td><td><code>~/LocalAI/start_*.sh</code></td></tr>
-            <tr><td>ComfyUI</td><td><code>~/ComfyUI/start_*.sh</code></td></tr>
-          </tbody>
-        </table>
-      </div>
-
-      <h3>Creating a Profile</h3>
-
-      <div class="steps">
-        <div class="step">
-          <div class="step-num">1</div>
-          <div class="step-body">
-            <div class="step-title">Create a startup script in the engine directory</div>
-            <div class="step-desc">Create a script named <code>start_*.sh</code> in the engine's directory (e.g. <code>~/SGLang/start_qwen3_70b.sh</code>). The filename must start with <code>start_</code> and end with <code>.sh</code>.</div>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <div class="step-body">
-            <div class="step-title">Add header comments (optional but recommended)</div>
-            <div class="step-desc">Add <code># Name:</code>, <code># Description:</code>, and <code># VRAM:</code> comments in the first 20 lines. These control what the profile card displays in the UI. Without them, the name is derived from the filename.</div>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <div class="step-body">
-            <div class="step-title">Open the engine tab</div>
-            <div class="step-desc">The new profile appears in the selector immediately. No app restart, no config editing. The UI re-scans on every tab load.</div>
-          </div>
+        <div class="callout warn">
+          <div class="callout-label">Remember your key</div>
+          <p>Since the key is stored as a hash, it cannot be recovered. If you lose the key, clear it by editing
+            <code>config.json</code> and removing the <code>api_key</code> field, then restarting the app.
+          </p>
         </div>
       </div>
 
-      <h3>Example SGLang Script</h3>
+      <!-- DIAGNOSTICS -->
+      <div class="doc-section" id="diagnostics">
+        <div class="eyebrow">11 — System</div>
+        <h2>Logs &amp; Debug</h2>
 
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">~/SGLang/start_mistral_small4.sh</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
-<span class="cm"># Name: Mistral Small 4</span>
-<span class="cm"># Description: 119B NVFP4 · ~5 min warm-up</span>
-<span class="cm"># VRAM: 119</span>
-sudo docker run --rm --gpus all --ipc=host \
-  --name my-sglang-container \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
-  -p 30000:30000 \
-  lmsysorg/sglang:nightly-dev-cu13 \
-  python3 -m sglang.launch_server \
-    --model-path /root/.cache/huggingface/hub/models--mistralai--Mistral-Small-3.2-24B-Instruct-2506/snapshots/main \
-    --quantization modelopt_fp4 \
-    --host 0.0.0.0 \
-    --port 30000 \
-    --tool-call-parser mistral</div>
+        <p>The Logs &amp; Debug tab provides full-stack visibility into your AI infrastructure without SSH access.</p>
+
+        <h3>System Overview</h3>
+        <p>A grid of stat cards showing hostname, IP address, architecture, total memory, Python version, app uptime,
+          and disk usage for the HF cache directory. Health checks for all services show colored status
+          (green/red/amber) with response latency in milliseconds. Sudo and Docker permission status are also displayed.
+        </p>
+
+        <h3>Running Configuration</h3>
+        <p>Collapsible sections showing the current app configuration, parsed LiteLLM YAML, and discovered profiles
+          for all engines. Useful for verifying what the app sees without checking files on the server.</p>
+
+        <h3>Application Logs</h3>
+        <p>A color-coded log viewer connected to the app's in-memory ring buffer (500 entries). Filter by severity level
+          (DEBUG, INFO, WARNING, ERROR), search by text, and toggle 3-second auto-refresh. The buffer captures app
+          events like engine starts, config changes, auth failures, and download activity. Logs are in-memory only —
+          they clear on app restart.</p>
+
+        <h3>Engine Logs</h3>
+        <p>Tabbed viewer showing the latest log file for each engine from <code>/tmp/</code>. Each engine writes its
+          stdout/stderr to a timestamped log file when started via the app. Switch between engines using the tab bar.
+        </p>
+
+        <h3>LiteLLM Logs</h3>
+        <p>Reads the LiteLLM service journal via <code>journalctl -u litellm</code>. Shows the most recent log lines
+          with search and auto-refresh. If the app doesn't have journal access, a permission error is displayed
+          gracefully.</p>
+
+        <h3>Docker Containers</h3>
+        <p>A table showing all running Docker containers with ID, name, image, status, ports, and creation time. Click
+          Refresh to update the view.</p>
+
+        <div class="callout tip">
+          <div class="callout-label">Smart scroll</div>
+          <p>Log panes only auto-scroll to the bottom if you haven't scrolled up. This lets you read through logs
+            without being interrupted by new entries during auto-refresh.</p>
+        </div>
       </div>
 
-      <h3>Example vLLM Script</h3>
+      <!-- MODEL RECOMMENDATIONS -->
+      <div class="doc-section" id="models">
+        <div class="eyebrow">12 — Reference</div>
+        <h2>Model Recommendations for DGX Spark</h2>
 
-      <div class="code-wrap">
-        <div class="code-header"><span class="code-title">~/vLLM/start_nemotron3super_vllm.sh</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-        <div class="code-body"><span class="cm">#!/usr/bin/env bash</span>
-<span class="cm"># Name: Nemotron 3 Super</span>
-<span class="cm"># Description: 49B BF16 · Nvidia flagship · ~5 min warm-up</span>
-<span class="cm"># VRAM: 97</span>
-sudo docker run --rm --gpus all --ipc=host \
-  --name my-vllm-container \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -p 8000:8000 \
-  vllm/vllm-openai:latest \
-  --model /root/.cache/huggingface/hub/models--nvidia--Nemotron-Super-49B-v1/snapshots/main \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --tensor-parallel-size 1 \
-  --tool-call-parser mistral \
-  --enable-auto-tool-choice</div>
+        <p>Curated picks for the GB10 unified memory architecture. VRAM figures are approximate for the Ollama default
+          quantization unless noted.</p>
+
+        <h3>Coding</h3>
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Size</th>
+                <th>VRAM</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>qwen3-coder-next</td>
+                <td>80B MoE (3B active)</td>
+                <td>~45 GB</td>
+                <td><span class="rec-badge rec-star">★ Top Pick</span> &nbsp;Agentic coding, 256K context, tool-use
+                  trained. Best coding model available locally as of Feb 2026.</td>
+              </tr>
+              <tr>
+                <td>qwen2.5-coder:32b</td>
+                <td>32B</td>
+                <td>~20 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Solid fallback, faster than
+                  Qwen3-Coder-Next, runs alongside a large-model engine.</td>
+              </tr>
+              <tr>
+                <td>qwen2.5-coder:14b</td>
+                <td>14B</td>
+                <td>~9 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Fast, good for quick tasks and
+                  autocompletion.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>General Purpose</h3>
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Size</th>
+                <th>VRAM</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>qwen2.5:32b</td>
+                <td>32B</td>
+                <td>~20 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Strong all-rounder. Good for tasks that
+                  don't need the flagship model.</td>
+              </tr>
+              <tr>
+                <td>llama3.2:3b</td>
+                <td>3B</td>
+                <td>~2 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Ultra-fast, low VRAM. Useful for quick
+                  lookups, classification, routing.</td>
+              </tr>
+              <tr>
+                <td>phi4</td>
+                <td>14B</td>
+                <td>~8 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Microsoft's small but capable model.
+                  Good reasoning-to-size ratio.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Reasoning / Thinking</h3>
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Size</th>
+                <th>VRAM</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>qwq:32b</td>
+                <td>32B</td>
+                <td>~20 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Qwen's thinking model. Slow but strong
+                  on complex reasoning.</td>
+              </tr>
+              <tr>
+                <td>deepseek-r1:14b</td>
+                <td>14B</td>
+                <td>~9 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Compact reasoning model, good
+                  cost/quality tradeoff.</td>
+              </tr>
+              <tr>
+                <td>deepseek-r1:70b</td>
+                <td>70B</td>
+                <td>~43 GB</td>
+                <td><span class="rec-badge rec-big">stop engine first</span> &nbsp;Near-flagship reasoning quality.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Embeddings (Always-On)</h3>
+        <div class="model-table-wrap">
+          <table class="model-table">
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Size</th>
+                <th>VRAM</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>nomic-embed-text</td>
+                <td>137M</td>
+                <td>&lt;1 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Fast, high quality. Use for RAG and
+                  semantic search.</td>
+              </tr>
+              <tr>
+                <td>mxbai-embed-large</td>
+                <td>335M</td>
+                <td>&lt;1 GB</td>
+                <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Higher accuracy than nomic, slightly
+                  slower.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout tip">
+          <div class="callout-label">MoE models and VRAM</div>
+          <p>MoE models like <code>qwen3-coder-next</code> (80B total, 3B active) load all expert weights into memory
+            but only compute a fraction per token. The full 80B BF16 model needs ~160 GB — more than your device has.
+            Use the quantized Ollama version which lands around 45 GB, comfortably fitting with SGLang stopped.</p>
+        </div>
       </div>
 
-      <h3>SGLang Flags by Model Family</h3>
+      <!-- TROUBLESHOOTING -->
+      <div class="doc-section" id="troubleshooting">
+        <div class="eyebrow">13 — Reference</div>
+        <h2>Troubleshooting</h2>
 
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Model Family</th><th>Required Flags</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>Mistral (all)</td>
-              <td><code>--tool-call-parser mistral</code><br><code>--moe-runner-backend flashinfer_cutlass</code></td>
-              <td>MoE runner only needed for MoE variants. Always use <code>--attention-backend triton</code> on GB10.</td>
-            </tr>
-            <tr>
-              <td>Qwen3-Coder-Next</td>
-              <td><code>--tool-call-parser qwen3_coder</code></td>
-              <td>New parser — different from qwen2.5. Requires SGLang >= v0.5.8.</td>
-            </tr>
-            <tr>
-              <td>All models on GB10</td>
-              <td><code>--attention-backend triton</code></td>
-              <td>FlashInfer has GB10 bugs. Never use <code>--quantization modelopt_fp4</code> or <code>--fp4-gemm-backend</code> on SM121A.</td>
-            </tr>
-          </tbody>
+        <h3>Service Status Pills Show Red</h3>
+        <table class="param-table">
+          <tr>
+            <td>Any engine red</td>
+            <td>The engine container is stopped. Use its tab to start a profile, or check <code>docker ps</code> via
+              SSH.</td>
+          </tr>
+          <tr>
+            <td>Ollama red</td>
+            <td>Ollama service is down. Run <code>sudo systemctl restart ollama</code> via SSH.</td>
+          </tr>
+          <tr>
+            <td>LiteLLM red</td>
+            <td>LiteLLM service is down. Use the Restart button on the LiteLLM tab or
+              <code>sudo systemctl restart litellm</code>.
+            </td>
+          </tr>
         </table>
-      </div>
 
-      <h3>Common vLLM Flags</h3>
-
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Flag</th><th>Description</th></tr></thead>
-          <tbody>
-            <tr><td>--model</td><td>Path to model weights or HuggingFace repo ID</td></tr>
-            <tr><td>--tensor-parallel-size</td><td>Number of GPUs for tensor parallelism (1 for DGX Spark)</td></tr>
-            <tr><td>--max-model-len</td><td>Maximum context length. Reduce if hitting OOM errors.</td></tr>
-            <tr><td>--gpu-memory-utilization</td><td>Fraction of GPU memory to use (default 0.9). Lower to leave room for Ollama.</td></tr>
-            <tr><td>--dtype</td><td>Data type: <code>auto</code>, <code>float16</code>, <code>bfloat16</code></td></tr>
-            <tr><td>--quantization</td><td>Quantization method: <code>awq</code>, <code>gptq</code>, <code>squeezellm</code>, etc.</td></tr>
-            <tr><td>--tool-call-parser</td><td>Tool calling format: <code>mistral</code>, <code>hermes</code>, <code>llama3_json</code>, etc.</td></tr>
-            <tr><td>--enable-auto-tool-choice</td><td>Auto-detect tool calls from model output</td></tr>
-          </tbody>
+        <h3>Pull Gets Stuck / No Progress</h3>
+        <table class="param-table">
+          <tr>
+            <td>Bar stays at 0%</td>
+            <td>Ollama may be downloading a manifest before the first layer. Wait 30s — it should start.</td>
+          </tr>
+          <tr>
+            <td>Connection error</td>
+            <td>Check that Ollama is running. Your device needs internet access for pulls — verify via
+              <code>curl https://ollama.com</code>.
+            </td>
+          </tr>
+          <tr>
+            <td>Model not found</td>
+            <td>Double-check the exact name at <code>ollama.com/library</code>. Names are case-sensitive.</td>
+          </tr>
         </table>
-      </div>
 
-      <div class="callout tip">
-        <div class="callout-label">LiteLLM integration</div>
-        <p>To route engine models through LiteLLM, add an entry to <code>litellm_config.yaml</code> with <code>model: openai/your-model-name</code> and <code>api_base</code> pointing to the engine's URL. The Ollama wildcard only covers Ollama — each engine model needs an explicit entry.</p>
-      </div>
-    </div>
-
-    <!-- SETTINGS -->
-    <div class="doc-section" id="settings">
-      <div class="eyebrow">09 — System</div>
-      <h2>Settings</h2>
-
-      <p>The Settings tab provides centralized configuration for the app and all connected services.</p>
-
-      <h3>Display Name</h3>
-      <p>Set the name shown in the app header bar. Defaults to "DGX Spark". Useful for distinguishing between multiple devices.</p>
-
-      <h3>Service URLs</h3>
-      <p>Configure the URL for each service. All seven services (Ollama, LiteLLM, SGLang, vLLM, llama.cpp, LocalAI, ComfyUI) have URL inputs with individual <strong>Test</strong> buttons for connectivity checks. Use <strong>Test All</strong> to verify all services at once. Changes are saved to <code>config.json</code>.</p>
-
-      <h3>API Key</h3>
-      <p>Set or clear the optional API key for authentication. See the <a href="#security">Security</a> section for details.</p>
-
-      <div class="callout info">
-        <div class="callout-label">Runtime changes</div>
-        <p>All settings take effect immediately — no app restart required. Changes are persisted to <code>config.json</code> for next startup.</p>
-      </div>
-    </div>
-
-    <!-- SECURITY -->
-    <div class="doc-section" id="security">
-      <div class="eyebrow">10 — System</div>
-      <h2>Security</h2>
-
-      <p>API key authentication is optional and can be enabled from the Settings tab. When a key is set, all mutating operations require the key.</p>
-
-      <h3>What's Protected</h3>
-      <table class="param-table">
-        <tr><td>Requires key</td><td>Start/stop engines, pull/delete Ollama models, HF download, update config, apply wildcard, restart LiteLLM, clear logs</td></tr>
-        <tr><td>No key needed</td><td>Status checks, model inventory, profiles, HF search, diagnostics, logs (read), node info</td></tr>
-      </table>
-
-      <h3>How It Works</h3>
-      <p>The API key is sent as an <code>Authorization: Bearer &lt;key&gt;</code> header with every mutating request. The app stores only the SHA-256 hash of the key in <code>config.json</code> — the plaintext key is never written to disk. Verification uses constant-time <code>hmac.compare_digest()</code> on the hashes to prevent timing attacks.</p>
-
-      <div class="callout warn">
-        <div class="callout-label">Remember your key</div>
-        <p>Since the key is stored as a hash, it cannot be recovered. If you lose the key, clear it by editing <code>config.json</code> and removing the <code>api_key</code> field, then restarting the app.</p>
-      </div>
-    </div>
-
-    <!-- DIAGNOSTICS -->
-    <div class="doc-section" id="diagnostics">
-      <div class="eyebrow">11 — System</div>
-      <h2>Logs &amp; Debug</h2>
-
-      <p>The Logs &amp; Debug tab provides full-stack visibility into your AI infrastructure without SSH access.</p>
-
-      <h3>System Overview</h3>
-      <p>A grid of stat cards showing hostname, IP address, architecture, total memory, Python version, app uptime, and disk usage for the HF cache directory. Health checks for all services show colored status (green/red/amber) with response latency in milliseconds. Sudo and Docker permission status are also displayed.</p>
-
-      <h3>Running Configuration</h3>
-      <p>Four collapsible sections showing the current app configuration, parsed LiteLLM YAML, and discovered profiles for all engines. Useful for verifying what the app sees without checking files on the server.</p>
-
-      <h3>Application Logs</h3>
-      <p>A color-coded log viewer connected to the app's in-memory ring buffer (500 entries). Filter by severity level (DEBUG, INFO, WARNING, ERROR), search by text, and toggle 3-second auto-refresh. The buffer captures app events like engine starts, config changes, auth failures, and download activity. Logs are in-memory only — they clear on app restart.</p>
-
-      <h3>Engine Logs</h3>
-      <p>Tabbed viewer showing the latest log file for each engine from <code>/tmp/</code>. Each engine writes its stdout/stderr to a timestamped log file when started via the app. Switch between engines using the tab bar.</p>
-
-      <h3>LiteLLM Logs</h3>
-      <p>Reads the LiteLLM service journal via <code>journalctl -u litellm</code>. Shows the most recent log lines with search and auto-refresh. If the app doesn't have journal access, a permission error is displayed gracefully.</p>
-
-      <h3>Docker Containers</h3>
-      <p>A table showing all running Docker containers with ID, name, image, status, ports, and creation time. Click Refresh to update the view.</p>
-
-      <div class="callout tip">
-        <div class="callout-label">Smart scroll</div>
-        <p>Log panes only auto-scroll to the bottom if you haven't scrolled up. This lets you read through logs without being interrupted by new entries during auto-refresh.</p>
-      </div>
-    </div>
-
-    <!-- MODEL RECOMMENDATIONS -->
-    <div class="doc-section" id="models">
-      <div class="eyebrow">12 — Reference</div>
-      <h2>Model Recommendations for DGX Spark</h2>
-
-      <p>Curated picks for the GB10 unified memory architecture. VRAM figures are approximate for the Ollama default quantization unless noted.</p>
-
-      <h3>Coding</h3>
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Model</th><th>Size</th><th>VRAM</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>qwen3-coder-next</td>
-              <td>80B MoE (3B active)</td>
-              <td>~45 GB</td>
-              <td><span class="rec-badge rec-star">★ Top Pick</span> &nbsp;Agentic coding, 256K context, tool-use trained. Best coding model available locally as of Feb 2026.</td>
-            </tr>
-            <tr>
-              <td>qwen2.5-coder:32b</td>
-              <td>32B</td>
-              <td>~20 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Solid fallback, faster than Qwen3-Coder-Next, runs alongside a large-model engine.</td>
-            </tr>
-            <tr>
-              <td>qwen2.5-coder:14b</td>
-              <td>14B</td>
-              <td>~9 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Fast, good for quick tasks and autocompletion.</td>
-            </tr>
-          </tbody>
+        <h3>HF Download Fails with Permission Error</h3>
+        <table class="param-table">
+          <tr>
+            <td>403 on custom path</td>
+            <td>The destination directory must be registered under <strong>Inventory → Scan Directories</strong> before
+              it can be used as a download target. Add the directory there first, then retry the download.</td>
+          </tr>
+          <tr>
+            <td>No error but nothing downloads</td>
+            <td>Check the browser console for a failed fetch. If the API key is set, ensure it's stored in your browser
+              — open Settings and re-enter it if needed.</td>
+          </tr>
         </table>
-      </div>
-
-      <h3>General Purpose</h3>
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Model</th><th>Size</th><th>VRAM</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>qwen2.5:32b</td>
-              <td>32B</td>
-              <td>~20 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Strong all-rounder. Good for tasks that don't need the flagship model.</td>
-            </tr>
-            <tr>
-              <td>llama3.2:3b</td>
-              <td>3B</td>
-              <td>~2 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Ultra-fast, low VRAM. Useful for quick lookups, classification, routing.</td>
-            </tr>
-            <tr>
-              <td>phi4</td>
-              <td>14B</td>
-              <td>~8 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Microsoft's small but capable model. Good reasoning-to-size ratio.</td>
-            </tr>
-          </tbody>
+        <h3>Models Not Showing in LiteLLM Routes</h3>
+        <table class="param-table">
+          <tr>
+            <td>Wildcard not applied</td>
+            <td>Go to the LiteLLM tab and click Apply Wildcard. This is a one-time step.</td>
+          </tr>
+          <tr>
+            <td>LiteLLM needs restart</td>
+            <td>Even with the wildcard, LiteLLM needs to be running. Check the status pill and restart if red.</td>
+          </tr>
+          <tr>
+            <td>Model just pulled</td>
+            <td>With the wildcard active, newly pulled models are available immediately — no restart needed.</td>
+          </tr>
         </table>
-      </div>
 
-      <h3>Reasoning / Thinking</h3>
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Model</th><th>Size</th><th>VRAM</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>qwq:32b</td>
-              <td>32B</td>
-              <td>~20 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Qwen's thinking model. Slow but strong on complex reasoning.</td>
-            </tr>
-            <tr>
-              <td>deepseek-r1:14b</td>
-              <td>14B</td>
-              <td>~9 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Compact reasoning model, good cost/quality tradeoff.</td>
-            </tr>
-            <tr>
-              <td>deepseek-r1:70b</td>
-              <td>70B</td>
-              <td>~43 GB</td>
-              <td><span class="rec-badge rec-big">stop engine first</span> &nbsp;Near-flagship reasoning quality.</td>
-            </tr>
-          </tbody>
+        <h3>Engine Fails to Start</h3>
+        <table class="param-table">
+          <tr>
+            <td>Port already in use</td>
+            <td>A previous container is still running on the same port. Use the Stop button first, wait 10s, then start
+              again.</td>
+          </tr>
+          <tr>
+            <td>Container name conflict</td>
+            <td>If a stopped container with the same name exists, add <code>--rm</code> to your <code>docker run</code>
+              or run <code>docker rm &lt;name&gt;</code> first.</td>
+          </tr>
+          <tr>
+            <td>Model path missing</td>
+            <td>Check that the model was fully downloaded. Run <code>ls ~/.cache/huggingface/hub/</code> via SSH.</td>
+          </tr>
+          <tr>
+            <td>OOM error</td>
+            <td>Not enough unified memory. Stop other engines first, or reduce memory flags in the start script (e.g.
+              <code>--gpu-memory-utilization</code> for vLLM, <code>--mem-fraction-static</code> for SGLang).
+            </td>
+          </tr>
+          <tr>
+            <td>No profiles found</td>
+            <td>Make sure start scripts are in the correct directory (e.g. <code>~/SGLang/start_*.sh</code>) and start
+              with <code>start_</code>.</td>
+          </tr>
+          <tr>
+            <td>Start timeout</td>
+            <td>The app polls for 10 minutes. If the engine doesn't become healthy, check the engine log in the Logs
+              &amp; Debug tab for errors.</td>
+          </tr>
         </table>
-      </div>
 
-      <h3>Embeddings (Always-On)</h3>
-      <div class="model-table-wrap">
-        <table class="model-table">
-          <thead><tr><th>Model</th><th>Size</th><th>VRAM</th><th>Notes</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>nomic-embed-text</td>
-              <td>137M</td>
-              <td>&lt;1 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Fast, high quality. Use for RAG and semantic search.</td>
-            </tr>
-            <tr>
-              <td>mxbai-embed-large</td>
-              <td>335M</td>
-              <td>&lt;1 GB</td>
-              <td><span class="rec-badge rec-fit">fits alongside</span> &nbsp;Higher accuracy than nomic, slightly slower.</td>
-            </tr>
-          </tbody>
+        <h3>Mistral Returns HTTP 400 / "Message Ordering Conflict"</h3>
+        <table class="param-table">
+          <tr>
+            <td>Consecutive same-role messages</td>
+            <td>Mistral enforces strict user/assistant role alternation. Any middleware, agent framework, or callback
+              that injects consecutive messages with the same role (e.g. two <code>user</code> turns in a row) will
+              trigger an HTTP 400. Audit your LiteLLM callbacks and any agent boot hooks.</td>
+          </tr>
+          <tr>
+            <td>Subagent tool-call injection</td>
+            <td>Subagent tool-call/result sequences may violate the alternation rule if injected raw into the
+              conversation. Ensure tool results are wrapped in the expected alternating structure before forwarding to
+              Mistral.</td>
+          </tr>
+          <tr>
+            <td>Session compaction</td>
+            <td>Context compaction that merges or reorders messages can also break alternation. If the error fires
+              mid-conversation, check your compaction logic.</td>
+          </tr>
         </table>
+
+        <h3>App Not Loading</h3>
+        <table class="param-table">
+          <tr>
+            <td>Check service</td>
+            <td><code>sudo systemctl status model-manager</code></td>
+          </tr>
+          <tr>
+            <td>View logs</td>
+            <td><code>sudo journalctl -u model-manager -f</code></td>
+          </tr>
+          <tr>
+            <td>Restart</td>
+            <td><code>sudo systemctl restart model-manager</code></td>
+          </tr>
+        </table>
+
+        <div class="callout tip">
+          <div class="callout-label">Quick health check</div>
+          <p>All services can be verified in one command: <code class="live"
+              data-svc="healthcheck">curl -s http://127.0.0.1:30000/health; curl -s http://127.0.0.1:8000/health; curl -s http://127.0.0.1:11434/api/tags &gt;/dev/null &amp;&amp; curl -s http://127.0.0.1:4000/health &amp;&amp; echo "all ok"</code>
+          </p>
+        </div>
       </div>
 
-      <div class="callout tip">
-        <div class="callout-label">MoE models and VRAM</div>
-        <p>MoE models like <code>qwen3-coder-next</code> (80B total, 3B active) load all expert weights into memory but only compute a fraction per token. The full 80B BF16 model needs ~160 GB — more than your device has. Use the quantized Ollama version which lands around 45 GB, comfortably fitting with SGLang stopped.</p>
+      <div class="footer">
+        <span class="live" data-svc="footer">loading…</span>
+        <span>NVIDIA DGX Spark · GB10 · 128 GB unified memory</span>
       </div>
-    </div>
 
-    <!-- TROUBLESHOOTING -->
-    <div class="doc-section" id="troubleshooting">
-      <div class="eyebrow">13 — Reference</div>
-      <h2>Troubleshooting</h2>
+    </main>
+  </div>
 
-      <h3>Service Status Pills Show Red</h3>
-      <table class="param-table">
-        <tr><td>Any engine red</td><td>The engine container is stopped. Use its tab to start a profile, or check <code>docker ps</code> via SSH.</td></tr>
-        <tr><td>Ollama red</td><td>Ollama service is down. Run <code>sudo systemctl restart ollama</code> via SSH.</td></tr>
-        <tr><td>LiteLLM red</td><td>LiteLLM service is down. Use the Restart button on the LiteLLM tab or <code>sudo systemctl restart litellm</code>.</td></tr>
-      </table>
+  <script>
+    // Sidebar active state on scroll
+    const sections = document.querySelectorAll('.doc-section, .hero');
+    const links = document.querySelectorAll('.sidebar-link');
 
-      <h3>Pull Gets Stuck / No Progress</h3>
-      <table class="param-table">
-        <tr><td>Bar stays at 0%</td><td>Ollama may be downloading a manifest before the first layer. Wait 30s — it should start.</td></tr>
-        <tr><td>Connection error</td><td>Check that Ollama is running. Your device needs internet access for pulls — verify via <code>curl https://ollama.com</code>.</td></tr>
-        <tr><td>Model not found</td><td>Double-check the exact name at <code>ollama.com/library</code>. Names are case-sensitive.</td></tr>
-      </table>
+    const obs = new IntersectionObserver(entries => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          links.forEach(l => l.classList.remove('active'));
+          const id = e.target.id;
+          const active = document.querySelector(`.sidebar-link[href="#${id}"]`);
+          if (active) active.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-20% 0px -70% 0px' });
 
-      <h3>Models Not Showing in LiteLLM Routes</h3>
-      <table class="param-table">
-        <tr><td>Wildcard not applied</td><td>Go to the LiteLLM tab and click Apply Wildcard. This is a one-time step.</td></tr>
-        <tr><td>LiteLLM needs restart</td><td>Even with the wildcard, LiteLLM needs to be running. Check the status pill and restart if red.</td></tr>
-        <tr><td>Model just pulled</td><td>With the wildcard active, newly pulled models are available immediately — no restart needed.</td></tr>
-      </table>
+    sections.forEach(s => obs.observe(s));
 
-      <h3>Engine Fails to Start</h3>
-      <table class="param-table">
-        <tr><td>Port already in use</td><td>A previous container is still running on the same port. Use the Stop button first, wait 10s, then start again.</td></tr>
-        <tr><td>Container name conflict</td><td>If a stopped container with the same name exists, add <code>--rm</code> to your <code>docker run</code> or run <code>docker rm &lt;name&gt;</code> first.</td></tr>
-        <tr><td>Model path missing</td><td>Check that the model was fully downloaded. Run <code>ls ~/.cache/huggingface/hub/</code> via SSH.</td></tr>
-        <tr><td>OOM error</td><td>Not enough unified memory. Stop other engines first, or reduce memory flags in the start script (e.g. <code>--gpu-memory-utilization</code> for vLLM, <code>--mem-fraction-static</code> for SGLang).</td></tr>
-        <tr><td>No profiles found</td><td>Make sure start scripts are in the correct directory (e.g. <code>~/SGLang/start_*.sh</code>) and start with <code>start_</code>.</td></tr>
-        <tr><td>Start timeout</td><td>The app polls for 10 minutes. If the engine doesn't become healthy, check the engine log in the Logs &amp; Debug tab for errors.</td></tr>
-      </table>
-
-      <h3>Mistral Returns HTTP 400 / "Message Ordering Conflict"</h3>
-      <table class="param-table">
-        <tr><td>Consecutive same-role messages</td><td>Mistral enforces strict user/assistant role alternation. Any middleware, agent framework, or callback that injects consecutive messages with the same role (e.g. two <code>user</code> turns in a row) will trigger an HTTP 400. Audit your LiteLLM callbacks and any agent boot hooks.</td></tr>
-        <tr><td>Subagent tool-call injection</td><td>Subagent tool-call/result sequences may violate the alternation rule if injected raw into the conversation. Ensure tool results are wrapped in the expected alternating structure before forwarding to Mistral.</td></tr>
-        <tr><td>Session compaction</td><td>Context compaction that merges or reorders messages can also break alternation. If the error fires mid-conversation, check your compaction logic.</td></tr>
-      </table>
-
-      <h3>App Not Loading</h3>
-      <table class="param-table">
-        <tr><td>Check service</td><td><code>sudo systemctl status model-manager</code></td></tr>
-        <tr><td>View logs</td><td><code>sudo journalctl -u model-manager -f</code></td></tr>
-        <tr><td>Restart</td><td><code>sudo systemctl restart model-manager</code></td></tr>
-      </table>
-
-      <div class="callout tip">
-        <div class="callout-label">Quick health check</div>
-        <p>All services can be verified in one command: <code class="live" data-svc="healthcheck">curl -s http://127.0.0.1:30000/health; curl -s http://127.0.0.1:8000/health; curl -s http://127.0.0.1:11434/api/tags &gt;/dev/null &amp;&amp; curl -s http://127.0.0.1:4000/health &amp;&amp; echo "all ok"</code></p>
-      </div>
-    </div>
-
-    <div class="footer">
-      <span class="live" data-svc="footer">loading…</span>
-      <span>NVIDIA DGX Spark · GB10 · 128 GB unified memory</span>
-    </div>
-
-  </main>
-</div>
-
-<script>
-// Sidebar active state on scroll
-const sections = document.querySelectorAll('.doc-section, .hero');
-const links = document.querySelectorAll('.sidebar-link');
-
-const obs = new IntersectionObserver(entries => {
-  entries.forEach(e => {
-    if (e.isIntersecting) {
-      links.forEach(l => l.classList.remove('active'));
-      const id = e.target.id;
-      const active = document.querySelector(`.sidebar-link[href="#${id}"]`);
-      if (active) active.classList.add('active');
+    // Copy buttons
+    function copyCode(btn) {
+      const code = btn.closest('.code-wrap').querySelector('.code-body').innerText;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = 'Copy', 1800);
+      });
     }
-  });
-}, { rootMargin: '-20% 0px -70% 0px' });
 
-sections.forEach(s => obs.observe(s));
-
-// Copy buttons
-function copyCode(btn) {
-  const code = btn.closest('.code-wrap').querySelector('.code-body').innerText;
-  navigator.clipboard.writeText(code).then(() => {
-    btn.textContent = 'Copied!';
-    setTimeout(() => btn.textContent = 'Copy', 1800);
-  });
-}
-
-// ── Live config value injection ──
-(async function injectLiveConfig() {
-  try {
-    const r = await fetch('/api/nodeinfo');
-    const d = await r.json();
-    const svc = d.services || {};
-    // Extract port from a URL like "http://host:port"
-    const port = url => ':' + (url || '').split(':').pop();
-    const portMap = {
-      ollama:   port(svc.ollama),
-      litellm:  port(svc.litellm),
-      sglang:   port(svc.sglang),
-      vllm:     port(svc.vllm),
-      llamacpp: port(svc.llamacpp),
-      localai:  port(svc.localai),
-      comfyui:  port(svc.comfyui),
-      app:      ':' + d.port,
-    };
-    document.querySelectorAll('.live').forEach(el => {
-      const s = el.dataset.svc;
-      const fmt = el.dataset.fmt || 'port';
-      if (s === 'footer') {
-        el.textContent = d.hostname + ' \u00b7 ' + d.ip + ' \u00b7 model-manager ' + portMap.app;
-        el.classList.add('loaded');
-        return;
+    // ── Live config value injection ──
+    (async function injectLiveConfig() {
+      try {
+        const r = await fetch('/api/nodeinfo');
+        const d = await r.json();
+        const svc = d.services || {};
+        // Extract port from a URL like "http://host:port"
+        const port = url => ':' + (url || '').split(':').pop();
+        const portMap = {
+          ollama: port(svc.ollama),
+          litellm: port(svc.litellm),
+          sglang: port(svc.sglang),
+          vllm: port(svc.vllm),
+          llamacpp: port(svc.llamacpp),
+          localai: port(svc.localai),
+          comfyui: port(svc.comfyui),
+          app: ':' + d.port,
+        };
+        document.querySelectorAll('.live').forEach(el => {
+          const s = el.dataset.svc;
+          const fmt = el.dataset.fmt || 'port';
+          if (s === 'footer') {
+            el.textContent = d.hostname + ' \u00b7 ' + d.ip + ' \u00b7 model-manager ' + portMap.app;
+            el.classList.add('loaded');
+            return;
+          }
+          if (s === 'healthcheck') {
+            // Rebuild the curl command with live URLs
+            el.textContent = 'curl -s ' + svc.sglang + '/health; curl -s ' + svc.vllm + '/health; curl -s ' + (svc.llamacpp || 'http://127.0.0.1:8080') + '/health; curl -s ' + svc.ollama + '/api/tags >/dev/null && curl -s ' + svc.litellm + '/health && echo "all ok"';
+            el.classList.add('loaded');
+            return;
+          }
+          if (!portMap[s]) return;
+          if (fmt === 'port') {
+            el.textContent = portMap[s];
+          } else if (fmt === 'url') {
+            el.textContent = svc[s] || el.textContent;
+          } else if (fmt === 'url/v1') {
+            el.textContent = (svc[s] || '') + '/v1';
+          } else if (fmt === 'url/v1-label') {
+            el.textContent = 'api_base: ' + (svc[s] || '') + '/v1';
+          }
+          el.classList.add('loaded');
+        });
+      } catch (e) {
+        // Graceful degradation — static defaults remain
       }
-      if (s === 'healthcheck') {
-        // Rebuild the curl command with live URLs
-        el.textContent = 'curl -s ' + svc.sglang + '/health; curl -s ' + svc.vllm + '/health; curl -s ' + (svc.llamacpp||'http://127.0.0.1:8080') + '/health; curl -s ' + svc.ollama + '/api/tags >/dev/null && curl -s ' + svc.litellm + '/health && echo "all ok"';
-        el.classList.add('loaded');
-        return;
-      }
-      if (!portMap[s]) return;
-      if (fmt === 'port') {
-        el.textContent = portMap[s];
-      } else if (fmt === 'url') {
-        el.textContent = svc[s] || el.textContent;
-      } else if (fmt === 'url/v1') {
-        el.textContent = (svc[s] || '') + '/v1';
-      } else if (fmt === 'url/v1-label') {
-        el.textContent = 'api_base: ' + (svc[s] || '') + '/v1';
-      }
-      el.classList.add('loaded');
-    });
-  } catch(e) {
-    // Graceful degradation — static defaults remain
-  }
-})();
-</script>
+    })();
+  </script>
 </body>
+
 </html>
