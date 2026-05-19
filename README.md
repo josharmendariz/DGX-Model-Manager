@@ -2,7 +2,7 @@
 
 A single-file web UI for managing AI models and inference engines on **NVIDIA DGX Spark** and compatible aarch64 GPU systems. Pull Ollama models, browse HuggingFace, manage your local model inventory, route through LiteLLM, and control five inference engines — all from one browser tab.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-aarch64%20Ubuntu-orange) ![Single File](https://img.shields.io/badge/architecture-single%20file-yellow)
+![Python](https://img.shields.io/badge/python-3.10+-blue) ![Platform](https://img.shields.io/badge/Server-NVIDIA_DGX_Spark-76B900?style=flat&logo=nvidia&logoColor=white) ![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-aarch64%20Ubuntu-orange) ![Single File](https://img.shields.io/badge/architecture-single%20file-yellow)
 
 ---
 
