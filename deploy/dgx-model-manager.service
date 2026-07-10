@@ -1,0 +1,26 @@
+[Unit]
+Description=DGX Model Manager (LLM engine control UI, port 8090)
+Documentation=https://github.com/josharmendariz/DGX-Model-Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/josh/DGX-Model-Manager
+# Tailnet-private deployment: bound to the Tailscale IP only (config.json
+# app.host), same trust model as hermes-webui — so unauthenticated access
+# inside the tailnet is acknowledged.
+Environment=MODEL_MANAGER_ALLOW_UNAUTH=1
+# Wait for the Tailscale IP to exist before binding to it (tailscaled is a
+# system service we can't order against from a --user unit). Give up after
+# ~60s and let the bind fail — Restart=always will retry.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show tailscale0 2>/dev/null | grep -q 100.115.54.83 && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/python3 /home/josh/DGX-Model-Manager/app.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+# Health-gate the restart loop — / serves the UI without auth.
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://100.115.54.83:8090/ >/dev/null && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=default.target

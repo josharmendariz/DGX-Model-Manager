@@ -18,7 +18,7 @@ exec docker run --name vllm_node --gpus all -p 8000:8000 \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
   vllm/vllm-openai:cu130-nightly \
   --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 \
-  --served-model-name nemotron-3-nano \
+  --served-model-name nemotron-3-nano vllm-active \
   --host 0.0.0.0 --port 8000 \
   --async-scheduling --dtype auto --kv-cache-dtype fp8 \
   --trust-remote-code --gpu-memory-utilization 0.35 \
