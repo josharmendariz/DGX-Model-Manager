@@ -117,6 +117,14 @@ _paths = _app_config.get("paths", {})
 LITELLM_CONFIG    = Path(os.path.expanduser(_paths.get("litellm_config", "~/litellm/litellm_config.yaml")))
 HF_CACHE_DIR      = Path(os.path.expanduser(_paths.get("hf_cache", "~/.cache/huggingface/hub")))
 
+# LiteLLM backend mode — when litellm runs inside Kubernetes (fed by a
+# configmap) instead of a systemd unit, restarts must sync the config file
+# into the configmap and roll the deployment. Opt in via config.json:
+#   "litellm_k8s": {"enabled": true, "namespace": "llm-inference",
+#                   "configmap": "litellm-config", "configmap_key": "config.yaml",
+#                   "deployment": "litellm"}
+_litellm_k8s = _app_config.get("litellm_k8s", {})
+
 # ─── Engine Registry ─────────────────────────────────────────────────────────
 # Data-driven engine definitions — add a new engine by adding an entry here.
 # Each engine gets: /api/{key}/profiles, /api/{key}/status, /api/{key}/start,
@@ -284,6 +292,41 @@ def load_litellm_config() -> dict:
 def save_litellm_config(cfg: dict):
     with open(LITELLM_CONFIG, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
+async def _restart_litellm_backend() -> tuple[bool, str]:
+    """Restart LiteLLM after a config change.
+
+    k8s mode: sync LITELLM_CONFIG into the configmap, then roll the deployment
+    (the pod mounts the configmap read-only, so a file write alone is invisible
+    to the cluster). Default mode: restart the systemd unit (upstream behavior).
+    """
+    if _litellm_k8s.get("enabled"):
+        ns  = _litellm_k8s.get("namespace", "default")
+        cm  = _litellm_k8s.get("configmap", "litellm-config")
+        key = _litellm_k8s.get("configmap_key", "config.yaml")
+        dep = _litellm_k8s.get("deployment", "litellm")
+        r = await _run("kubectl", "create", "configmap", cm, "-n", ns,
+                       f"--from-file={key}={LITELLM_CONFIG}",
+                       "--dry-run=client", "-o", "yaml", timeout=15)
+        if r.returncode != 0:
+            return False, f"configmap render failed: {r.stderr.strip()}"
+        proc = await asyncio.create_subprocess_exec(
+            "kubectl", "apply", "-f", "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate(r.stdout.encode())
+        if proc.returncode != 0:
+            return False, f"configmap apply failed: {err.decode().strip()}"
+        r2 = await _run("kubectl", "rollout", "restart", f"deployment/{dep}", "-n", ns, timeout=15)
+        if r2.returncode != 0:
+            return False, f"rollout restart failed: {r2.stderr.strip()}"
+        return True, "configmap synced + deployment rolled"
+    result = await _run("sudo", "systemctl", "restart", "litellm", timeout=15)
+    if result.returncode != 0:
+        hint = " — configure passwordless sudo (see Settings or the banner on this tab)" if "password" in result.stderr.lower() else ""
+        return False, result.stderr.strip() + hint
+    return True, "systemd unit restarted"
 
 
 def _parse_script_meta(script_path: Path) -> dict:
@@ -1018,25 +1061,23 @@ async def apply_litellm_wildcard():
         raise HTTPException(500, f"Failed to save LiteLLM config: {e}")
     _logger.info("LiteLLM wildcard applied, restarting service")
 
-    result = await _run("sudo", "systemctl", "restart", "litellm", timeout=15)
-    if result.returncode != 0:
-        _logger.error("LiteLLM restart failed after wildcard: %s", result.stderr.strip())
-        hint = " — configure passwordless sudo (see Settings or the banner on this tab)" if "password" in result.stderr.lower() else ""
-        raise HTTPException(500, f"Config saved but restart failed: {result.stderr.strip()}{hint}")
-    _logger.info("LiteLLM restarted successfully")
-    return {"ok": True, "message": "Wildcard applied — LiteLLM restarted"}
+    ok, detail = await _restart_litellm_backend()
+    if not ok:
+        _logger.error("LiteLLM restart failed after wildcard: %s", detail)
+        raise HTTPException(500, f"Config saved but restart failed: {detail}")
+    _logger.info("LiteLLM restarted successfully (%s)", detail)
+    return {"ok": True, "message": f"Wildcard applied — LiteLLM restarted ({detail})"}
 
 
 @app.post("/api/litellm/restart", dependencies=[Depends(verify_auth)])
 async def restart_litellm():
     _logger.info("LiteLLM restart requested")
-    result = await _run("sudo", "systemctl", "restart", "litellm", timeout=15)
-    if result.returncode != 0:
-        _logger.error("LiteLLM restart failed: %s", result.stderr.strip())
-        hint = " — configure passwordless sudo (see Settings or the banner on this tab)" if "password" in result.stderr.lower() else ""
-        raise HTTPException(500, f"Restart failed: {result.stderr.strip()}{hint}")
-    _logger.info("LiteLLM restarted successfully")
-    return {"ok": True}
+    ok, detail = await _restart_litellm_backend()
+    if not ok:
+        _logger.error("LiteLLM restart failed: %s", detail)
+        raise HTTPException(500, f"Restart failed: {detail}")
+    _logger.info("LiteLLM restarted successfully (%s)", detail)
+    return {"ok": True, "message": detail}
 
 # ── Shared engine helpers ─────────────────────────────────────────────────────
 
