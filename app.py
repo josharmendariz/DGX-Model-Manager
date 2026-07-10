@@ -1182,16 +1182,34 @@ async def _engine_status(base_url: str, docker_name: str,
                     model = d[0]["id"]
             except Exception:
                 pass
-        return {"running": running, "model": model, "container_info": "", "instances": []}
+        if not running:
+            state = "stopped"
+        elif models_path is None or model:
+            state = "serving"
+        else:
+            state = "loading"
+        return {"running": running, "model": model, "state": state,
+                "container_info": "", "instances": []}
 
     # Aggregate: running if ANY instance is healthy
     any_running = any(i["running"] for i in instances)
     primary_model = next((i["model"] for i in instances if i["running"] and i["model"]), None)
     legacy_info = "\n".join(f"{i['name']}\t{i['status']}" for i in instances)
 
+    # Readiness: a container being up ("running") is not the same as the model
+    # being loaded — vLLM weight-load takes minutes, during which /v1/models is
+    # empty. Surface a tri-state so the UI can show "Loading…" vs "Serving".
+    if models_path is None:      # engines w/o a models endpoint: health == ready
+        state = "serving" if any_running else "loading"
+    elif primary_model:
+        state = "serving"
+    else:
+        state = "loading"
+
     return {
         "running": any_running,
         "model": primary_model,
+        "state": state,
         "container_info": legacy_info,
         "instances": instances,
     }
@@ -2443,6 +2461,8 @@ body::before{
   transition:background .3s,box-shadow .3s;
 }
 .engine-led.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.engine-led.loading{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:led-pulse 1.1s ease-in-out infinite}
+@keyframes led-pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .engine-title{font-size:15px;font-weight:700}
 .engine-model{font-size:11px;color:var(--amber);font-family:var(--mono);margin-top:2px}
 .engine-footer{font-size:11px;color:var(--muted);font-family:var(--mono)}
@@ -3680,15 +3700,28 @@ async function loadEngineStatus(eng) {
     const card  = document.getElementById(eng.ids.card);
     const stop  = document.getElementById(eng.ids.stop);
     if (!led || !title || !card) return;
-    if (d.running) {
+    // Tri-state: a live container ("loading") is distinct from a ready model
+    // ("serving") \u2014 vLLM takes minutes to load weights. Fall back to running.
+    const state = d.state || (d.running ? 'serving' : 'stopped');
+    if (state === 'serving') {
       led.className = 'engine-led on';
-      title.textContent = eng.name + ' \u2014 Running';
-      model.textContent = d.model || (eng.webui ? '' : 'Model loading\u2026');
+      title.textContent = eng.name + ' \u2014 Serving';
+      model.textContent = d.model || (eng.webui ? '' : 'Ready');
       card.classList.add('online');
       stop.disabled = false;
       if (eng.webui && eng.ids.webui) {
         const wb = document.getElementById(eng.ids.webui);
         if (wb) { wb.style.display = ''; wb.href = _engineBaseUrl(eng.key); }
+      }
+    } else if (state === 'loading') {
+      led.className = 'engine-led loading';
+      title.textContent = eng.name + ' \u2014 Loading\u2026';
+      model.textContent = 'Container up \u2014 loading model weights\u2026';
+      card.classList.add('online');
+      stop.disabled = false;
+      if (eng.webui && eng.ids.webui) {
+        const wb = document.getElementById(eng.ids.webui);
+        if (wb) wb.style.display = 'none';
       }
     } else {
       led.className = 'engine-led';
