@@ -242,6 +242,27 @@ def _get_total_memory_gb() -> int:
         pass
     return 0
 
+
+def _get_available_memory_gb() -> float:
+    """Currently-available system memory in GB, from /proc/meminfo MemAvailable.
+
+    On the GB10 (DGX Spark) the GPU and system RAM are ONE ~121 GB unified pool,
+    and nvidia-smi reports memory as N/A on this hardware — so MemAvailable is
+    the only trustworthy signal of how much room a new model actually has. Note
+    that vLLM's --gpu-memory-utilization reserves a fraction of this whole pool,
+    yet that reservation never appears in the container's RSS or docker stats, so
+    a running engine's real footprint is unmeasurable and must be estimated from
+    profile metadata (see _vram_admission_check).
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return 0.0
+
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 class PullRequest(BaseModel):
@@ -249,6 +270,7 @@ class PullRequest(BaseModel):
 
 class EngineStartRequest(BaseModel):
     profile: str
+    force: bool = False
 
 class HFDownloadRequest(BaseModel):
     repo_id: str
@@ -1200,12 +1222,105 @@ async def _engine_stop(base_url: str, engine_name: str) -> dict:
     return {"ok": ok, "output": output}
 
 
-async def _engine_start(req_profile: str, scan_fn, engine_name: str) -> dict:
+async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple[float, str]:
+    """VRAM (GB) to credit back for the profile currently running on an engine.
+
+    A new profile's start script does `docker rm -f <container>`, so whatever is
+    running now will be torn down and its unified memory freed before the new one
+    loads. Because a running engine's real footprint is unmeasurable on the GB10
+    (see _get_available_memory_gb), we identify WHICH profile is live by matching
+    the engine's reported served-model-name against each profile's start script
+    (scripts embed their own --served-model-name), and credit that profile's
+    declared vram_gb. Returns (0.0, "") if nothing is running or the running
+    profile cannot be identified — a deliberately conservative credit.
+    """
+    eng = _ENGINES.get(engine_key)
+    if not eng:
+        return 0.0, ""
+    try:
+        status = await _engine_status(
+            _engine_bases[engine_key], eng.get("docker_filter", engine_key),
+            eng.get("health_path", "/health"), eng.get("models_path"))
+    except Exception:
+        return 0.0, ""
+    if not status.get("running"):
+        return 0.0, ""
+    served = status.get("model")
+    if not served:
+        return 0.0, ""
+    # Primary match: served name appears verbatim in a profile's start script.
+    for p in profiles:
+        if p.get("vram_gb") is None:
+            continue
+        try:
+            content = Path(os.path.expanduser(p.get("script", ""))).read_text()
+        except Exception:
+            content = ""
+        if served in content:
+            return float(p["vram_gb"]), p["id"]
+    # Fallback heuristic: fuzzy token match on served name vs profile id/name.
+    sv = served.lower()
+    for p in profiles:
+        if p.get("vram_gb") is None:
+            continue
+        pid = p["id"].lower()
+        if pid.startswith("start_"):
+            pid = pid[6:]
+        if sv in pid or pid in sv or sv in p.get("name", "").lower():
+            return float(p["vram_gb"]), p["id"]
+    return 0.0, ""
+
+
+# Safety margin (GB) reserved for the OS and other services on the unified pool.
+_VRAM_SAFETY_MARGIN_GB = 8
+
+
+async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
+                                scan_fn=None) -> None:
+    """Reject a profile launch that would overcommit the GB10 unified-memory pool.
+
+    GB10 reasoning: GPU and system RAM share one ~121 GB pool and nvidia-smi
+    can't report memory here, so we admit based on /proc/meminfo MemAvailable
+    plus a "reclaim credit" for the profile about to be torn down and replaced
+    by this one (its start script runs `docker rm -f` first). Engine-generic:
+    works for any engine in _ENGINES. Profiles without a declared vram_gb, and
+    force=true launches, skip the check.
+    """
+    if force:
+        _logger.warning("VRAM admission check SKIPPED (force=true) for profile '%s'",
+                        profile.get("id"))
+        return
+    vram = profile.get("vram_gb")
+    if vram is None:
+        _logger.info("Profile '%s' has no VRAM metadata — skipping admission check",
+                     profile.get("id"))
+        return
+    profiles = scan_fn() if scan_fn else _scan_profiles(engine_key)
+    available = _get_available_memory_gb()
+    credit, credit_id = await _running_profile_vram_credit(engine_key, profiles)
+    projected = available + credit
+    margin = _VRAM_SAFETY_MARGIN_GB
+    if vram > projected - margin:
+        credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+                       if credit else
+                       "no running profile could be identified, so a conservative "
+                       "0 GB reclaim credit was used")
+        raise HTTPException(
+            409,
+            f"Insufficient unified memory to start '{profile.get('id')}': needs "
+            f"{vram} GB but only {projected:.0f} GB is projected available "
+            f"({available:.0f} GB free + {credit_note}), and {margin} GB is held "
+            f"back as an OS/services safety margin. Pass force=true to override.")
+
+
+async def _engine_start(req_profile: str, scan_fn, engine_name: str,
+                        engine_key: str | None = None, force: bool = False) -> dict:
     """Start a Docker engine by launching the selected profile script."""
     profiles = scan_fn()
     profile = next((p for p in profiles if p["id"] == req_profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req_profile}' not found")
+    await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
     script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
         raise HTTPException(400, f"Script not found: {script}")
@@ -1250,7 +1365,8 @@ for _ek, _ev in _ENGINES.items():
         @app.post(f"/api/{key}/start", name=f"{key}_start",
                   dependencies=[Depends(verify_auth)])
         async def start(req: EngineStartRequest, k=key):
-            return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k)
+            return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k,
+                                       engine_key=k, force=req.force)
 
     _make_engine_routes(_ek, _ev)
 
