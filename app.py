@@ -957,6 +957,8 @@ async def get_status():
                 except Exception:
                     pass
         status[key] = entry
+    # Unified-memory snapshot for the header gauge — cheap /proc/meminfo read.
+    status["memory"] = _meminfo_snapshot()
     return status
 
 
@@ -1186,6 +1188,9 @@ async def get_nodeinfo():
         "ollama_base": OLLAMA_BASE,
         "services": services,
         "engine_ports": engine_ports,
+        # Optional deep-link target for the header memory gauge (Settings-free:
+        # set app.grafana_url in config.json; empty string = plain gauge).
+        "grafana_url": _app_config.get("app", {}).get("grafana_url", ""),
     }
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
@@ -2887,6 +2892,28 @@ body::before{
 }
 .refresh-btn:hover{border-color:var(--amber);color:var(--amber)}
 
+/* ── Header memory gauge ── */
+.hdr-mem{
+  display:none;align-items:center;gap:8px;
+  padding:3px 10px;
+  border-radius:6px;
+  border:1px solid var(--border);
+  background:var(--s2);
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--text);
+  text-decoration:none;
+  white-space:nowrap;
+  transition:border-color .2s;
+}
+a.hdr-mem[href]:hover{border-color:var(--amber)}
+.hdr-mem-pct{color:var(--muted);margin-left:6px}
+.hdr-mem-pct.crit{color:var(--red)}
+.hdr-mem svg{display:block}
+.mem-spark-line{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.mem-spark-threshold{stroke:var(--red);stroke-width:1;stroke-dasharray:2 3;opacity:.6}
+.mem-spark-dot{fill:var(--amber)}
+
 /* ── Layout ── */
 .body-wrap{display:flex;flex:1;overflow:hidden}
 .sidebar{
@@ -3514,6 +3541,14 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     </div>
   </div>
   <div class="hdr-sep"></div>
+  <a class="hdr-mem" id="hdr-mem" target="_blank" rel="noopener" title="Unified memory">
+    <svg width="72" height="20" viewBox="0 0 72 20" aria-hidden="true">
+      <line class="mem-spark-threshold" id="mem-spark-threshold" x1="1" y1="2.8" x2="71" y2="2.8"></line>
+      <polyline class="mem-spark-line" id="mem-spark-line" points=""></polyline>
+      <circle class="mem-spark-dot" id="mem-spark-dot" r="2" cx="-5" cy="-5"></circle>
+    </svg>
+    <span><span id="mem-used">--</span><span class="hdr-mem-pct" id="mem-pct">--%</span></span>
+  </a>
   <div class="status-cluster">
     <div class="pill" id="pill-ollama"><div class="dot"></div><span>Ollama</span></div>
     <div class="pill" id="pill-litellm"><div class="dot"></div><span>LiteLLM</span></div>
@@ -4069,6 +4104,10 @@ let litellmPort = '';
 let ollamaBase = '';
 let warmSelectedProfile = null;
 
+// Header memory gauge — alert threshold spliced in from server config
+const MEM_ALERT_PCT = """ + str(_ALERT_THRESHOLDS["memory_percent"]) + r""";
+let memHistory = [];  // last ~60 used_pct samples (12s poll ≈ 12 min window)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4142,6 +4181,8 @@ async function loadNodeInfo() {
       d.hostname + ' \u00b7 ' + d.ip + ' \u00b7 :' + d.port;
     litellmPort = d.litellm_port || '';
     ollamaBase = d.ollama_base || '';
+    // Memory gauge deep-links to Grafana when app.grafana_url is configured
+    if (d.grafana_url) document.getElementById('hdr-mem').href = d.grafana_url;
     // Store service URLs for engine webui links
     _nodeServices = d.services || {};
     // Populate engine footers dynamically
@@ -4205,7 +4246,36 @@ async function pollStatus() {
           d[key].model ? eng.name + ' \u00b7 ' + d[key].model.split('/').pop().slice(0,18) : eng.name);
       }
     }
+    updateMemGauge(d.memory);
   } catch(e) {}
+}
+
+function updateMemGauge(mem) {
+  if (!mem || mem.error || !mem.total_gb) return;
+  memHistory.push(mem.used_pct);
+  if (memHistory.length > 60) memHistory.shift();
+  const el = document.getElementById('hdr-mem');
+  el.style.display = 'flex';
+  document.getElementById('mem-used').textContent =
+    Math.round(mem.used_gb) + ' / ' + Math.round(mem.total_gb) + ' GB';
+  const pctEl = document.getElementById('mem-pct');
+  pctEl.textContent = Math.round(mem.used_pct) + '%';
+  pctEl.classList.toggle('crit', mem.used_pct >= MEM_ALERT_PCT);
+  el.title = 'Unified memory \u2014 ' + mem.used_gb + ' GB used, ' + mem.available_gb +
+    ' GB available of ' + mem.total_gb + ' GB \u00b7 alert threshold ' + MEM_ALERT_PCT +
+    '% (dashed line) \u00b7 ~12 min history';
+  // Inline-SVG sparkline on a fixed 0-100% scale so the threshold line is stable
+  const W = 72, H = 20, n = memHistory.length;
+  const y = p => (H - 1) - (Math.min(Math.max(p, 0), 100) / 100) * (H - 2);
+  const x = i => n > 1 ? 1 + (i / (n - 1)) * (W - 2) : 1;
+  document.getElementById('mem-spark-line').setAttribute('points',
+    memHistory.map((p, i) => x(i).toFixed(1) + ',' + y(p).toFixed(1)).join(' '));
+  const dot = document.getElementById('mem-spark-dot');
+  dot.setAttribute('cx', x(n - 1).toFixed(1));
+  dot.setAttribute('cy', y(memHistory[n - 1]).toFixed(1));
+  const th = document.getElementById('mem-spark-threshold');
+  th.setAttribute('y1', y(MEM_ALERT_PCT).toFixed(1));
+  th.setAttribute('y2', y(MEM_ALERT_PCT).toFixed(1));
 }
 
 function setPill(id, ok, label) {
