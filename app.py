@@ -2909,8 +2909,9 @@ body::before{
 a.hdr-mem[href]:hover{border-color:var(--amber)}
 .hdr-mem-pct{color:var(--muted);margin-left:6px}
 .hdr-mem-pct.crit{color:var(--red)}
-.hdr-mem svg{display:block}
-.mem-spark-line{fill:none;stroke:var(--muted);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.hdr-mem svg{display:block;flex:none;width:72px;height:20px}
+.mem-spark-area{fill:var(--amber);opacity:.16;stroke:none}
+.mem-spark-line{fill:none;stroke:var(--amber);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round;opacity:.9}
 .mem-spark-threshold{stroke:var(--red);stroke-width:1;stroke-dasharray:2 3;opacity:.6}
 .mem-spark-dot{fill:var(--amber)}
 
@@ -3543,6 +3544,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
   <div class="hdr-sep"></div>
   <a class="hdr-mem" id="hdr-mem" target="_blank" rel="noopener" title="Unified memory">
     <svg width="72" height="20" viewBox="0 0 72 20" aria-hidden="true">
+      <polygon class="mem-spark-area" id="mem-spark-area" points=""></polygon>
       <line class="mem-spark-threshold" id="mem-spark-threshold" x1="1" y1="2.8" x2="71" y2="2.8"></line>
       <polyline class="mem-spark-line" id="mem-spark-line" points=""></polyline>
       <circle class="mem-spark-dot" id="mem-spark-dot" r="2" cx="-5" cy="-5"></circle>
@@ -4265,14 +4267,21 @@ function updateMemGauge(mem) {
   el.title = 'Unified memory \u2014 ' + mem.used_gb + ' GB used, ' + mem.available_gb +
     ' GB available of ' + mem.total_gb + ' GB \u00b7 alert threshold ' + MEM_ALERT_PCT +
     '% (dashed line) \u00b7 ~12 min history';
-  // Inline-SVG sparkline on a fixed 0-100% scale so the threshold line is stable
-  const W = 72, H = 20, n = memHistory.length;
-  const y = p => (H - 1) - (Math.min(Math.max(p, 0), 100) / 100) * (H - 2);
-  const x = i => n > 1 ? 1 + (i / (n - 1)) * (W - 2) : 1;
-  document.getElementById('mem-spark-line').setAttribute('points',
-    memHistory.map((p, i) => x(i).toFixed(1) + ',' + y(p).toFixed(1)).join(' '));
+  // Inline-SVG sparkline on a fixed 0-100% scale so the threshold line is stable.
+  // A single sample is drawn as a full-width level so the gauge reads as a
+  // filled meter immediately, before ~12 min of history accumulates.
+  const W = 72, H = 20, n = memHistory.length, base = H - 1;
+  const y = p => base - (Math.min(Math.max(p, 0), 100) / 100) * (H - 2);
+  const x = i => n > 1 ? 1 + (i / (n - 1)) * (W - 2) : 71;
+  const linePts = n === 1
+    ? ['1,' + y(memHistory[0]).toFixed(1), '71,' + y(memHistory[0]).toFixed(1)]
+    : memHistory.map((p, i) => x(i).toFixed(1) + ',' + y(p).toFixed(1));
+  document.getElementById('mem-spark-line').setAttribute('points', linePts.join(' '));
+  // Fill the area under the line down to the baseline so the "level" is visible.
+  document.getElementById('mem-spark-area').setAttribute('points',
+    ['1,' + base, ...linePts, '71,' + base].join(' '));
   const dot = document.getElementById('mem-spark-dot');
-  dot.setAttribute('cx', x(n - 1).toFixed(1));
+  dot.setAttribute('cx', '71');
   dot.setAttribute('cy', y(memHistory[n - 1]).toFixed(1));
   const th = document.getElementById('mem-spark-threshold');
   th.setAttribute('y1', y(MEM_ALERT_PCT).toFixed(1));
