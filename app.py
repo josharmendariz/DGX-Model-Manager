@@ -1211,7 +1211,29 @@ _ALERT_ENDPOINTS = tuple(_alerts_cfg.get("endpoints") or ("vllm", "litellm"))
 _ALERT_INTERVAL_S = int(_alerts_cfg.get("interval_s")
                         or os.environ.get("ALERT_CHECK_INTERVAL", "300"))
 _ALERT_COOLDOWN_S = int(_alerts_cfg.get("cooldown_s") or 1800)
-_last_alert_sent: dict[str, float] = {}
+
+# Cooldown state — wall-clock epoch timestamps persisted across restarts so a
+# restart mid-incident doesn't re-fire every alert. Gitignored, best-effort I/O:
+# a corrupt or missing state file must never break alerting.
+_ALERT_STATE_FILE = _APP_DIR / "alert_state.json"
+
+
+def _load_alert_state() -> dict[str, float]:
+    try:
+        data = json.loads(_ALERT_STATE_FILE.read_text())
+        return {str(k): float(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def _save_alert_state() -> None:
+    try:
+        _ALERT_STATE_FILE.write_text(json.dumps(_last_alert_sent))
+    except Exception as e:
+        _logger.warning("Failed to persist alert state: %s", e)
+
+
+_last_alert_sent: dict[str, float] = _load_alert_state()
 
 # Channel configs — discord is on by default (previous behavior); extra
 # channels are opt-in via config.json alerts.channels.
@@ -1320,7 +1342,7 @@ def _send_alerts(alerts: list[dict], force: bool = False) -> list[str]:
             _logger.warning("Alerts active but no alert channel is configured: %s",
                             [a["type"] for a in alerts])
         return sent
-    now = _time.monotonic()
+    now = _time.time()  # wall-clock so persisted cooldowns survive restarts
     for alert in alerts:
         last = _last_alert_sent.get(alert["type"], 0.0)
         if not force and last and now - last < _ALERT_COOLDOWN_S:
@@ -1334,6 +1356,7 @@ def _send_alerts(alerts: list[dict], force: bool = False) -> list[str]:
         if delivered:
             _last_alert_sent[alert["type"]] = now
             sent.append(alert["type"])
+            _save_alert_state()
     return sent
 
 

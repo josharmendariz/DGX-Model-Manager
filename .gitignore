@@ -4,6 +4,7 @@ config.json
 # Runtime data written by the app
 custom_dirs.json
 hf_meta_cache.json
+alert_state.json
 
 # Local working dirs
 backup/
