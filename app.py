@@ -4096,7 +4096,7 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
-let activeTab = 'ollama';
+let activeTab = 'vllm';
 let selectedProfile = null;
 let selectedVLLMProfile = null;
 let statusTimer = null;
@@ -4113,8 +4113,9 @@ let memHistory = [];  // last ~60 used_pct samples (12s poll ≈ 12 min window)
 // ─────────────────────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
+  switchTab(activeTab);  // land on the vLLM switcher (static markup defaults to ollama)
   pollStatus();
-  loadOllamaModels();
+  loadOllamaModels();    // still needed for the sidebar badge
   loadNodeInfo();
   loadScriptDirs();
   checkSudo();
