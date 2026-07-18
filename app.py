@@ -32,6 +32,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from pydantic import BaseModel
 import uvicorn
 
+from discord_notify import send_discord_alert
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 class _MemoryHandler(logging.Handler):
@@ -918,9 +920,11 @@ async def _lifespan(app):
             msg = "SECURITY NOTICE: no API key set and MODEL_MANAGER_ALLOW_UNAUTH=1 — open access acknowledged."
             _logger.warning(msg)
             print(msg, flush=True)
+    alert_task = asyncio.create_task(_alert_loop())
     _logger.info("App started on port %s", APP_PORT)
     yield
     _logger.info("App shutting down")
+    alert_task.cancel()
     await _http.aclose()
 
 app = FastAPI(title="DGX Model Manager", lifespan=_lifespan)
@@ -1182,6 +1186,121 @@ async def get_nodeinfo():
         "ollama_base": OLLAMA_BASE,
         "services": services,
         "engine_ports": engine_ports,
+    }
+
+# ── Alerting ──────────────────────────────────────────────────────────────────
+# Threshold alerts to Discord, salvaged from Hermes SysEng. State comes from
+# this app's own health/memory helpers — no external processes. GPU thresholds
+# are deliberately skipped (too noisy on the GB10 unified pool).
+
+_ALERT_THRESHOLDS = {
+    "memory_percent": 90,    # unified-pool usage — the only trustworthy VRAM signal here
+    "endpoint_failures": 2,  # core serving endpoints unhealthy at once
+}
+# Only the core serving path — other registered engines are usually off by design.
+_ALERT_ENDPOINTS = ("vllm", "litellm")
+_ALERT_INTERVAL_S = int(os.environ.get("ALERT_CHECK_INTERVAL", "300"))
+_ALERT_COOLDOWN_S = 1800  # don't repeat the same alert type more often than this
+_last_alert_sent: dict[str, float] = {}
+
+
+async def _alert_endpoint_health() -> dict[str, bool]:
+    """Health of the endpoints that matter for alerting, keyed by service name."""
+    keys, coros = [], []
+    for key in _ALERT_ENDPOINTS:
+        if key in _ENGINES:
+            keys.append(key)
+            coros.append(service_ok(_engine_bases[key], _ENGINES[key].get("health_path", "/health")))
+        elif key == "litellm":
+            keys.append(key)
+            coros.append(service_ok(LITELLM_BASE, "/v1/models"))
+        elif key == "ollama":
+            keys.append(key)
+            coros.append(service_ok(OLLAMA_BASE, "/api/tags"))
+    results = await asyncio.gather(*coros)
+    return dict(zip(keys, results))
+
+
+async def _collect_alerts() -> list[dict]:
+    """Run threshold checks against in-process state and return active alerts."""
+    alerts = []
+
+    mem = _meminfo_snapshot()
+    used_pct = mem.get("used_pct", 0)
+    if used_pct > _ALERT_THRESHOLDS["memory_percent"]:
+        alerts.append({
+            "type": "memory_high_usage",
+            "severity": "critical",
+            "message": (f"Memory usage is {used_pct}% "
+                        f"({mem.get('used_gb', 0)} / {mem.get('total_gb', 0)} GB)"),
+        })
+
+    health = await _alert_endpoint_health()
+    failed = [k for k, ok in health.items() if not ok]
+    if len(failed) >= _ALERT_THRESHOLDS["endpoint_failures"]:
+        alerts.append({
+            "type": "endpoint_failures",
+            "severity": "critical",
+            "message": f"{len(failed)} serving endpoint(s) unhealthy: {', '.join(failed)}",
+        })
+
+    return alerts
+
+
+def _send_alerts(alerts: list[dict], force: bool = False) -> list[str]:
+    """Route alerts to Discord via discord_notify. No-op when no webhook is set.
+
+    Blocking (urllib) — call via asyncio.to_thread from async contexts.
+    """
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    sent: list[str] = []
+    if not webhook:
+        if alerts:
+            _logger.warning("Alerts active but DISCORD_WEBHOOK_URL is not set: %s",
+                            [a["type"] for a in alerts])
+        return sent
+    now = _time.monotonic()
+    for alert in alerts:
+        last = _last_alert_sent.get(alert["type"], 0.0)
+        if not force and last and now - last < _ALERT_COOLDOWN_S:
+            continue
+        color = 0xFF0000 if alert.get("severity") == "critical" else 0xFFA500
+        title = f"{alert['type'].upper()} - {alert.get('severity', 'warning').upper()}"
+        if send_discord_alert(webhook, title, alert["message"], color):
+            _last_alert_sent[alert["type"]] = now
+            sent.append(alert["type"])
+        else:
+            _logger.warning("Failed to send Discord alert: %s", alert["type"])
+    return sent
+
+
+async def _alert_loop():
+    """Periodic in-process alert check, started from _lifespan."""
+    _logger.info("Alerting loop started (interval %ss, endpoints %s)",
+                 _ALERT_INTERVAL_S, ",".join(_ALERT_ENDPOINTS))
+    while True:
+        await asyncio.sleep(_ALERT_INTERVAL_S)
+        try:
+            alerts = await _collect_alerts()
+            if alerts:
+                _logger.warning("%d alert(s) active: %s",
+                                len(alerts), [a["type"] for a in alerts])
+                await asyncio.to_thread(_send_alerts, alerts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _logger.error("Alert check failed: %s", e)
+
+
+@app.post("/api/alerts/check", dependencies=[Depends(verify_auth)])
+async def run_alert_check():
+    """Manual alert check — returns active alerts; sends to Discord if configured."""
+    alerts = await _collect_alerts()
+    sent = await asyncio.to_thread(_send_alerts, alerts, True)
+    return {
+        "alerts": alerts,
+        "sent": sent,
+        "webhook_configured": bool(os.environ.get("DISCORD_WEBHOOK_URL")),
     }
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
