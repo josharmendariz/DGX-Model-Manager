@@ -272,6 +272,13 @@ class EngineStartRequest(BaseModel):
     profile: str
     force: bool = False
 
+class OllamaStopRequest(BaseModel):
+    name: str
+
+class CreateVLLMProfileRequest(BaseModel):
+    path: str
+    model_name: Optional[str] = None
+
 class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
@@ -299,7 +306,7 @@ async def _run(*cmd: str, timeout: float = 30) -> subprocess.CompletedProcess:
 async def service_ok(base: str, path: str = "/health") -> bool:
     try:
         r = await _http.get(base + path, timeout=3.0)
-        return r.status_code < 400
+        return r.status_code < 400 or r.status_code in (401, 403)
     except Exception:
         return False
 
@@ -929,7 +936,7 @@ async def get_status():
         check_keys.append(key)
         check_coros.append(service_ok(_engine_bases[key], eng.get("health_path", "/health")))
     check_keys += ["ollama", "litellm"]
-    check_coros += [service_ok(OLLAMA_BASE, "/api/tags"), service_ok(LITELLM_BASE, "/health")]
+    check_coros += [service_ok(OLLAMA_BASE, "/api/tags"), service_ok(LITELLM_BASE, "/v1/models")]
     results = await asyncio.gather(*check_coros)
 
     status = {}
@@ -947,6 +954,205 @@ async def get_status():
                     pass
         status[key] = entry
     return status
+
+
+def _meminfo_snapshot() -> dict:
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                vals[k] = int(v.split()[0])
+    except Exception as e:
+        return {"error": str(e)}
+
+    total = vals.get("MemTotal", 0) / 1024 / 1024
+    available = vals.get("MemAvailable", 0) / 1024 / 1024
+    used = max(total - available, 0)
+    return {
+        "total_gb": round(total, 1),
+        "available_gb": round(available, 1),
+        "used_gb": round(used, 1),
+        "used_pct": round((used / total) * 100, 1) if total else 0,
+        "swap_total_gb": round(vals.get("SwapTotal", 0) / 1024 / 1024, 1),
+        "swap_free_gb": round(vals.get("SwapFree", 0) / 1024 / 1024, 1),
+    }
+
+
+async def _nvidia_compute_apps() -> dict:
+    result = await _run(
+        "nvidia-smi",
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return {"ok": False, "apps": [], "error": (result.stderr or result.stdout).strip()}
+
+    apps = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        try:
+            used_mib = int(parts[2])
+        except ValueError:
+            used_mib = None
+        cmdline = ""
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_text(errors="ignore").replace("\0", " ").strip()
+        except Exception:
+            pass
+        apps.append({
+            "pid": pid,
+            "process": parts[1],
+            "used_mib": used_mib,
+            "used_gb": round(used_mib / 1024, 1) if used_mib is not None else None,
+            "cmd": cmdline[:280],
+        })
+    apps.sort(key=lambda x: x.get("used_mib") or 0, reverse=True)
+    return {"ok": True, "apps": apps, "total_mib": sum(a.get("used_mib") or 0 for a in apps)}
+
+
+async def _docker_model_containers() -> dict:
+    result = await _run("docker", "ps", "--format", "{{json .}}", timeout=5)
+    if result.returncode != 0:
+        return {"ok": False, "containers": [], "error": (result.stderr or result.stdout).strip()}
+    keywords = ("vllm", "ollama", "llama", "sglang", "localai", "local-ai", "comfy", "litellm", "triton", "tgi")
+    containers = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        hay = " ".join(str(row.get(k, "")) for k in ("Names", "Image", "Command", "Ports")).lower()
+        if not any(k in hay for k in keywords):
+            continue
+        containers.append({
+            "id": row.get("ID", ""),
+            "name": row.get("Names", ""),
+            "image": row.get("Image", ""),
+            "status": row.get("Status", ""),
+            "ports": row.get("Ports", ""),
+            "command": row.get("Command", ""),
+        })
+    return {"ok": True, "containers": containers}
+
+
+def _parse_ollama_ps(stdout: str) -> list[dict]:
+    rows = []
+    for line in stdout.splitlines()[1:]:
+        if not line.strip():
+            continue
+        parts = _re.split(r"\s{2,}", line.strip())
+        if len(parts) >= 6:
+            rows.append({
+                "name": parts[0],
+                "id": parts[1],
+                "size": parts[2],
+                "processor": parts[3],
+                "context": parts[4],
+                "until": parts[5],
+            })
+        elif parts:
+            rows.append({"name": parts[0], "raw": line.strip()})
+    return rows
+
+
+async def _ollama_warm_models() -> dict:
+    result = await _run("ollama", "ps", timeout=5)
+    if result.returncode != 0:
+        return {"ok": False, "models": [], "raw": "", "error": (result.stderr or result.stdout).strip()}
+    return {"ok": True, "models": _parse_ollama_ps(result.stdout), "raw": result.stdout}
+
+
+async def _k8s_vllm_deployments() -> dict:
+    result = await _run("kubectl", "get", "deploy", "-n", "llm-inference", "-o", "json", timeout=8)
+    if result.returncode != 0:
+        return {"ok": False, "deployments": [], "error": (result.stderr or result.stdout).strip()}
+    try:
+        data = json.loads(result.stdout)
+    except Exception as e:
+        return {"ok": False, "deployments": [], "error": str(e)}
+    deployments = []
+    for item in data.get("items", []):
+        spec = item.get("spec", {})
+        status = item.get("status", {})
+        tmpl = spec.get("template", {}).get("spec", {})
+        containers = tmpl.get("containers", [])
+        images = [c.get("image", "") for c in containers]
+        name = item.get("metadata", {}).get("name", "")
+        if name.startswith("prometheus-"):
+            continue
+        hay = (name + " " + " ".join(images)).lower()
+        if "vllm" not in hay:
+            continue
+        deployments.append({
+            "name": name,
+            "replicas": spec.get("replicas", 0),
+            "available": status.get("availableReplicas", 0),
+            "ready": status.get("readyReplicas", 0),
+            "updated": status.get("updatedReplicas", 0),
+            "images": images,
+        })
+    return {"ok": True, "deployments": deployments}
+
+
+def _identify_active_profile(status: dict, profiles: list[dict]) -> Optional[str]:
+    served = status.get("model") or ""
+    if not served:
+        return None
+    served_l = served.lower()
+    for p in profiles:
+        try:
+            content = Path(os.path.expanduser(p.get("script", ""))).read_text(errors="ignore")
+        except Exception:
+            content = ""
+        if served in content:
+            return p.get("id")
+    for p in profiles:
+        pid = p.get("id", "").lower().removeprefix("start_")
+        pname = p.get("name", "").lower()
+        if pid and (pid in served_l or served_l in pid or served_l in pname):
+            return p.get("id")
+    return None
+
+
+@app.get("/api/warm-models")
+async def get_warm_models():
+    """Resource-oriented view of currently loaded/warm model runtimes."""
+    vllm_profiles = _scan_profiles("vllm")
+    vllm_status = await _engine_status(
+        _engine_bases["vllm"], _ENGINES["vllm"].get("docker_filter", "vllm"),
+        _ENGINES["vllm"].get("health_path", "/health"), _ENGINES["vllm"].get("models_path"))
+    active_profile = _identify_active_profile(vllm_status, vllm_profiles)
+    nvidia, docker, ollama, k8s = await asyncio.gather(
+        _nvidia_compute_apps(),
+        _docker_model_containers(),
+        _ollama_warm_models(),
+        _k8s_vllm_deployments(),
+    )
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "memory": _meminfo_snapshot(),
+        "nvidia": nvidia,
+        "docker": docker,
+        "ollama": ollama,
+        "vllm": {
+            "status": vllm_status,
+            "profiles": vllm_profiles,
+            "active_profile": active_profile,
+        },
+        "kubernetes": k8s,
+    }
 
 @app.get("/api/nodeinfo")
 async def get_nodeinfo():
@@ -1033,6 +1239,18 @@ async def delete_ollama_model(name: str):
         raise
     except Exception as e:
         raise HTTPException(502, str(e))
+
+
+@app.post("/api/ollama/stop", dependencies=[Depends(verify_auth)])
+async def stop_ollama_model(req: OllamaStopRequest):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "Model name is required")
+    result = await _run("ollama", "stop", name, timeout=30)
+    if result.returncode != 0:
+        raise HTTPException(500, (result.stderr or result.stdout or "ollama stop failed").strip())
+    _logger.info("Ollama warm model stopped: %s", name)
+    return {"ok": True, "output": (result.stdout + result.stderr).strip()}
 
 # ── LiteLLM ───────────────────────────────────────────────────────────────────
 
@@ -1466,6 +1684,186 @@ def _validate_service_url(url: str, label: str = "URL"):
 _CONTAINER_ID_RE = _re.compile(r"^[a-f0-9]{12,64}$")
 
 
+def _safe_profile_slug(name: str) -> str:
+    slug = _re.sub(r"[^a-zA-Z0-9._-]+", "_", name.strip().lower())
+    slug = _re.sub(r"_+", "_", slug).strip("._-")
+    return slug[:96] or "hf_model"
+
+
+def _path_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _allowed_model_roots() -> list[Path]:
+    roots = [HF_CACHE_DIR]
+    for d in _load_custom_dirs():
+        try:
+            roots.append(Path(os.path.expanduser(d)))
+        except Exception:
+            pass
+    return roots
+
+
+def _find_launch_dir(path: Path) -> Path:
+    """Accept an HF model dir, snapshot dir, or flat model dir and return the launch dir."""
+    if (path / "config.json").exists():
+        return path
+    snaps = path / "snapshots"
+    if snaps.exists():
+        candidates = [s for s in sorted(snaps.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+                      if s.is_dir() and (s / "config.json").exists()]
+        if candidates:
+            return candidates[0]
+    raise HTTPException(400, "Could not find a launchable snapshot with config.json")
+
+
+def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> dict:
+    config = {}
+    try:
+        config = json.loads((launch_dir / "config.json").read_text())
+    except Exception:
+        pass
+    model_name = requested_name or launch_dir.name
+    hf_root = launch_dir
+    for parent in launch_dir.parents:
+        if parent.name.startswith("models--"):
+            hf_root = parent
+            tail = parent.name[8:]
+            parts = tail.split("--", 1)
+            if len(parts) == 2:
+                model_name = f"{parts[0]}/{parts[1]}"
+            break
+    fmt = _detect_format(hf_root, is_hf_cache=hf_root.name.startswith("models--"))
+    hints = _infer_from_name(model_name.split("/")[-1])
+    inferred = _infer_from_config(config, hints)
+    task_label = _task_from_modalities(inferred.get("modalities", ["Text"]))
+    if hf_root.name.startswith("models--") and (hf_root / "blobs").exists():
+        try:
+            size_gb = round(sum(f.stat().st_size for f in (hf_root / "blobs").iterdir() if f.is_file()) / 1e9, 1)
+        except Exception:
+            size_gb = _dir_size_gb(hf_root)
+    else:
+        size_gb = _dir_size_gb(launch_dir)
+    vram_gb = int(min(112, max(16, round((size_gb * 1.35) + 12))))
+    return {
+        "name": model_name,
+        "served": model_name.replace("/", "--"),
+        "fmt": fmt,
+        "dtype": inferred.get("dtype") or "Unknown",
+        "is_moe": inferred.get("is_moe"),
+        "modalities": inferred.get("modalities", ["Text"]),
+        "task_label": task_label,
+        "size_gb": size_gb,
+        "vram_gb": vram_gb,
+    }
+
+
+def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]:
+    hf_cache_parent = HF_CACHE_DIR.parent.resolve()  # ~/.cache/huggingface
+    if _path_under(launch_dir, hf_cache_parent):
+        rel = launch_dir.resolve().relative_to(hf_cache_parent)
+        return [
+            f'  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
+        ], "/root/.cache/huggingface/" + str(rel).replace(os.sep, "/")
+    return [
+        f'  -v "{launch_dir}:/models/{slug}:ro" \\',
+    ], f"/models/{slug}"
+
+
+def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) -> tuple[str, str, dict]:
+    info = _profile_model_info(launch_dir, model_name)
+    if info["fmt"] not in ("safetensors", "pytorch"):
+        raise HTTPException(400, f"Only safetensors/PyTorch snapshots can be used with vLLM; found {info['fmt']}")
+    if info.get("task_label") not in ("Text Gen", "Vision LLM"):
+        raise HTTPException(400, f"Only text/vision LLM snapshots can be added to vLLM; detected {info.get('task_label')}")
+    slug = _safe_profile_slug(info["name"])
+    script_name = f"start_hf_{slug}.sh"
+    mounts, container_model = _container_model_mount(launch_dir, slug)
+    dtype = info["dtype"]
+    is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
+    is_moe = bool(info["is_moe"]) or "moe" in info["name"].lower() or "a3b" in info["name"].lower()
+
+    env_lines = [
+        "  -e HF_HUB_OFFLINE=1 \\",
+        "  -e CUDA_DEVICE_MAX_CONNECTIONS=8 \\",
+    ]
+    if is_fp4:
+        env_lines += [
+            "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
+            "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
+            "  -e VLLM_NVFP4_GEMM_BACKEND=marlin \\",
+        ]
+
+    arg_lines = [
+        f'  --model "{container_model}" \\',
+        f'  --served-model-name "{info["name"]}" "{info["served"]}" vllm-active \\',
+        "  --host 0.0.0.0 --port 8000 \\",
+        "  --trust-remote-code --dtype auto \\",
+        "  --gpu-memory-utilization 0.75 \\",
+        "  --max-model-len 32768 --max-num-seqs 2 \\",
+        "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+    ]
+    if is_moe:
+        arg_lines.append("  --moe-backend marlin \\")
+    if "qwen" in info["name"].lower():
+        arg_lines += [
+            "  --enable-auto-tool-choice \\",
+            "  --tool-call-parser qwen3_coder \\",
+        ]
+    arg_lines.append("  --generation-config vllm")
+
+    script = f"""#!/bin/bash
+# Name: HF {info['name']}
+# Description: Local HF snapshot via vLLM ({dtype}, {info['size_gb']:.1f} GB on disk)
+# VRAM: {info['vram_gb']}
+#
+# Auto-generated by DGX Model Manager from:
+# {launch_dir}
+set -euo pipefail
+
+docker rm -f vllm_node 2>/dev/null || true
+
+exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \\
+{chr(10).join(mounts)}
+{chr(10).join(env_lines)}
+  vllm/vllm-openai:v0.20.0 \\
+{chr(10).join(arg_lines)}
+"""
+    return script_name, script, info
+
+
+def _create_vllm_profile_from_path(path: str, model_name: str | None = None) -> dict:
+    raw = Path(os.path.expanduser(path.strip())).resolve()
+    if not raw.exists() or not raw.is_dir():
+        raise HTTPException(404, "Model directory not found")
+    if not any(_path_under(raw, root) for root in _allowed_model_roots()):
+        raise HTTPException(403, "Model path must be under the HF cache or a registered inventory directory")
+    launch_dir = _find_launch_dir(raw)
+    script_name, script, info = _build_vllm_profile_script(launch_dir, model_name)
+    target_dir = _engine_dirs["vllm"]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / script_name
+    if target.exists():
+        existing = target.read_text(errors="ignore")
+        if str(launch_dir) not in existing:
+            raise HTTPException(409, f"Profile script already exists with different contents: {target.name}")
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(script)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    _logger.info("Created vLLM HF profile %s for %s", target, launch_dir)
+    return {"ok": True, "profile": _parse_script_meta(target), "path": str(target), "model": info}
+
+
+@app.post("/api/vllm/profiles/from-hf", dependencies=[Depends(verify_auth)])
+async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
+    return _create_vllm_profile_from_path(req.path, req.model_name)
+
+
 @app.post("/api/hf/download", dependencies=[Depends(verify_auth)])
 async def hf_download(req: HFDownloadRequest):
     repo_id = req.repo_id.strip()
@@ -1511,6 +1909,13 @@ async def hf_download(req: HFDownloadRequest):
                 line = raw.decode().strip()
                 if line:
                     yield f"data: {line}\n\n"
+                    try:
+                        ev = json.loads(line)
+                        if ev.get("status") == "complete" and int(ev.get("errors", 0) or 0) == 0 and ev.get("path"):
+                            profile_result = _create_vllm_profile_from_path(str(ev["path"]), repo_id)
+                            yield f"data: {json.dumps({'auto_profile': profile_result})}\n\n"
+                    except Exception as profile_exc:
+                        yield f"data: {json.dumps({'auto_profile_error': str(profile_exc)})}\n\n"
             stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
             for line in stderr_data.decode().split("\n"):
                 stripped = line.strip()
@@ -1945,7 +2350,7 @@ class TestServiceRequest(BaseModel):
 @app.post("/api/test-service", dependencies=[Depends(verify_auth)])
 async def test_service(req: TestServiceRequest):
     """Test connectivity to a service endpoint."""
-    health_paths = {"ollama": "/api/tags", "litellm": "/health"}
+    health_paths = {"ollama": "/api/tags", "litellm": "/v1/models"}
     for key, eng in _ENGINES.items():
         health_paths[key] = eng.get("health_path", "/health")
     _validate_service_url(req.url, req.type)
@@ -1955,8 +2360,8 @@ async def test_service(req: TestServiceRequest):
         t0 = _time.monotonic()
         r = await _http.get(url, timeout=5.0)
         latency_ms = round((_time.monotonic() - t0) * 1000)
-        if r.status_code < 400:
-            return {"ok": True, "latency_ms": latency_ms}
+        if r.status_code < 400 or r.status_code in (401, 403):
+            return {"ok": True, "latency_ms": latency_ms, "auth_required": r.status_code in (401, 403)}
         return {"ok": False, "latency_ms": latency_ms, "error": f"HTTP {r.status_code}"}
     except httpx.ConnectError:
         return {"ok": False, "error": "Connection refused"}
@@ -1976,13 +2381,14 @@ async def debug_system():
             t0 = _time.monotonic()
             r = await _http.get(base + path, timeout=3.0)
             ms = round((_time.monotonic() - t0) * 1000)
-            return name, {"url": base, "healthy": r.status_code < 400, "response_ms": ms}
+            return name, {"url": base, "healthy": r.status_code < 400 or r.status_code in (401, 403),
+                          "response_ms": ms, "auth_required": r.status_code in (401, 403)}
         except Exception:
             return name, {"url": base, "healthy": False, "response_ms": None}
 
     check_coros = [
         _check("ollama", OLLAMA_BASE, "/api/tags"),
-        _check("litellm", LITELLM_BASE, "/health"),
+        _check("litellm", LITELLM_BASE, "/v1/models"),
     ]
     for key, eng in _ENGINES.items():
         check_coros.append(_check(key, _engine_bases[key], eng.get("health_path", "/health")))
@@ -2847,6 +3253,35 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 .docker-table tr:last-child td{border-bottom:none}
 .docker-table tr:hover td{background:var(--s2)}
 
+/* ── Warm Models ── */
+.warm-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.warm-panel{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:14px}
+.warm-panel.full{grid-column:1/-1}
+.warm-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.warm-title-main{font-size:13px;font-weight:700;color:var(--text)}
+.warm-sub{font-size:11px;color:var(--muted);line-height:1.5}
+.warm-metric{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--text);margin-bottom:6px}
+.warm-bar{height:10px;border-radius:999px;background:var(--s3);overflow:hidden;border:1px solid var(--border)}
+.warm-bar-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--amber));width:0%}
+.warm-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid rgba(51,65,85,.55)}
+.warm-row:first-child{border-top:0}
+.warm-name{font-size:12px;font-weight:700;color:var(--text);word-break:break-word}
+.warm-meta{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px;word-break:break-word}
+.warm-pill{font-family:var(--mono);font-size:10px;border:1px solid var(--border);border-radius:999px;padding:3px 8px;color:var(--muted);white-space:nowrap}
+.warm-pill.ok{color:var(--green);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
+.warm-pill.warn{color:var(--amber);border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.08)}
+.warm-pill.err{color:var(--red);border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
+.warm-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.warm-profile-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}
+.warm-profile{border:1px solid var(--border);background:var(--s2);border-radius:8px;padding:10px;cursor:pointer;transition:all .12s}
+.warm-profile:hover{border-color:rgba(251,191,36,.45)}
+.warm-profile.active{border-color:var(--green);background:rgba(34,197,94,.08)}
+.warm-profile.selected{border-color:var(--amber);background:rgba(251,191,36,.08)}
+.warm-profile-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.warm-profile-name{font-size:12px;font-weight:700;color:var(--text)}
+.warm-profile-desc{font-size:11px;color:var(--muted);line-height:1.45;margin-top:5px}
+@media (max-width: 900px){.warm-grid{grid-template-columns:1fr}.warm-panel.full{grid-column:auto}}
+
 /* ── Settings ── */
 .svc-status{
   font-family:var(--mono);font-size:11px;
@@ -2902,6 +3337,9 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-section-label">Engines</div>
 """ + "".join(f'    <div class="nav-item" id="nav-{k}" onclick="switchTab(\'{k}\')">\n      <span class="nav-icon">{e["icon"]}</span>{e["name"]}\n    </div>\n' for k, e in _ENGINES.items()) + r"""
     <div class="nav-section-label">System</div>
+    <div class="nav-item" id="nav-warm" onclick="switchTab('warm')">
+      <span class="nav-icon">&#9729;</span>Warm Models
+    </div>
     <div class="nav-item" id="nav-settings" onclick="switchTab('settings')">
       <span class="nav-icon">&#9881;</span>Settings
     </div>
@@ -3141,6 +3579,99 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 ''' for k, e in _ENGINES.items()) + r"""
+    <!-- ─── WARM MODELS ─── -->
+    <div class="tab" id="tab-warm">
+      <div class="page-hdr">
+        <div class="page-title">Warm Model Resources</div>
+        <div class="page-sub">See what is loaded, which processes are holding unified memory, and switch the active vLLM profile.</div>
+      </div>
+
+      <div class="warm-actions" style="margin-bottom:14px">
+        <button class="btn btn-sm btn-ghost" onclick="loadWarmModels()">&#8635; Refresh</button>
+        <button class="btn btn-sm btn-danger" onclick="warmStopVLLM()">Stop vLLM</button>
+        <span class="warm-sub" id="warm-updated">Not loaded yet</span>
+      </div>
+
+      <div class="warm-grid">
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Unified Memory</div>
+              <div class="warm-sub">GB10 RAM and GPU share this pool</div>
+            </div>
+            <span class="warm-pill" id="warm-memory-pill">--</span>
+          </div>
+          <div class="warm-metric" id="warm-memory-metric">--</div>
+          <div class="warm-bar"><div class="warm-bar-fill" id="warm-memory-bar"></div></div>
+          <div class="warm-sub" id="warm-memory-sub" style="margin-top:8px"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">vLLM Active</div>
+              <div class="warm-sub">Container, served model, and matched profile</div>
+            </div>
+            <span class="warm-pill" id="warm-vllm-pill">--</span>
+          </div>
+          <div id="warm-vllm-active"></div>
+        </div>
+
+        <div class="warm-panel full">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Switch vLLM Profile</div>
+              <div class="warm-sub">Launching a profile replaces the current vLLM container.</div>
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="warmStartSelected()">Start Selected</button>
+          </div>
+          <div class="warm-profile-grid" id="warm-vllm-profiles"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">GPU Compute Apps</div>
+              <div class="warm-sub">Resident GPU processes from nvidia-smi</div>
+            </div>
+            <span class="warm-pill" id="warm-gpu-total">--</span>
+          </div>
+          <div id="warm-gpu-apps"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Ollama Warm Models</div>
+              <div class="warm-sub">Models currently kept alive by Ollama</div>
+            </div>
+            <span class="warm-pill" id="warm-ollama-total">--</span>
+          </div>
+          <div id="warm-ollama-models"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Model Containers</div>
+              <div class="warm-sub">Docker runtimes related to model serving</div>
+            </div>
+          </div>
+          <div id="warm-containers"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Kubernetes vLLM</div>
+              <div class="warm-sub">Scaled deployments in llm-inference</div>
+            </div>
+          </div>
+          <div id="warm-k8s"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- ─── SETTINGS ─── -->
     <div class="tab" id="tab-settings">
       <div class="page-hdr">
@@ -3325,6 +3856,7 @@ let selectedVLLMProfile = null;
 let statusTimer = null;
 let litellmPort = '';
 let ollamaBase = '';
+let warmSelectedProfile = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init
@@ -3442,6 +3974,7 @@ function switchTab(name) {
   else if (engines[name]) { loadEngineStatus(engines[name]); loadEngineProfiles(engines[name]); }
   else if (name === 'ollama') { loadOllamaModels(); }
   else if (name === 'inventory') { loadUnifiedInventory(); loadCustomDirs(); }
+  else if (name === 'warm') { loadWarmModels(); }
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
 }
@@ -3673,6 +4206,162 @@ async function restartLiteLLM() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Warm model resources
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _gb(v) {
+  return (v == null || isNaN(v)) ? '--' : Number(v).toFixed(1) + ' GB';
+}
+
+function _warmEmpty(msg) {
+  return '<div class="empty" style="padding:16px"><div class="empty-text">' + _escHtml(msg) + '</div></div>';
+}
+
+function _warmRow(name, meta, rightHtml) {
+  return '<div class="warm-row"><div><div class="warm-name">' + _escHtml(name) + '</div>'
+    + '<div class="warm-meta">' + _escHtml(meta || '') + '</div></div>'
+    + '<div class="warm-actions">' + (rightHtml || '') + '</div></div>';
+}
+
+async function loadWarmModels() {
+  const setHtml = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  try {
+    const d = await apiFetch('/api/warm-models');
+    const updated = document.getElementById('warm-updated');
+    if (updated) updated.textContent = 'Updated ' + new Date(d.timestamp).toLocaleTimeString();
+
+    const mem = d.memory || {};
+    const usedPct = Math.max(0, Math.min(100, mem.used_pct || 0));
+    document.getElementById('warm-memory-metric').textContent = _gb(mem.used_gb) + ' used';
+    document.getElementById('warm-memory-bar').style.width = usedPct + '%';
+    document.getElementById('warm-memory-sub').textContent = _gb(mem.available_gb) + ' available of ' + _gb(mem.total_gb);
+    const memPill = document.getElementById('warm-memory-pill');
+    memPill.textContent = usedPct.toFixed(1) + '%';
+    memPill.className = 'warm-pill ' + (mem.available_gb < 10 ? 'err' : mem.available_gb < 25 ? 'warn' : 'ok');
+
+    const v = d.vllm || {};
+    const status = v.status || {};
+    const profiles = v.profiles || [];
+    const activeProfile = v.active_profile || null;
+    if (!warmSelectedProfile) warmSelectedProfile = activeProfile || (profiles[0] && profiles[0].id) || null;
+    const activeProfileInfo = profiles.find(p => p.id === activeProfile);
+    const state = status.state || (status.running ? 'serving' : 'stopped');
+    const vPill = document.getElementById('warm-vllm-pill');
+    vPill.textContent = state;
+    vPill.className = 'warm-pill ' + (state === 'serving' ? 'ok' : state === 'loading' ? 'warn' : 'err');
+    const inst = (status.instances || [])[0] || {};
+    setHtml('warm-vllm-active',
+      _warmRow(status.model || 'No served model',
+        [
+          activeProfileInfo ? activeProfileInfo.name : (activeProfile ? activeProfile : 'no matched profile'),
+          inst.name ? inst.name : '',
+          inst.port ? ':' + inst.port : ''
+        ].filter(Boolean).join(' · '),
+        status.running ? '<button class="btn btn-sm btn-danger" onclick="warmStopVLLM()">Stop</button>' : '')
+    );
+
+    setHtml('warm-vllm-profiles', profiles.length ? profiles.map(p => {
+      const isActive = p.id === activeProfile;
+      const isSelected = p.id === warmSelectedProfile;
+      const cls = 'warm-profile' + (isActive ? ' active' : '') + (isSelected ? ' selected' : '');
+      const vram = p.vram_gb != null ? p.vram_gb + ' GB' : '--';
+      return '<div class="' + cls + '" onclick="warmSelectProfile(\'' + p.id.replace(/'/g, "\\'") + '\')">'
+        + '<div class="warm-profile-head"><div class="warm-profile-name">' + _escHtml(p.name || p.id) + '</div>'
+        + '<span class="warm-pill ' + (isActive ? 'ok' : '') + '">' + _escHtml(vram) + '</span></div>'
+        + '<div class="warm-profile-desc">' + _escHtml(p.description || p.id) + '</div>'
+        + (isActive ? '<div class="warm-meta" style="color:var(--green);margin-top:6px">active now</div>' : '')
+        + '</div>';
+    }).join('') : _warmEmpty('No vLLM profiles found'));
+
+    const gpu = d.nvidia || {};
+    const apps = gpu.apps || [];
+    const gpuTotal = document.getElementById('warm-gpu-total');
+    gpuTotal.textContent = apps.length ? _gb((gpu.total_mib || 0) / 1024) : 'none';
+    gpuTotal.className = 'warm-pill ' + (apps.length ? 'warn' : 'ok');
+    setHtml('warm-gpu-apps', apps.length ? apps.map(a =>
+      _warmRow(a.process || ('PID ' + a.pid), 'pid ' + a.pid + (a.cmd ? ' · ' + a.cmd : ''),
+        '<span class="warm-pill warn">' + _escHtml(_gb(a.used_gb)) + '</span>')
+    ).join('') : _warmEmpty(gpu.ok === false ? (gpu.error || 'nvidia-smi unavailable') : 'No GPU compute apps'));
+
+    const ollama = d.ollama || {};
+    const warmModels = ollama.models || [];
+    const ollamaTotal = document.getElementById('warm-ollama-total');
+    ollamaTotal.textContent = warmModels.length + ' warm';
+    ollamaTotal.className = 'warm-pill ' + (warmModels.length ? 'warn' : 'ok');
+    setHtml('warm-ollama-models', warmModels.length ? warmModels.map(m =>
+      _warmRow(m.name || 'unknown', [m.size, m.processor, m.until].filter(Boolean).join(' · '),
+        '<button class="btn btn-sm btn-danger" onclick="warmStopOllama(\'' + (m.name || '').replace(/'/g, "\\'") + '\')">Unload</button>')
+    ).join('') : _warmEmpty(ollama.ok === false ? (ollama.error || 'Ollama unavailable') : 'No warm Ollama models'));
+
+    const containers = (d.docker || {}).containers || [];
+    setHtml('warm-containers', containers.length ? containers.map(c =>
+      _warmRow(c.name || c.id, [c.image, c.status, c.ports].filter(Boolean).join(' · '), '')
+    ).join('') : _warmEmpty((d.docker || {}).ok === false ? ((d.docker || {}).error || 'Docker unavailable') : 'No model containers'));
+
+    const deployments = (d.kubernetes || {}).deployments || [];
+    setHtml('warm-k8s', deployments.length ? deployments.map(dep => {
+      const available = dep.available || 0;
+      const replicas = dep.replicas || 0;
+      const cls = replicas === 0 ? '' : available >= replicas ? 'ok' : 'warn';
+      return _warmRow(dep.name, (dep.images || []).join(' · '),
+        '<span class="warm-pill ' + cls + '">' + available + '/' + replicas + '</span>');
+    }).join('') : _warmEmpty((d.kubernetes || {}).ok === false ? ((d.kubernetes || {}).error || 'kubectl unavailable') : 'No scaled vLLM deployments'));
+  } catch(e) {
+    setHtml('warm-vllm-active', _warmEmpty('Failed to load resources: ' + e.message));
+  }
+}
+
+function warmSelectProfile(id) {
+  warmSelectedProfile = id;
+  document.querySelectorAll('.warm-profile').forEach(el => el.classList.remove('selected'));
+  loadWarmModels();
+}
+
+async function warmStartSelected() {
+  if (!warmSelectedProfile) { toast('Select a vLLM profile first', 'err'); return; }
+  try {
+    await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile});
+    toast('vLLM profile starting', 'ok');
+    setTimeout(loadWarmModels, 2500);
+  } catch(e) {
+    if (String(e.message || '').includes('Insufficient unified memory') &&
+        confirm(e.message + '\n\nForce start anyway?')) {
+      try {
+        await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile, force: true});
+        toast('vLLM profile force-started', 'ok');
+        setTimeout(loadWarmModels, 2500);
+      } catch(forceErr) {
+        toast('Force start failed: ' + forceErr.message, 'err');
+      }
+    } else {
+      toast('Start failed: ' + e.message, 'err');
+    }
+  }
+}
+
+async function warmStopVLLM() {
+  if (!confirm('Stop vLLM? This will interrupt active inference requests.')) return;
+  try {
+    await apiFetch('/api/vllm/stop', 'POST');
+    toast('vLLM stopped', 'ok');
+    setTimeout(loadWarmModels, 1500);
+  } catch(e) {
+    toast('Stop failed: ' + e.message, 'err');
+  }
+}
+
+async function warmStopOllama(name) {
+  if (!name || !confirm('Unload ' + name + ' from Ollama?')) return;
+  try {
+    await apiFetch('/api/ollama/stop', 'POST', {name});
+    toast('Ollama model unloaded', 'ok');
+    setTimeout(loadWarmModels, 1000);
+  } catch(e) {
+    toast('Unload failed: ' + e.message, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SGLang
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3885,6 +4574,15 @@ async function hfDownload() {
             if (ev.errors > 0) parts.push('⚠ ' + ev.errors + ' error(s)');
             lines.push(parts.join('  ·  '));
             toast('✓ Downloaded: ' + repo, 'ok');
+          } else if (ev.auto_profile) {
+            const p = ev.auto_profile.profile || {};
+            lines.push('✓ vLLM profile added: ' + (p.name || p.id || 'profile'));
+            toast('✓ vLLM profile added', 'ok');
+            loadUnifiedInventory();
+            loadEngineProfiles(engines.vllm);
+            loadWarmModels();
+          } else if (ev.auto_profile_error) {
+            lines.push('vLLM profile not auto-created: ' + ev.auto_profile_error);
           } else if (ev.status === 'error') {
             bar.className = 'prog-bar';
             bar.style.width = '0';
@@ -4014,7 +4712,7 @@ function renderInventoryTable(models) {
   }
 
   let html = '<div class="inv-table-wrap" style="border-radius:8px;border:1px solid var(--border)"><table class="inv-table"><thead><tr>';
-  html += '<th>Model</th><th>Task</th><th>Format</th><th>Dtype</th><th>Params</th><th>Size</th><th>Source</th><th>Script</th><th style="width:36px"></th>';
+  html += '<th>Model</th><th>Task</th><th>Format</th><th>Dtype</th><th>Params</th><th>Size</th><th>Source</th><th>Script</th><th style="width:150px"></th>';
   html += '</tr></thead><tbody>';
 
   for (const m of models) {
@@ -4029,6 +4727,12 @@ function renderInventoryTable(models) {
     const delBtn = m.source === 'ollama'
       ? ''
       : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + '\')">&#10005;</button>';
+    const canCreateVllm = m.source !== 'ollama' && !m.has_script
+      && (m.format === 'safetensors' || m.format === 'pytorch')
+      && (m.task_label === 'Text Gen' || m.task_label === 'Vision LLM');
+    const createBtn = canCreateVllm
+      ? '<button class="btn btn-sm" style="font-size:10px;padding:3px 8px" onclick="createVLLMProfileFromInventory(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + '\')">Create vLLM</button>'
+      : '';
 
     html += '<tr>';
     html += '<td><div class="inv-model-name">' + m.name + '</div>' + (m.owner ? '<div class="inv-owner">' + m.owner + '</div>' : '') + '</td>';
@@ -4039,7 +4743,7 @@ function renderInventoryTable(models) {
     html += '<td style="font-family:var(--mono);font-size:11px;white-space:nowrap">' + size + '</td>';
     html += '<td><span class="inv-source-badge ' + sourceClass(m.source) + '">' + sourceLabel(m.source) + '</span></td>';
     html += '<td>' + scriptBadge + '</td>';
-    html += '<td>' + delBtn + '</td>';
+    html += '<td><div style="display:flex;align-items:center;gap:6px;justify-content:flex-end">' + createBtn + delBtn + '</div></td>';
     html += '</tr>';
   }
 
@@ -4115,6 +4819,21 @@ async function removeInventoryDir(path) {
     await loadUnifiedInventory();
   } catch(e) {
     toast('Failed: ' + e.message, 'err');
+  }
+}
+
+async function createVLLMProfileFromInventory(dirPath, modelName) {
+  try {
+    const d = await apiFetch('/api/vllm/profiles/from-hf', 'POST', {path: dirPath, model_name: modelName});
+    const p = d.profile || {};
+    toast('vLLM profile added: ' + (p.name || p.id || modelName), 'ok');
+    await loadUnifiedInventory();
+    if (engines.vllm) {
+      await loadEngineProfiles(engines.vllm);
+    }
+    await loadWarmModels();
+  } catch(e) {
+    toast('Profile creation failed: ' + e.message, 'err');
   }
 }
 
