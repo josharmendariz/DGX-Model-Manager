@@ -349,6 +349,17 @@ The app is a **single Python file** by design. All HTML, CSS, and JavaScript are
 
 ---
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest -q
+```
+
+The suite in `tests/` covers the highest-consequence logic: profile script parsing (`# VRAM:` headers), model metadata inference, the unified-memory admission check that gates engine launches, and alert collection/routing with cooldown persistence. External I/O (Docker, HTTP health checks, `/proc/meminfo`) is mocked — tests never touch running services.
+
+---
+
 ## API Reference
 
 All endpoints are under `/api/`. Basic status and inventory endpoints are unauthenticated. Mutating and diagnostic endpoints require the API key when auth is enabled.

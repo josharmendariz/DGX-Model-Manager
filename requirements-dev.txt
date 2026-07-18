@@ -1,0 +1,4 @@
+# Test dependencies — runtime deps live in requirements.txt
+pytest
+pytest-asyncio
+httpx
