@@ -3631,6 +3631,10 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 
 <div class="body-wrap">
   <nav class="sidebar">
+    <div class="nav-section-label">Dashboards</div>
+    <div class="nav-item" id="nav-sites" onclick="switchTab('sites')">
+      <span class="nav-icon">&#128202;</span>Dashboards
+    </div>
     <div class="nav-section-label">Models</div>
     <div class="nav-item active" id="nav-ollama" onclick="switchTab('ollama')">
       <span class="nav-icon">🦙</span>Ollama
@@ -3663,10 +3667,6 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-section-label">Diagnostics</div>
     <div class="nav-item" id="nav-debug" onclick="switchTab('debug')">
       <span class="nav-icon">&#128269;</span>Logs &amp; Debug
-    </div>
-    <div class="nav-section-label">Dashboards</div>
-    <div class="nav-item" id="nav-sites" onclick="switchTab('sites')">
-      <span class="nav-icon">&#128202;</span>Dashboards
     </div>
   </nav>
 
