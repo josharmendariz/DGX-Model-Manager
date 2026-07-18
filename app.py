@@ -1189,19 +1189,79 @@ async def get_nodeinfo():
     }
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
-# Threshold alerts to Discord, salvaged from Hermes SysEng. State comes from
-# this app's own health/memory helpers — no external processes. GPU thresholds
-# are deliberately skipped (too noisy on the GB10 unified pool).
+# Threshold alerts, salvaged from Hermes SysEng. State comes from this app's
+# own health/memory helpers — no external processes. GPU thresholds are
+# deliberately skipped (too noisy on the GB10 unified pool).
+#
+# Configured via the optional "alerts" section of config.json (documented in
+# config.example.json). Every key is optional — a missing/empty section keeps
+# the previous hardcoded/env-driven behavior exactly.
 
+_alerts_cfg: dict = _app_config.get("alerts") or {}
+
+_ALERT_ENABLED = bool(_alerts_cfg.get("enabled", True))
 _ALERT_THRESHOLDS = {
     "memory_percent": 90,    # unified-pool usage — the only trustworthy VRAM signal here
     "endpoint_failures": 2,  # core serving endpoints unhealthy at once
 }
+_ALERT_THRESHOLDS.update(_alerts_cfg.get("thresholds") or {})
 # Only the core serving path — other registered engines are usually off by design.
-_ALERT_ENDPOINTS = ("vllm", "litellm")
-_ALERT_INTERVAL_S = int(os.environ.get("ALERT_CHECK_INTERVAL", "300"))
-_ALERT_COOLDOWN_S = 1800  # don't repeat the same alert type more often than this
+_ALERT_ENDPOINTS = tuple(_alerts_cfg.get("endpoints") or ("vllm", "litellm"))
+# Config wins; env var is the migration-era fallback (systemd EnvironmentFile).
+_ALERT_INTERVAL_S = int(_alerts_cfg.get("interval_s")
+                        or os.environ.get("ALERT_CHECK_INTERVAL", "300"))
+_ALERT_COOLDOWN_S = int(_alerts_cfg.get("cooldown_s") or 1800)
 _last_alert_sent: dict[str, float] = {}
+
+# Channel configs — discord is on by default (previous behavior); extra
+# channels are opt-in via config.json alerts.channels.
+_ALERT_CHANNELS: dict[str, dict] = {"discord": {"enabled": True}}
+for _ch_name, _ch_cfg in (_alerts_cfg.get("channels") or {}).items():
+    _ALERT_CHANNELS[_ch_name] = {**_ALERT_CHANNELS.get(_ch_name, {}), **(_ch_cfg or {})}
+
+
+def _resolve_discord_webhook(cfg: dict) -> str:
+    """Webhook resolution order: config.json → DISCORD_WEBHOOK_URL env fallback."""
+    return cfg.get("webhook_url") or os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+
+def _notify_discord(alert: dict, cfg: dict) -> bool:
+    color = 0xFF0000 if alert.get("severity") == "critical" else 0xFFA500
+    title = f"{alert['type'].upper()} - {alert.get('severity', 'warning').upper()}"
+    return send_discord_alert(_resolve_discord_webhook(cfg), title, alert["message"], color)
+
+
+def _notify_log(alert: dict, cfg: dict) -> bool:
+    """Log-only channel — always available, useful when no webhook is set."""
+    _logger.warning("ALERT [%s] %s: %s", alert.get("severity", "warning"),
+                    alert["type"], alert["message"])
+    return True
+
+
+# Notifier registry — adding a channel (email, ntfy, …) is one entry here plus
+# an optional readiness predicate below. Signature: (alert, channel_cfg) -> bool.
+_ALERT_NOTIFIERS: dict = {
+    "discord": _notify_discord,
+    "log": _notify_log,
+}
+
+# Channels that need external config before they can deliver. Missing entry
+# means "always ready" (e.g. the log channel).
+_ALERT_CHANNEL_READY: dict = {
+    "discord": lambda cfg: bool(_resolve_discord_webhook(cfg)),
+}
+
+
+def _configured_alert_channels() -> dict[str, dict]:
+    """Enabled channels whose notifier is registered and ready to deliver."""
+    out: dict[str, dict] = {}
+    for name, cfg in _ALERT_CHANNELS.items():
+        if name not in _ALERT_NOTIFIERS or not cfg.get("enabled", True):
+            continue
+        if not _ALERT_CHANNEL_READY.get(name, lambda c: True)(cfg):
+            continue
+        out[name] = cfg
+    return out
 
 
 async def _alert_endpoint_health() -> dict[str, bool]:
@@ -1248,15 +1308,16 @@ async def _collect_alerts() -> list[dict]:
 
 
 def _send_alerts(alerts: list[dict], force: bool = False) -> list[str]:
-    """Route alerts to Discord via discord_notify. No-op when no webhook is set.
+    """Route alerts to every configured notifier channel, honoring the cooldown.
 
-    Blocking (urllib) — call via asyncio.to_thread from async contexts.
+    Blocking (urllib in the discord notifier) — call via asyncio.to_thread
+    from async contexts.
     """
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    channels = _configured_alert_channels()
     sent: list[str] = []
-    if not webhook:
+    if not channels:
         if alerts:
-            _logger.warning("Alerts active but DISCORD_WEBHOOK_URL is not set: %s",
+            _logger.warning("Alerts active but no alert channel is configured: %s",
                             [a["type"] for a in alerts])
         return sent
     now = _time.monotonic()
@@ -1264,20 +1325,26 @@ def _send_alerts(alerts: list[dict], force: bool = False) -> list[str]:
         last = _last_alert_sent.get(alert["type"], 0.0)
         if not force and last and now - last < _ALERT_COOLDOWN_S:
             continue
-        color = 0xFF0000 if alert.get("severity") == "critical" else 0xFFA500
-        title = f"{alert['type'].upper()} - {alert.get('severity', 'warning').upper()}"
-        if send_discord_alert(webhook, title, alert["message"], color):
+        delivered = False
+        for name, cfg in channels.items():
+            if _ALERT_NOTIFIERS[name](alert, cfg):
+                delivered = True
+            else:
+                _logger.warning("Failed to send %s alert: %s", name, alert["type"])
+        if delivered:
             _last_alert_sent[alert["type"]] = now
             sent.append(alert["type"])
-        else:
-            _logger.warning("Failed to send Discord alert: %s", alert["type"])
     return sent
 
 
 async def _alert_loop():
     """Periodic in-process alert check, started from _lifespan."""
-    _logger.info("Alerting loop started (interval %ss, endpoints %s)",
-                 _ALERT_INTERVAL_S, ",".join(_ALERT_ENDPOINTS))
+    if not _ALERT_ENABLED:
+        _logger.info("Alerting disabled via config (alerts.enabled=false)")
+        return
+    _logger.info("Alerting loop started (interval %ss, endpoints %s, channels %s)",
+                 _ALERT_INTERVAL_S, ",".join(_ALERT_ENDPOINTS),
+                 ",".join(_configured_alert_channels()) or "none")
     while True:
         await asyncio.sleep(_ALERT_INTERVAL_S)
         try:
@@ -1297,10 +1364,12 @@ async def run_alert_check():
     """Manual alert check — returns active alerts; sends to Discord if configured."""
     alerts = await _collect_alerts()
     sent = await asyncio.to_thread(_send_alerts, alerts, True)
+    channels = _configured_alert_channels()
     return {
         "alerts": alerts,
         "sent": sent,
-        "webhook_configured": bool(os.environ.get("DISCORD_WEBHOOK_URL")),
+        "channels": sorted(channels),
+        "webhook_configured": "discord" in channels,
     }
 
 # ── Ollama ────────────────────────────────────────────────────────────────────

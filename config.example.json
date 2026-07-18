@@ -16,5 +16,20 @@
   "paths": {
     "litellm_config": "~/litellm/litellm_config.yaml",
     "hf_cache":       "~/.cache/huggingface/hub"
+  },
+  "alerts": {
+    "_comment": "All keys optional — omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
+    "enabled": true,
+    "interval_s": 300,
+    "cooldown_s": 1800,
+    "thresholds": {
+      "memory_percent": 90,
+      "endpoint_failures": 2
+    },
+    "endpoints": ["vllm", "litellm"],
+    "channels": {
+      "discord": {"enabled": true, "webhook_url": ""},
+      "log":     {"enabled": false}
+    }
   }
 }
