@@ -10,6 +10,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Discord's edge (Cloudflare) 403s the default "Python-urllib/*" User-Agent,
+# so a real POST silently fails even when the webhook is valid. Send an
+# explicit UA. (GET webhook metadata works without it, which masks the bug.)
+_UA = "DGX-Model-Manager (+https://github.com/josharmendariz/DGX-Model-Manager)"
+
 
 def send_discord_alert(webhook_url: str, title: str, message: str, color: int = 0xFF0000) -> bool:
     """Send a Discord alert with embed format."""
@@ -30,7 +35,7 @@ def send_discord_alert(webhook_url: str, title: str, message: str, color: int = 
         req = urllib.request.Request(
             webhook_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": _UA},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as response:
@@ -79,7 +84,7 @@ def send_troubleshooter_summary(webhook_url: str, alert_output: str, remediation
         req = urllib.request.Request(
             webhook_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": _UA},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as response:
