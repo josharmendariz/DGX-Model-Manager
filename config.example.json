@@ -32,5 +32,10 @@
       "discord": {"enabled": true, "webhook_url": ""},
       "log":     {"enabled": false}
     }
-  }
+  },
+  "sites": [
+    {"_comment": "Optional — other web UIs on this box, shown as link cards in the Dashboards tab. Give a port (resolved against app.sites_base → app.host → the request host; scheme defaults to http) OR a verbatim url. group is a free-form section heading; desc is a one-liner."},
+    {"name": "Grafana",   "port": 3000, "group": "Metrics", "desc": "Metrics dashboards"},
+    {"name": "Other Box", "url": "https://otherhost.example:8443", "group": "Ops", "desc": "Dashboard on a different host"}
+  ]
 }

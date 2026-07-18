@@ -127,6 +127,16 @@ HF_CACHE_DIR      = Path(os.path.expanduser(_paths.get("hf_cache", "~/.cache/hug
 #                   "deployment": "litellm"}
 _litellm_k8s = _app_config.get("litellm_k8s", {})
 
+# Dashboards — optional "sites" array in config.json listing other web UIs on
+# this box, rendered as link cards in the Dashboards tab. Each entry:
+#   {"name": "...", "desc": "...", "group": "...", "port": 3000}  — resolved
+#   against app.sites_base (falls back to app.host, then the request host), or
+#   {"name": "...", "url": "http://other-host:1234"}              — verbatim.
+# Optional "scheme" (default "http") applies to port-based entries. A missing
+# or empty array simply renders the tab's empty-state — never an error.
+_SITES = _app_config.get("sites") or []
+_SITES_BASE = _app_config.get("app", {}).get("sites_base", "")
+
 # ─── Engine Registry ─────────────────────────────────────────────────────────
 # Data-driven engine definitions — add a new engine by adding an entry here.
 # Each engine gets: /api/{key}/profiles, /api/{key}/status, /api/{key}/start,
@@ -1192,6 +1202,54 @@ async def get_nodeinfo():
         # set app.grafana_url in config.json; empty string = plain gauge).
         "grafana_url": _app_config.get("app", {}).get("grafana_url", ""),
     }
+
+# ── Dashboards ────────────────────────────────────────────────────────────────
+# Read-only listing of other web UIs on this box (config.json "sites" array),
+# consumed by the Dashboards tab. Unauthenticated by design, like /api/status.
+
+
+def _resolve_site_url(site: dict, request_host: str) -> str:
+    """Resolve one sites entry to a full URL — verbatim "url" wins, otherwise
+    scheme://base:port where base is app.sites_base → app.host → request host."""
+    if site.get("url"):
+        return site["url"]
+    host = _SITES_BASE or APP_HOST
+    if not host or host == "0.0.0.0":
+        host = request_host or "127.0.0.1"
+    return f"{site.get('scheme', 'http')}://{host}:{site.get('port')}"
+
+
+async def _site_reachable(url: str) -> bool:
+    """Best-effort probe — mirrors service_ok, but with a shorter timeout so a
+    page of dead links can't slow the endpoint. Auth walls still count as up."""
+    if _http is None:
+        return False
+    try:
+        r = await _http.get(url, timeout=1.5)
+        return r.status_code < 400 or r.status_code in (401, 403)
+    except Exception:
+        return False
+
+
+@app.get("/api/sites")
+async def get_sites(request: Request):
+    resolved = []
+    for s in _SITES:
+        if not isinstance(s, dict) or not s.get("name"):
+            continue
+        if not s.get("url") and not s.get("port"):
+            continue
+        resolved.append({
+            "name": s["name"],
+            "desc": s.get("desc", ""),
+            "group": s.get("group", ""),
+            "url": _resolve_site_url(s, request.url.hostname or ""),
+        })
+    checks = await asyncio.gather(*(_site_reachable(e["url"]) for e in resolved))
+    for entry, ok in zip(resolved, checks):
+        entry["reachable"] = ok
+    return {"sites": resolved}
+
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
 # Threshold alerts, salvaged from Hermes SysEng. State comes from this app's
@@ -3026,6 +3084,17 @@ a.hdr-mem[href]:hover{border-color:var(--amber)}
 .model-card-meta{font-size:11px;color:var(--muted);margin-top:2px}
 .model-card-right{display:flex;align-items:center;gap:6px;flex-shrink:0}
 
+/* ── Dashboards (site link cards reuse model-card) ── */
+a.model-card{text-decoration:none;color:inherit;cursor:pointer}
+a.model-card:hover{border-color:var(--amber)}
+.site-dot{
+  width:6px;height:6px;border-radius:50%;flex-shrink:0;
+  background:var(--s2);border:1px solid var(--border2);
+  transition:background .3s,box-shadow .3s;
+}
+.site-dot.ok{background:var(--green);border-color:var(--green);box-shadow:0 0 5px var(--green)}
+.site-dot.err{background:var(--red);border-color:var(--red)}
+
 /* ── Tags ── */
 .tag{
   display:inline-block;padding:2px 7px;
@@ -3595,6 +3664,10 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-item" id="nav-debug" onclick="switchTab('debug')">
       <span class="nav-icon">&#128269;</span>Logs &amp; Debug
     </div>
+    <div class="nav-section-label">Dashboards</div>
+    <div class="nav-item" id="nav-sites" onclick="switchTab('sites')">
+      <span class="nav-icon">&#128202;</span>Dashboards
+    </div>
   </nav>
 
   <main class="main">
@@ -4088,6 +4161,17 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <!-- ─── DASHBOARDS ─── -->
+    <div class="tab" id="tab-sites">
+      <div class="page-hdr">
+        <div class="page-title">Dashboards</div>
+        <div class="page-sub">Other web UIs served on this box. Managed via the <code>sites</code> array in <code>config.json</code>.</div>
+      </div>
+      <div id="sites-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -4120,6 +4204,7 @@ document.addEventListener('DOMContentLoaded', () => {
   loadOllamaModels();    // still needed for the sidebar badge
   loadNodeInfo();
   loadScriptDirs();
+  loadSites();           // pre-render the Dashboards pane
   checkSudo();
   statusTimer = setInterval(pollStatus, 12000);
 });
@@ -4232,6 +4317,7 @@ function switchTab(name) {
   else if (name === 'warm') { loadWarmModels(); }
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
+  else if (name === 'sites') { loadSites(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4294,6 +4380,54 @@ function setPill(id, ok, label) {
   el.className = 'pill ' + (ok ? 'ok' : 'err');
   const sp = el.querySelector('span');
   if (sp) sp.textContent = label;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashboards
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadSites() {
+  const root = document.getElementById('sites-root');
+  try {
+    const d = await apiFetch('/api/sites');
+    const sites = d.sites || [];
+    if (!sites.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
+        '<div class="empty-text">No dashboards configured &mdash; add a <code>sites</code> array to config.json</div></div>';
+      return;
+    }
+    // Group cards under sec-label headings; ungrouped entries land in "Other".
+    const groups = new Map();
+    sites.forEach(s => {
+      const g = s.group || 'Other';
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(s);
+    });
+    let html = '';
+    for (const [group, entries] of groups) {
+      html += '<div class="sec-label">' + _escHtml(group) + '</div>';
+      html += '<div class="model-grid">' + entries.map(s => {
+        let hostLabel = s.url;
+        try { hostLabel = new URL(s.url).host; } catch(e) {}
+        const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
+        const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
+        const href = _escHtml(s.url).replace(/"/g, '&quot;');
+        return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
+          '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
+          '<div class="model-card-info">' +
+            '<div class="model-card-name">' + _escHtml(s.name) + '</div>' +
+            '<div class="model-card-meta">' + _escHtml(hostLabel) +
+              (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
+          '</div>' +
+          '<div class="model-card-right"><span class="tag tag-amber">open ↗</span></div>' +
+        '</a>';
+      }).join('') + '</div>';
+    }
+    root.innerHTML = html;
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
+      '<div class="empty-text">Could not load dashboards · ' + _escHtml(e.message) + '</div></div>';
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
