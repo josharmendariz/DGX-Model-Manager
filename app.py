@@ -1784,6 +1784,48 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
 # Safety margin (GB) reserved for the OS and other services on the unified pool.
 _VRAM_SAFETY_MARGIN_GB = 8
 
+# Minimum projected headroom (GB, on top of the safety margin) required to admit a
+# profile whose VRAM need is unknown (no `# VRAM:` header). We cannot math an
+# unmetered launch, so instead of skipping the check we refuse to launch onto a
+# nearly-full pool — the case that actually hangs the box.
+_VRAM_UNKNOWN_MIN_HEADROOM_GB = 24
+
+
+async def _other_running_engines(exclude_key: str) -> list[str]:
+    """Names of OTHER engines currently holding the unified pool.
+
+    Their footprint is already reflected in MemAvailable (so the admission math
+    stays correct without crediting them), but naming them tells the user which
+    engine to stop — the admission failure often means a *different* engine is
+    occupying memory, not that this engine's model is too big. Checked only on
+    the rejection path; probes run concurrently.
+    """
+    async def _running(key: str) -> Optional[str]:
+        eng = _ENGINES.get(key, {})
+        try:
+            status = await _engine_status(
+                _engine_bases[key], eng.get("docker_filter", key),
+                eng.get("health_path", "/health"), eng.get("models_path"))
+        except Exception:
+            return None
+        return eng.get("name", key) if status.get("running") else None
+
+    others = [k for k in _ENGINES if k != exclude_key]
+    names = await asyncio.gather(*(_running(k) for k in others))
+    return [n for n in names if n]
+
+
+async def _other_engines_note(engine_key: str) -> str:
+    """A trailing sentence naming other running engines, or '' if none."""
+    try:
+        running = await _other_running_engines(engine_key)
+    except Exception:
+        return ""
+    if not running:
+        return ""
+    return (f" Note: {', '.join(running)} {'is' if len(running) == 1 else 'are'} "
+            f"also running and holding the shared pool — stopping it frees memory.")
+
 
 async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                                 scan_fn=None) -> None:
@@ -1801,15 +1843,32 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                         profile.get("id"))
         return
     vram = profile.get("vram_gb")
-    if vram is None:
-        _logger.info("Profile '%s' has no VRAM metadata — skipping admission check",
-                     profile.get("id"))
-        return
     profiles = scan_fn() if scan_fn else _scan_profiles(engine_key)
     available = _get_available_memory_gb()
     credit, credit_id = await _running_profile_vram_credit(engine_key, profiles)
     projected = available + credit
     margin = _VRAM_SAFETY_MARGIN_GB
+    if vram is None:
+        # Unknown need: can't math it, but still refuse to launch onto a
+        # nearly-full pool. Require a healthy headroom floor above the margin.
+        headroom = projected - margin
+        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GB:
+            credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+                           if credit else "no reclaimable running profile identified")
+            raise HTTPException(
+                409,
+                f"Refusing to start '{profile.get('id')}': it declares no VRAM "
+                f"footprint (add a '# VRAM: NN' header to its start script), and only "
+                f"{headroom:.0f} GB of unified memory headroom is projected available "
+                f"({available:.0f} GB free + {credit_note}, minus a {margin} GB "
+                f"safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GB} GB floor "
+                f"required for an unmetered launch."
+                f"{await _other_engines_note(engine_key)} Pass force=true to override.")
+        _logger.warning(
+            "Profile '%s' has no VRAM metadata — admitted on %.0f GB headroom floor; "
+            "add a '# VRAM: NN' header for a precise check",
+            profile.get("id"), headroom)
+        return
     if vram > projected - margin:
         credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
                        if credit else
@@ -1820,7 +1879,8 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
             f"Insufficient unified memory to start '{profile.get('id')}': needs "
             f"{vram} GB but only {projected:.0f} GB is projected available "
             f"({available:.0f} GB free + {credit_note}), and {margin} GB is held "
-            f"back as an OS/services safety margin. Pass force=true to override.")
+            f"back as an OS/services safety margin."
+            f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
@@ -4749,7 +4809,7 @@ async function warmStartSelected() {
     toast('vLLM profile starting', 'ok');
     setTimeout(loadWarmModels, 2500);
   } catch(e) {
-    if (String(e.message || '').includes('Insufficient unified memory') &&
+    if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
       try {
         await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile, force: true});
@@ -4909,11 +4969,9 @@ async function startEngine(eng) {
   prog.classList.add('show');
   log.textContent = 'Sending start command\u2026';
 
-  try {
-    const d = await apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile});
+  const beginPoll = (d) => {
     toast('\u2713 ' + eng.name + ' starting', 'ok');
     log.textContent = d.message + '\n\nPolling status every 20 seconds\u2026';
-
     let pollCount = 0;
     const poll = setInterval(async () => {
       pollCount++;
@@ -4934,9 +4992,26 @@ async function startEngine(eng) {
         toast(eng.name + ' did not start within 10 minutes', 'err');
       }
     }, 20000);
+  };
+
+  const startWith = (force) =>
+    apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
+
+  try {
+    beginPoll(await startWith(false));
   } catch(e) {
-    toast('Start failed: ' + e.message, 'err');
-    prog.classList.remove('show');
+    if (String(e.message || '').includes('unified memory') &&
+        confirm(e.message + '\n\nForce start anyway?')) {
+      try {
+        beginPoll(await startWith(true));
+      } catch(forceErr) {
+        toast('Force start failed: ' + forceErr.message, 'err');
+        prog.classList.remove('show');
+      }
+    } else {
+      toast('Start failed: ' + e.message, 'err');
+      prog.classList.remove('show');
+    }
   } finally {
     btn.disabled = false;
     btn.innerHTML = '\u25b6 Start Selected';

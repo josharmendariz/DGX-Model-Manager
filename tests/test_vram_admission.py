@@ -76,12 +76,16 @@ async def test_credit_unknown_engine_key():
 
 # ── _vram_admission_check ─────────────────────────────────────────────────────
 
-def _patch_memory(monkeypatch, available_gb, credit=(0.0, "")):
+def _patch_memory(monkeypatch, available_gb, credit=(0.0, ""), others=None):
     monkeypatch.setattr(appmod, "_get_available_memory_gb", lambda: available_gb)
 
     async def stub_credit(engine_key, profiles):
         return credit
     monkeypatch.setattr(appmod, "_running_profile_vram_credit", stub_credit)
+
+    async def stub_others(exclude_key):
+        return others or []
+    monkeypatch.setattr(appmod, "_other_running_engines", stub_others)
 
 
 @pytest.mark.asyncio
@@ -103,6 +107,16 @@ async def test_admission_rejects_overcommit_with_409(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_admission_rejection_names_other_running_engines(monkeypatch):
+    _patch_memory(monkeypatch, available_gb=50.0, others=["SGLang"])
+    profile = {"id": "start_huge", "vram_gb": 60}
+    with pytest.raises(HTTPException) as exc:
+        await appmod._vram_admission_check("vllm", profile, force=False, scan_fn=lambda: [])
+    assert "SGLang" in exc.value.detail
+    assert "also running" in exc.value.detail
+
+
+@pytest.mark.asyncio
 async def test_admission_reclaim_credit_rescues_swap(monkeypatch):
     # Only 20 GB free, but the running 55 GB profile is torn down first.
     _patch_memory(monkeypatch, available_gb=20.0, credit=(55.0, "start_old"))
@@ -118,7 +132,26 @@ async def test_admission_force_bypasses_check(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_admission_skipped_without_vram_metadata(monkeypatch):
-    _patch_memory(monkeypatch, available_gb=1.0)
+async def test_admission_unmetered_allowed_with_headroom(monkeypatch):
+    # No vram_gb, but plenty of room: 100 free - 8 margin = 92 headroom >= floor.
+    _patch_memory(monkeypatch, available_gb=100.0)
     profile = {"id": "start_unknown", "vram_gb": None}
     await appmod._vram_admission_check("vllm", profile, force=False, scan_fn=lambda: [])
+
+
+@pytest.mark.asyncio
+async def test_admission_unmetered_rejected_on_full_pool(monkeypatch):
+    # No vram_gb and a nearly-full pool: 20 free - 8 margin = 12 headroom < floor.
+    _patch_memory(monkeypatch, available_gb=20.0)
+    profile = {"id": "start_unknown", "vram_gb": None}
+    with pytest.raises(HTTPException) as exc:
+        await appmod._vram_admission_check("vllm", profile, force=False, scan_fn=lambda: [])
+    assert exc.value.status_code == 409
+    assert "no VRAM footprint" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_admission_unmetered_force_bypasses(monkeypatch):
+    _patch_memory(monkeypatch, available_gb=1.0)
+    profile = {"id": "start_unknown", "vram_gb": None}
+    await appmod._vram_admission_check("vllm", profile, force=True, scan_fn=lambda: [])
