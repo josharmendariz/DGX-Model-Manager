@@ -1,0 +1,116 @@
+{
+  "meta": {
+    "schema_version": 1,
+    "hardware": "NVIDIA DGX Spark (GB10 Grace Blackwell, 128GB unified LPDDR5X ~273 GB/s, SM121)",
+    "last_updated": "2026-07-20",
+    "notes": "Curated, Spark-specific tuning + model recommendations. The recommender diffs these against installed vLLM profiles and live state. Refresh via the research job (proposes updates for approval)."
+  },
+  "recommendations": [
+    {
+      "id": "nvfp4-vs-fp8-benchmark",
+      "kind": "config",
+      "severity": "high",
+      "title": "Benchmark NVFP4 against FP8 — NVFP4 can be slower on GB10",
+      "summary": "On GB10 (SM121) a missing hardware instruction can make NVFP4 ~32% SLOWER than FP8 for the same model, despite fewer bits. Don't assume FP4 wins.",
+      "action": "For any profile you keep at NVFP4, stand up its FP8 twin and compare tok/s on your real dispatch pattern before committing.",
+      "match": { "type": "script_contains_any", "patterns": ["nvfp4", "NVFP4", "fp4"] },
+      "sources": [
+        { "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html", "note": "vLLM DGX Spark config + FP4/FP8 kernel notes", "date": "2026-06-01" },
+        { "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked", "note": "NVFP4 32% slower than FP8 investigation", "date": "2026-04" }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "marlin-moe-backend",
+      "kind": "config",
+      "severity": "high",
+      "title": "Use the Marlin MoE backend — non-Marlin backends fail on GB10",
+      "summary": "Marlin is the only currently functional NVFP4/FP8-MoE backend on GB10; FlashInfer CUTLASS / TRTLLM get rejected at expert-count x intermediate-dim shape validation. Fires when a profile sets --moe-backend to something other than marlin (and doesn't force Marlin via env).",
+      "action": "Change --moe-backend to marlin (or set VLLM_TEST_FORCE_FP8_MARLIN=1 / VLLM_NVFP4_GEMM_BACKEND=marlin) in the flagged profile.",
+      "match": { "type": "moe_backend_not_marlin", "marlin_signals": ["--moe-backend marlin", "FP8_MARLIN=1", "VLLM_NVFP4_GEMM_BACKEND=marlin"] },
+      "sources": [
+        { "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html", "note": "Marlin mandatory for NVFP4 MoE on GB10", "date": "2026-06-01" }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "cuda-graphs",
+      "kind": "tuning",
+      "severity": "medium",
+      "title": "Enable CUDA graphs (~60% decode speedup)",
+      "summary": "Nemotron Nano went 42 tok/s eager -> 66-67 tok/s with CUDA graphs on this box.",
+      "action": "Ensure CUDA graphs are not disabled (avoid --enforce-eager) in each profile.",
+      "match": { "type": "script_contains_any", "patterns": ["--enforce-eager", "enforce_eager"] },
+      "sources": [
+        { "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html", "note": "CUDA graphs default + ~60% gain", "date": "2026-06-01" }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "prefix-caching",
+      "kind": "tuning",
+      "severity": "medium",
+      "title": "Enable prefix caching — free throughput",
+      "summary": "--enable-prefix-caching is free throughput for any workload with repeated system prompts (agents, routers, RAG).",
+      "action": "Add --enable-prefix-caching to profiles serving repeated system prompts.",
+      "match": { "type": "script_missing_flag", "patterns": ["enable-prefix-caching", "enable_prefix_caching"] },
+      "sources": [
+        { "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html", "note": "prefix caching free throughput", "date": "2026-06-01" }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "raise-gpu-util",
+      "kind": "tuning",
+      "severity": "medium",
+      "title": "Raise gpu-memory-utilization — you are under-using 128GB",
+      "summary": "Default nano runs at 0.35 util. Community serves 16GB models with ~82GB free for KV cache; higher util = longer context + far higher batched throughput (Super NVFP4: 45 tok/s @8 streams -> 490 @128).",
+      "action": "For a solo-resident model, push --gpu-memory-utilization toward 0.80-0.90, leaving OS/services headroom.",
+      "match": { "type": "script_low_util", "threshold": 0.6 },
+      "sources": [
+        { "url": "https://dendro-logic.com/engineering/nvidia-dgx-spark-concurrency-benchmark/", "note": "concurrency scaling to 490 tok/s", "date": "2026" },
+        { "url": "https://explainx.ai/blog/nvidia-dgx-spark-local-llm-best-setup-2026", "note": "unified-memory KV cache headroom", "date": "2026" }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "model-gemma4-26b-a4b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Consider Gemma 4 26B-A4B — the pragmatic Spark default",
+      "summary": "16.5GB MoE footprint, multimodal (text/image/video), ~52 tok/s and 108+ tok/s with MTP speculative decoding, 82GB free for KV. Note: one head-to-head put Qwen 3.6 35B-A3B well ahead on quality (75% vs 46%), so pick per use-case.",
+      "action": "Add a Gemma 4 26B-A4B profile (NVFP4/FP8) for a fast multimodal default; benchmark quality vs your Qwen 3.6 A3B.",
+      "match": { "type": "model_absent", "signals": ["gemma-4", "gemma4", "26b-a4b"] },
+      "sources": [
+        { "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked", "note": "Gemma 4 26B-A4B throughput + MTP", "date": "2026-04" }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "model-gpt-oss-120b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Consider gpt-oss-120B (MXFP4) — largest-capable, MoE-light",
+      "summary": "120B total but 128 experts / 4 active = ~5B active params/token, so it fits and runs ~65+ tok/s single-seq on GB10. Unlike the dense Super-120B you retired for overcommit, MoE active-param count keeps it tractable.",
+      "action": "Evaluate gpt-oss-120B MXFP4 for a high-capability profile; verify VRAM footprint fits your admission floor before enabling.",
+      "match": { "type": "model_absent", "signals": ["gpt-oss-120", "gpt_oss_120"] },
+      "sources": [
+        { "url": "https://forums.developer.nvidia.com/t/building-local-hybrid-llms-on-dgx-spark-that-outperform-top-cloud-models/359569", "note": "gpt-oss-120B 65+ tok/s reports", "date": "2026" }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "arm64-image",
+      "kind": "config",
+      "severity": "low",
+      "title": "Verify ARM64/CUDA vLLM image on suspect tags (GB10 is aarch64)",
+      "summary": "Default Docker Hub :latest is amd64; on GB10 that is an exec-format error at runtime. Only fires on suspect image tags (:latest or an explicit amd64 tag) — a running container already proves aarch64, so working profiles stay quiet. Community image nologik/vllm-dgx-spark targets TORCH_CUDA_ARCH_LIST=12.1f / CUDA 13.",
+      "action": "Pin the start script to an aarch64/sm_121 image (an ARM vllm-openai build or nologik/vllm-dgx-spark).",
+      "match": { "type": "image_tag_suspect", "patterns": [":latest", "amd64", "x86_64"] },
+      "sources": [
+        { "url": "https://medium.com/@michael.hannecke/four-inference-engines-one-box-when-to-use-which-on-the-dgx-spark-6b32a53db768", "note": "engine/image selection on Spark", "date": "2026" }
+      ],
+      "confidence": "high"
+    }
+  ]
+}
