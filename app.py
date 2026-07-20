@@ -1251,6 +1251,104 @@ async def get_sites(request: Request):
     return {"sites": resolved}
 
 
+# ── Recommendations ─────────────────────────────────────────────────────────
+# Layer-2 recommender: diffs the curated Spark-specific KB (recommendations.json)
+# against installed vLLM profiles + live memory state. Each KB entry carries a
+# `match` rule; only fired recommendations are returned, ranked by severity.
+
+_RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _load_recommendations() -> dict:
+    try:
+        return json.loads(_RECOMMENDATIONS_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load recommendations.json: %s", e)
+        return {"meta": {}, "recommendations": []}
+
+
+def _profile_script_text(profile: dict) -> str:
+    try:
+        return Path(os.path.expanduser(profile.get("script", ""))).read_text()
+    except Exception:
+        return ""
+
+
+def _eval_profile_match(match: dict, text: str) -> Optional[str]:
+    """Return a per-profile 'why it fired' detail, or None if it doesn't fire."""
+    mt = match.get("type")
+    if mt == "script_contains_any":
+        for p in match.get("patterns", []):
+            if p in text:
+                return f"matches '{p}'"
+        return None
+    if mt == "script_missing_flag":
+        pats = match.get("patterns", [])
+        if pats and not any(p in text for p in pats):
+            return f"no {pats[0]}"
+        return None
+    if mt == "moe_backend_not_marlin":
+        m = _re.search(r"--moe-backend\s+(\S+)", text)
+        if not m:
+            return None  # not a MoE profile / no explicit backend
+        if any(sig in text for sig in match.get("marlin_signals", [])) or m.group(1) == "marlin":
+            return None
+        return f"uses --moe-backend {m.group(1)} (not marlin)"
+    if mt == "script_low_util":
+        m = _re.search(r"--gpu-memory-utilization\s+([0-9.]+)", text)
+        if not m:
+            return None
+        util = float(m.group(1))
+        thr = match.get("threshold", 0.6)
+        return f"gpu-memory-utilization {util:g} < {thr:g}" if util < thr else None
+    if mt == "image_tag_suspect":
+        for p in match.get("patterns", []):
+            if p in text:
+                return f"image references '{p}'"
+        return None
+    return None
+
+
+@app.get("/api/recommendations")
+async def get_recommendations():
+    kb = _load_recommendations()
+    profiles = _scan_profiles("vllm")
+    scripts = {p["id"]: _profile_script_text(p) for p in profiles}
+    haystack = " ".join(
+        [t.lower() for t in scripts.values()]
+        + [f"{p.get('id','')} {p.get('name','')}".lower() for p in profiles])
+
+    fired = []
+    for rec in kb.get("recommendations", []):
+        match = rec.get("match", {})
+        base = {k: rec[k] for k in
+                ("id", "kind", "severity", "title", "summary", "action",
+                 "sources", "confidence") if k in rec}
+        if match.get("type") == "model_absent":
+            signals = match.get("signals", [])
+            if not any(s.lower() in haystack for s in signals):
+                fired.append({**base, "scope": "global",
+                              "fired_for": [],
+                              "detail": f"no profile serves {' / '.join(signals)}"})
+            continue
+        hits = [{"profile": pid, "detail": detail}
+                for pid, text in scripts.items()
+                if (detail := _eval_profile_match(match, text))]
+        if hits:
+            fired.append({**base, "scope": "profile", "fired_for": hits})
+
+    fired.sort(key=lambda r: _REC_SEVERITY_ORDER.get(r.get("severity"), 9))
+    mem = _meminfo_snapshot()
+    return {
+        "meta": kb.get("meta", {}),
+        "state": {"available_gb": mem.get("available_gb"),
+                  "total_gb": mem.get("total_gb")},
+        "profiles_checked": len(profiles),
+        "recommendations": fired,
+    }
+
+
 # ── Alerting ──────────────────────────────────────────────────────────────────
 # Threshold alerts, salvaged from Hermes SysEng. State comes from this app's
 # own health/memory helpers — no external processes. GPU thresholds are
@@ -3710,6 +3808,11 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-item" id="nav-hf" onclick="switchTab('hf')">
       <span class="nav-icon">🤗</span>HF Download
     </div>
+    <div class="nav-section-label">Advisor</div>
+    <div class="nav-item" id="nav-recs" onclick="switchTab('recs')">
+      <span class="nav-icon">💡</span>Recommendations
+      <span class="nav-badge" id="badge-recs">—</span>
+    </div>
     <div class="nav-section-label">Routing</div>
     <div class="nav-item" id="nav-litellm" onclick="switchTab('litellm')">
       <span class="nav-icon">⚡</span>LiteLLM
@@ -4232,6 +4335,18 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <!-- ─── RECOMMENDATIONS ─── -->
+    <div class="tab" id="tab-recs">
+      <div class="page-hdr">
+        <div class="page-title">Recommendations</div>
+        <div class="page-sub">Spark-specific tuning &amp; model advice, diffed against your vLLM profiles and live memory. Curated in <code>recommendations.json</code>.</div>
+      </div>
+      <div id="recs-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="recs-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -4378,6 +4493,7 @@ function switchTab(name) {
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
+  else if (name === 'recs') { loadRecommendations(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4487,6 +4603,70 @@ async function loadSites() {
   } catch(e) {
     root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
       '<div class="empty-text">Could not load dashboards · ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recommendations
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _SEV = {
+  high:   { label: 'HIGH',   bg: 'rgba(239,68,68,.15)',  fg: '#f87171' },
+  medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
+  low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
+};
+
+async function loadRecommendations() {
+  const root = document.getElementById('recs-root');
+  const meta = document.getElementById('recs-meta');
+  try {
+    const d = await apiFetch('/api/recommendations');
+    const recs = d.recommendations || [];
+    document.getElementById('badge-recs').textContent = recs.length;
+    const st = d.state || {};
+    meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
+      (st.total_gb ? ' · ' + Math.round(st.available_gb) + ' / ' + Math.round(st.total_gb) +
+        ' GB free · ' + d.profiles_checked + ' profiles checked' : '') +
+      (d.meta && d.meta.last_updated ? ' · KB ' + _escHtml(d.meta.last_updated) : '');
+
+    if (!recs.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">✅</div>' +
+        '<div class="empty-text">No recommendations — your profiles match current Spark best practice.</div></div>';
+      return;
+    }
+    root.innerHTML = recs.map(r => {
+      const sev = _SEV[r.severity] || _SEV.low;
+      const chip = (txt, extra) => '<span style="display:inline-block;padding:2px 8px;border-radius:6px;' +
+        'font-size:11px;font-weight:600;' + (extra || '') + '">' + txt + '</span>';
+      const fired = r.scope === 'global'
+        ? '<div class="model-card-meta" style="margin-top:8px">' + _escHtml(r.detail) + '</div>'
+        : '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">' +
+            r.fired_for.map(h => chip(_escHtml(h.profile.replace(/^start_/, '')) +
+              ' · ' + _escHtml(h.detail),
+              'background:var(--s2);color:var(--muted);font-weight:500')).join('') +
+          '</div>';
+      const src = (r.sources || []).map(s =>
+        '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+        'style="color:var(--blue);text-decoration:none">' +
+        _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
+      ).join(' · ');
+      return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+          chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
+          '<span class="model-card-name">' + _escHtml(r.title) + '</span>' +
+          chip(_escHtml(r.kind) + ' · ' + _escHtml(r.confidence || '') + ' conf',
+               'background:var(--s2);color:var(--muted);font-weight:500') +
+        '</div>' +
+        '<div class="model-card-meta" style="margin-top:8px;line-height:1.5">' + _escHtml(r.summary) + '</div>' +
+        '<div style="margin-top:8px;font-size:13px"><strong style="color:var(--text)">Do:</strong> ' +
+          _escHtml(r.action) + '</div>' +
+        fired +
+        (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>' +
+      '<div class="empty-text">Could not load recommendations · ' + _escHtml(e.message) + '</div></div>';
   }
 }
 
