@@ -18,10 +18,19 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+
+
+def _codex_bin() -> str:
+    """Absolute path to the codex binary. PATH lookup fails when invoked from
+    the systemd --user daemon (minimal PATH omits ~/.npm-global/bin), so fall
+    back to the known npm-global install location."""
+    return (shutil.which("codex")
+            or os.path.expanduser("~/.npm-global/bin/codex"))
 
 APP_DIR = Path(__file__).resolve().parent
 KB_FILE = APP_DIR / "recommendations.json"
@@ -155,7 +164,7 @@ def _synthesize_codex(prompt: str) -> dict:
     runner = APP_DIR / ".research_run.sh"
     runner.write_text(
         "#!/bin/bash\n"
-        "codex exec --sandbox read-only --skip-git-repo-check --ephemeral "
+        f"{_codex_bin()} exec --sandbox read-only --skip-git-repo-check --ephemeral "
         f"--output-schema {SCHEMA_FILE} -o {out} \"$(cat {PROMPT_FILE})\"\n"
     )
     runner.chmod(0o755)

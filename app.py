@@ -1356,6 +1356,44 @@ async def get_recommendations():
     }
 
 
+# Research-refresh (KB layer 3). The job fetches curated sources, runs a
+# synthesis engine (Codex, ~1-2 min), and writes PROPOSED updates for review.
+# It never touches the live KB — approval stays a deliberate CLI step
+# (research_refresh.py --apply, then formalize each manual match rule). The UI
+# only *runs research* and *shows the proposals*; it intentionally cannot apply.
+_PROPOSED_FILE = _APP_DIR / "recommendations.proposed.json"
+_refresh_lock = asyncio.Lock()
+
+
+@app.get("/api/recommendations/proposed")
+async def get_proposed_recommendations():
+    """Return the last proposals (recommendations.proposed.json), if any."""
+    try:
+        data = json.loads(_PROPOSED_FILE.read_text())
+    except Exception:
+        return {"proposed": [], "summary": "", "exists": False}
+    return {**data, "exists": True}
+
+
+@app.post("/api/recommendations/refresh", dependencies=[Depends(verify_auth)])
+async def refresh_recommendations():
+    """Run the research-refresh job and return the proposed updates for review."""
+    if _refresh_lock.locked():
+        raise HTTPException(409, "A refresh is already running")
+    async with _refresh_lock:
+        import research_refresh
+        _logger.info("Research-refresh requested (engine=%s)", research_refresh.ENGINE)
+        try:
+            result = await asyncio.to_thread(research_refresh.research)
+        except Exception as e:
+            _logger.error("Research-refresh failed: %s", e)
+            raise HTTPException(500, f"Refresh failed: {e}")
+        props = result.get("proposed", [])
+        _logger.info("Research-refresh produced %d proposal(s)", len(props))
+        return {"ok": True, "engine": research_refresh.ENGINE,
+                "summary": result.get("summary", ""), "proposed": props}
+
+
 # ── Alerting ──────────────────────────────────────────────────────────────────
 # Threshold alerts, salvaged from Hermes SysEng. State comes from this app's
 # own health/memory helpers — no external processes. GPU thresholds are
@@ -4344,11 +4382,16 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 
     <!-- ─── RECOMMENDATIONS ─── -->
     <div class="tab" id="tab-recs">
-      <div class="page-hdr">
-        <div class="page-title">Recommendations</div>
-        <div class="page-sub">Spark-specific tuning &amp; model advice, diffed against your vLLM profiles and live memory. Curated in <code>recommendations.json</code>.</div>
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Recommendations</div>
+          <div class="page-sub">Spark-specific tuning &amp; model advice, diffed against your vLLM profiles and live memory. Curated in <code>recommendations.json</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="recs-refresh-btn" onclick="refreshKB()"
+                title="Fetch curated sources and ask the research engine for proposed KB updates (~1-2 min). Proposals are for review only — apply via research_refresh.py.">&#8635; Refresh KB</button>
       </div>
       <div id="recs-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="recs-proposed" style="margin-bottom:18px"></div>
       <div id="recs-root">
         <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
       </div>
@@ -4500,7 +4543,7 @@ function switchTab(name) {
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
-  else if (name === 'recs') { loadRecommendations(); }
+  else if (name === 'recs') { loadRecommendations(); loadProposed(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4674,6 +4717,70 @@ async function loadRecommendations() {
   } catch(e) {
     root.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>' +
       '<div class="empty-text">Could not load recommendations · ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// Proposed KB updates from the research-refresh job. Review-only: applying stays
+// a deliberate CLI step (research_refresh.py --apply, then formalize matches).
+function renderProposed(summary, proposed) {
+  const panel = document.getElementById('recs-proposed');
+  if (!proposed || !proposed.length) { panel.innerHTML = ''; return; }
+  const rows = proposed.map(p => {
+    const isUpd = p.status === 'update';
+    const tag = (txt, bg, fg) => '<span style="display:inline-block;padding:1px 7px;border-radius:6px;' +
+      'font-size:10px;font-weight:700;background:' + bg + ';color:' + fg + '">' + txt + '</span>';
+    const src = (p.sources || []).map(s =>
+      '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+      'style="color:var(--blue);text-decoration:none">' + _escHtml(s.note || s.url) + '</a>').join(' · ');
+    return '<div style="padding:10px 0;border-top:1px solid var(--border)">' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        tag(isUpd ? 'UPDATE' : 'NEW', isUpd ? 'rgba(59,130,246,.15)' : 'rgba(16,185,129,.15)',
+            isUpd ? '#60a5fa' : '#34d399') +
+        tag(_escHtml(p.severity || '?'), 'var(--s2)', 'var(--muted)') +
+        '<span style="font-weight:600;color:var(--text)">' + _escHtml(p.title || p.id) + '</span>' +
+      '</div>' +
+      '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(p.summary || '') + '</div>' +
+      '<div style="margin-top:6px;font-size:12px"><strong style="color:var(--text)">Match intent:</strong> ' +
+        _escHtml(p.suggested_match || '') + '</div>' +
+      (src ? '<div class="model-card-meta" style="margin-top:6px;font-size:11px">Sources: ' + src + '</div>' : '') +
+    '</div>';
+  }).join('');
+  panel.innerHTML = '<div class="model-card" style="display:block;cursor:default;' +
+    'border-color:var(--blue);background:rgba(59,130,246,.04)">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+      '<span class="model-card-name">🧪 Proposed KB updates · ' + proposed.length + '</span>' +
+      '<span class="model-card-meta" style="font-size:12px">review-only</span>' +
+    '</div>' +
+    (summary ? '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(summary) + '</div>' : '') +
+    rows +
+    '<div class="model-card-meta" style="margin-top:12px;font-size:12px">Apply deliberately: ' +
+      '<code>python3 research_refresh.py --apply</code>, then formalize each <code>match.type=="manual"</code> rule.</div>' +
+  '</div>';
+}
+
+async function loadProposed() {
+  try {
+    const d = await apiFetch('/api/recommendations/proposed');
+    renderProposed(d.summary, d.proposed);
+  } catch(e) { /* non-fatal: panel just stays empty */ }
+}
+
+async function refreshKB() {
+  const btn = document.getElementById('recs-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Researching…';
+  toast('Running research refresh — this takes ~1-2 min', '');
+  try {
+    const d = await apiFetch('/api/recommendations/refresh', 'POST');
+    renderProposed(d.summary, d.proposed);
+    const n = (d.proposed || []).length;
+    toast(n ? '✓ ' + n + ' proposal(s) — review below' : 'No new proposals', n ? 'ok' : '');
+  } catch(e) {
+    toast('Refresh failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
   }
 }
 
