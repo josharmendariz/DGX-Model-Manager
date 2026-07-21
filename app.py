@@ -1251,6 +1251,149 @@ async def get_sites(request: Request):
     return {"sites": resolved}
 
 
+# ── Recommendations ─────────────────────────────────────────────────────────
+# Layer-2 recommender: diffs the curated Spark-specific KB (recommendations.json)
+# against installed vLLM profiles + live memory state. Each KB entry carries a
+# `match` rule; only fired recommendations are returned, ranked by severity.
+
+_RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _load_recommendations() -> dict:
+    try:
+        return json.loads(_RECOMMENDATIONS_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load recommendations.json: %s", e)
+        return {"meta": {}, "recommendations": []}
+
+
+def _profile_script_text(profile: dict) -> str:
+    try:
+        return Path(os.path.expanduser(profile.get("script", ""))).read_text()
+    except Exception:
+        return ""
+
+
+def _eval_profile_match(match: dict, text: str) -> Optional[str]:
+    """Return a per-profile 'why it fired' detail, or None if it doesn't fire."""
+    mt = match.get("type")
+    if mt == "script_contains_any":
+        for p in match.get("patterns", []):
+            if p in text:
+                return f"matches '{p}'"
+        return None
+    if mt == "script_missing_flag":
+        pats = match.get("patterns", [])
+        if pats and not any(p in text for p in pats):
+            return f"no {pats[0]}"
+        return None
+    if mt == "moe_backend_not_marlin":
+        m = _re.search(r"--moe-backend\s+(\S+)", text)
+        if not m:
+            return None  # not a MoE profile / no explicit backend
+        if any(sig in text for sig in match.get("marlin_signals", [])) or m.group(1) == "marlin":
+            return None
+        return f"uses --moe-backend {m.group(1)} (not marlin)"
+    if mt == "script_low_util":
+        m = _re.search(r"--gpu-memory-utilization\s+([0-9.]+)", text)
+        if not m:
+            return None
+        util = float(m.group(1))
+        thr = match.get("threshold", 0.6)
+        return f"gpu-memory-utilization {util:g} < {thr:g}" if util < thr else None
+    if mt == "script_high_num_seqs":
+        m = _re.search(r"--max-num-seqs\s+(\d+)", text)
+        if not m:
+            return None
+        seqs = int(m.group(1))
+        thr = match.get("threshold", 16)
+        return f"max-num-seqs {seqs} > {thr}" if seqs > thr else None
+    if mt == "image_tag_suspect":
+        for p in match.get("patterns", []):
+            if p in text:
+                return f"image references '{p}'"
+        return None
+    return None
+
+
+@app.get("/api/recommendations")
+async def get_recommendations():
+    kb = _load_recommendations()
+    profiles = _scan_profiles("vllm")
+    scripts = {p["id"]: _profile_script_text(p) for p in profiles}
+    haystack = " ".join(
+        [t.lower() for t in scripts.values()]
+        + [f"{p.get('id','')} {p.get('name','')}".lower() for p in profiles])
+
+    fired = []
+    for rec in kb.get("recommendations", []):
+        match = rec.get("match", {})
+        base = {k: rec[k] for k in
+                ("id", "kind", "severity", "title", "summary", "action",
+                 "sources", "confidence") if k in rec}
+        if match.get("type") == "model_absent":
+            signals = match.get("signals", [])
+            if not any(s.lower() in haystack for s in signals):
+                fired.append({**base, "scope": "global",
+                              "fired_for": [],
+                              "detail": f"no profile serves {' / '.join(signals)}"})
+            continue
+        hits = [{"profile": pid, "detail": detail}
+                for pid, text in scripts.items()
+                if (detail := _eval_profile_match(match, text))]
+        if hits:
+            fired.append({**base, "scope": "profile", "fired_for": hits})
+
+    fired.sort(key=lambda r: _REC_SEVERITY_ORDER.get(r.get("severity"), 9))
+    mem = _meminfo_snapshot()
+    return {
+        "meta": kb.get("meta", {}),
+        "state": {"available_gb": mem.get("available_gb"),
+                  "total_gb": mem.get("total_gb")},
+        "profiles_checked": len(profiles),
+        "recommendations": fired,
+    }
+
+
+# Research-refresh (KB layer 3). The job fetches curated sources, runs a
+# synthesis engine (Codex, ~1-2 min), and writes PROPOSED updates for review.
+# It never touches the live KB — approval stays a deliberate CLI step
+# (research_refresh.py --apply, then formalize each manual match rule). The UI
+# only *runs research* and *shows the proposals*; it intentionally cannot apply.
+_PROPOSED_FILE = _APP_DIR / "recommendations.proposed.json"
+_refresh_lock = asyncio.Lock()
+
+
+@app.get("/api/recommendations/proposed")
+async def get_proposed_recommendations():
+    """Return the last proposals (recommendations.proposed.json), if any."""
+    try:
+        data = json.loads(_PROPOSED_FILE.read_text())
+    except Exception:
+        return {"proposed": [], "summary": "", "exists": False}
+    return {**data, "exists": True}
+
+
+@app.post("/api/recommendations/refresh", dependencies=[Depends(verify_auth)])
+async def refresh_recommendations():
+    """Run the research-refresh job and return the proposed updates for review."""
+    if _refresh_lock.locked():
+        raise HTTPException(409, "A refresh is already running")
+    async with _refresh_lock:
+        import research_refresh
+        _logger.info("Research-refresh requested (engine=%s)", research_refresh.ENGINE)
+        try:
+            result = await asyncio.to_thread(research_refresh.research)
+        except Exception as e:
+            _logger.error("Research-refresh failed: %s", e)
+            raise HTTPException(500, f"Refresh failed: {e}")
+        props = result.get("proposed", [])
+        _logger.info("Research-refresh produced %d proposal(s)", len(props))
+        return {"ok": True, "engine": research_refresh.ENGINE,
+                "summary": result.get("summary", ""), "proposed": props}
+
+
 # ── Alerting ──────────────────────────────────────────────────────────────────
 # Threshold alerts, salvaged from Hermes SysEng. State comes from this app's
 # own health/memory helpers — no external processes. GPU thresholds are
@@ -1784,6 +1927,48 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
 # Safety margin (GB) reserved for the OS and other services on the unified pool.
 _VRAM_SAFETY_MARGIN_GB = 8
 
+# Minimum projected headroom (GB, on top of the safety margin) required to admit a
+# profile whose VRAM need is unknown (no `# VRAM:` header). We cannot math an
+# unmetered launch, so instead of skipping the check we refuse to launch onto a
+# nearly-full pool — the case that actually hangs the box.
+_VRAM_UNKNOWN_MIN_HEADROOM_GB = 24
+
+
+async def _other_running_engines(exclude_key: str) -> list[str]:
+    """Names of OTHER engines currently holding the unified pool.
+
+    Their footprint is already reflected in MemAvailable (so the admission math
+    stays correct without crediting them), but naming them tells the user which
+    engine to stop — the admission failure often means a *different* engine is
+    occupying memory, not that this engine's model is too big. Checked only on
+    the rejection path; probes run concurrently.
+    """
+    async def _running(key: str) -> Optional[str]:
+        eng = _ENGINES.get(key, {})
+        try:
+            status = await _engine_status(
+                _engine_bases[key], eng.get("docker_filter", key),
+                eng.get("health_path", "/health"), eng.get("models_path"))
+        except Exception:
+            return None
+        return eng.get("name", key) if status.get("running") else None
+
+    others = [k for k in _ENGINES if k != exclude_key]
+    names = await asyncio.gather(*(_running(k) for k in others))
+    return [n for n in names if n]
+
+
+async def _other_engines_note(engine_key: str) -> str:
+    """A trailing sentence naming other running engines, or '' if none."""
+    try:
+        running = await _other_running_engines(engine_key)
+    except Exception:
+        return ""
+    if not running:
+        return ""
+    return (f" Note: {', '.join(running)} {'is' if len(running) == 1 else 'are'} "
+            f"also running and holding the shared pool — stopping it frees memory.")
+
 
 async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                                 scan_fn=None) -> None:
@@ -1801,15 +1986,32 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                         profile.get("id"))
         return
     vram = profile.get("vram_gb")
-    if vram is None:
-        _logger.info("Profile '%s' has no VRAM metadata — skipping admission check",
-                     profile.get("id"))
-        return
     profiles = scan_fn() if scan_fn else _scan_profiles(engine_key)
     available = _get_available_memory_gb()
     credit, credit_id = await _running_profile_vram_credit(engine_key, profiles)
     projected = available + credit
     margin = _VRAM_SAFETY_MARGIN_GB
+    if vram is None:
+        # Unknown need: can't math it, but still refuse to launch onto a
+        # nearly-full pool. Require a healthy headroom floor above the margin.
+        headroom = projected - margin
+        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GB:
+            credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+                           if credit else "no reclaimable running profile identified")
+            raise HTTPException(
+                409,
+                f"Refusing to start '{profile.get('id')}': it declares no VRAM "
+                f"footprint (add a '# VRAM: NN' header to its start script), and only "
+                f"{headroom:.0f} GB of unified memory headroom is projected available "
+                f"({available:.0f} GB free + {credit_note}, minus a {margin} GB "
+                f"safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GB} GB floor "
+                f"required for an unmetered launch."
+                f"{await _other_engines_note(engine_key)} Pass force=true to override.")
+        _logger.warning(
+            "Profile '%s' has no VRAM metadata — admitted on %.0f GB headroom floor; "
+            "add a '# VRAM: NN' header for a precise check",
+            profile.get("id"), headroom)
+        return
     if vram > projected - margin:
         credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
                        if credit else
@@ -1820,7 +2022,8 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
             f"Insufficient unified memory to start '{profile.get('id')}': needs "
             f"{vram} GB but only {projected:.0f} GB is projected available "
             f"({available:.0f} GB free + {credit_note}), and {margin} GB is held "
-            f"back as an OS/services safety margin. Pass force=true to override.")
+            f"back as an OS/services safety margin."
+            f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
@@ -3650,6 +3853,11 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-item" id="nav-hf" onclick="switchTab('hf')">
       <span class="nav-icon">🤗</span>HF Download
     </div>
+    <div class="nav-section-label">Advisor</div>
+    <div class="nav-item" id="nav-recs" onclick="switchTab('recs')">
+      <span class="nav-icon">💡</span>Recommendations
+      <span class="nav-badge" id="badge-recs">—</span>
+    </div>
     <div class="nav-section-label">Routing</div>
     <div class="nav-item" id="nav-litellm" onclick="switchTab('litellm')">
       <span class="nav-icon">⚡</span>LiteLLM
@@ -4172,6 +4380,23 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <!-- ─── RECOMMENDATIONS ─── -->
+    <div class="tab" id="tab-recs">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Recommendations</div>
+          <div class="page-sub">Spark-specific tuning &amp; model advice, diffed against your vLLM profiles and live memory. Curated in <code>recommendations.json</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="recs-refresh-btn" onclick="refreshKB()"
+                title="Fetch curated sources and ask the research engine for proposed KB updates (~1-2 min). Proposals are for review only — apply via research_refresh.py.">&#8635; Refresh KB</button>
+      </div>
+      <div id="recs-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="recs-proposed" style="margin-bottom:18px"></div>
+      <div id="recs-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -4318,6 +4543,7 @@ function switchTab(name) {
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
+  else if (name === 'recs') { loadRecommendations(); loadProposed(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4427,6 +4653,134 @@ async function loadSites() {
   } catch(e) {
     root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
       '<div class="empty-text">Could not load dashboards · ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recommendations
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _SEV = {
+  high:   { label: 'HIGH',   bg: 'rgba(239,68,68,.15)',  fg: '#f87171' },
+  medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
+  low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
+};
+
+async function loadRecommendations() {
+  const root = document.getElementById('recs-root');
+  const meta = document.getElementById('recs-meta');
+  try {
+    const d = await apiFetch('/api/recommendations');
+    const recs = d.recommendations || [];
+    document.getElementById('badge-recs').textContent = recs.length;
+    const st = d.state || {};
+    meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
+      (st.total_gb ? ' · ' + Math.round(st.available_gb) + ' / ' + Math.round(st.total_gb) +
+        ' GB free · ' + d.profiles_checked + ' profiles checked' : '') +
+      (d.meta && d.meta.last_updated ? ' · KB ' + _escHtml(d.meta.last_updated) : '');
+
+    if (!recs.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">✅</div>' +
+        '<div class="empty-text">No recommendations — your profiles match current Spark best practice.</div></div>';
+      return;
+    }
+    root.innerHTML = recs.map(r => {
+      const sev = _SEV[r.severity] || _SEV.low;
+      const chip = (txt, extra) => '<span style="display:inline-block;padding:2px 8px;border-radius:6px;' +
+        'font-size:11px;font-weight:600;' + (extra || '') + '">' + txt + '</span>';
+      const fired = r.scope === 'global'
+        ? '<div class="model-card-meta" style="margin-top:8px">' + _escHtml(r.detail) + '</div>'
+        : '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">' +
+            r.fired_for.map(h => chip(_escHtml(h.profile.replace(/^start_/, '')) +
+              ' · ' + _escHtml(h.detail),
+              'background:var(--s2);color:var(--muted);font-weight:500')).join('') +
+          '</div>';
+      const src = (r.sources || []).map(s =>
+        '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+        'style="color:var(--blue);text-decoration:none">' +
+        _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
+      ).join(' · ');
+      return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+          chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
+          '<span class="model-card-name">' + _escHtml(r.title) + '</span>' +
+          chip(_escHtml(r.kind) + ' · ' + _escHtml(r.confidence || '') + ' conf',
+               'background:var(--s2);color:var(--muted);font-weight:500') +
+        '</div>' +
+        '<div class="model-card-meta" style="margin-top:8px;line-height:1.5">' + _escHtml(r.summary) + '</div>' +
+        '<div style="margin-top:8px;font-size:13px"><strong style="color:var(--text)">Do:</strong> ' +
+          _escHtml(r.action) + '</div>' +
+        fired +
+        (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>' +
+      '<div class="empty-text">Could not load recommendations · ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// Proposed KB updates from the research-refresh job. Review-only: applying stays
+// a deliberate CLI step (research_refresh.py --apply, then formalize matches).
+function renderProposed(summary, proposed) {
+  const panel = document.getElementById('recs-proposed');
+  if (!proposed || !proposed.length) { panel.innerHTML = ''; return; }
+  const rows = proposed.map(p => {
+    const isUpd = p.status === 'update';
+    const tag = (txt, bg, fg) => '<span style="display:inline-block;padding:1px 7px;border-radius:6px;' +
+      'font-size:10px;font-weight:700;background:' + bg + ';color:' + fg + '">' + txt + '</span>';
+    const src = (p.sources || []).map(s =>
+      '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+      'style="color:var(--blue);text-decoration:none">' + _escHtml(s.note || s.url) + '</a>').join(' · ');
+    return '<div style="padding:10px 0;border-top:1px solid var(--border)">' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        tag(isUpd ? 'UPDATE' : 'NEW', isUpd ? 'rgba(59,130,246,.15)' : 'rgba(16,185,129,.15)',
+            isUpd ? '#60a5fa' : '#34d399') +
+        tag(_escHtml(p.severity || '?'), 'var(--s2)', 'var(--muted)') +
+        '<span style="font-weight:600;color:var(--text)">' + _escHtml(p.title || p.id) + '</span>' +
+      '</div>' +
+      '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(p.summary || '') + '</div>' +
+      '<div style="margin-top:6px;font-size:12px"><strong style="color:var(--text)">Match intent:</strong> ' +
+        _escHtml(p.suggested_match || '') + '</div>' +
+      (src ? '<div class="model-card-meta" style="margin-top:6px;font-size:11px">Sources: ' + src + '</div>' : '') +
+    '</div>';
+  }).join('');
+  panel.innerHTML = '<div class="model-card" style="display:block;cursor:default;' +
+    'border-color:var(--blue);background:rgba(59,130,246,.04)">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+      '<span class="model-card-name">🧪 Proposed KB updates · ' + proposed.length + '</span>' +
+      '<span class="model-card-meta" style="font-size:12px">review-only</span>' +
+    '</div>' +
+    (summary ? '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(summary) + '</div>' : '') +
+    rows +
+    '<div class="model-card-meta" style="margin-top:12px;font-size:12px">Apply deliberately: ' +
+      '<code>python3 research_refresh.py --apply</code>, then formalize each <code>match.type=="manual"</code> rule.</div>' +
+  '</div>';
+}
+
+async function loadProposed() {
+  try {
+    const d = await apiFetch('/api/recommendations/proposed');
+    renderProposed(d.summary, d.proposed);
+  } catch(e) { /* non-fatal: panel just stays empty */ }
+}
+
+async function refreshKB() {
+  const btn = document.getElementById('recs-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Researching…';
+  toast('Running research refresh — this takes ~1-2 min', '');
+  try {
+    const d = await apiFetch('/api/recommendations/refresh', 'POST');
+    renderProposed(d.summary, d.proposed);
+    const n = (d.proposed || []).length;
+    toast(n ? '✓ ' + n + ' proposal(s) — review below' : 'No new proposals', n ? 'ok' : '');
+  } catch(e) {
+    toast('Refresh failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
   }
 }
 
@@ -4749,7 +5103,7 @@ async function warmStartSelected() {
     toast('vLLM profile starting', 'ok');
     setTimeout(loadWarmModels, 2500);
   } catch(e) {
-    if (String(e.message || '').includes('Insufficient unified memory') &&
+    if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
       try {
         await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile, force: true});
@@ -4909,11 +5263,9 @@ async function startEngine(eng) {
   prog.classList.add('show');
   log.textContent = 'Sending start command\u2026';
 
-  try {
-    const d = await apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile});
+  const beginPoll = (d) => {
     toast('\u2713 ' + eng.name + ' starting', 'ok');
     log.textContent = d.message + '\n\nPolling status every 20 seconds\u2026';
-
     let pollCount = 0;
     const poll = setInterval(async () => {
       pollCount++;
@@ -4934,9 +5286,26 @@ async function startEngine(eng) {
         toast(eng.name + ' did not start within 10 minutes', 'err');
       }
     }, 20000);
+  };
+
+  const startWith = (force) =>
+    apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
+
+  try {
+    beginPoll(await startWith(false));
   } catch(e) {
-    toast('Start failed: ' + e.message, 'err');
-    prog.classList.remove('show');
+    if (String(e.message || '').includes('unified memory') &&
+        confirm(e.message + '\n\nForce start anyway?')) {
+      try {
+        beginPoll(await startWith(true));
+      } catch(forceErr) {
+        toast('Force start failed: ' + forceErr.message, 'err');
+        prog.classList.remove('show');
+      }
+    } else {
+      toast('Start failed: ' + e.message, 'err');
+      prog.classList.remove('show');
+    }
   } finally {
     btn.disabled = false;
     btn.innerHTML = '\u25b6 Start Selected';

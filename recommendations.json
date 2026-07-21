@@ -1,0 +1,311 @@
+{
+  "meta": {
+    "schema_version": 1,
+    "hardware": "NVIDIA DGX Spark (GB10 Grace Blackwell, 128GB unified LPDDR5X ~273 GB/s, SM121)",
+    "last_updated": "2026-07-21",
+    "notes": "Curated, Spark-specific tuning + model recommendations. The recommender diffs these against installed vLLM profiles and live state. Refresh via the research job (proposes updates for approval)."
+  },
+  "recommendations": [
+    {
+      "id": "nvfp4-vs-fp8-benchmark",
+      "kind": "config",
+      "severity": "high",
+      "title": "Benchmark NVFP4 against FP8 \u2014 NVFP4 can be slower on GB10",
+      "summary": "On GB10 (SM121) a missing hardware instruction can make NVFP4 ~32% SLOWER than FP8 for the same model, despite fewer bits. Don't assume FP4 wins.",
+      "action": "For any profile you keep at NVFP4, stand up its FP8 twin and compare tok/s on your real dispatch pattern before committing.",
+      "match": {
+        "type": "script_contains_any",
+        "patterns": [
+          "nvfp4",
+          "NVFP4",
+          "fp4"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "vLLM DGX Spark config + FP4/FP8 kernel notes",
+          "date": "2026-06-01"
+        },
+        {
+          "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked",
+          "note": "NVFP4 32% slower than FP8 investigation",
+          "date": "2026-04"
+        }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "marlin-moe-backend",
+      "kind": "config",
+      "severity": "high",
+      "title": "Use the Marlin MoE backend \u2014 non-Marlin backends fail on GB10",
+      "summary": "Marlin is the only currently functional NVFP4/FP8-MoE backend on GB10; FlashInfer CUTLASS / TRTLLM get rejected at expert-count x intermediate-dim shape validation. Fires when a profile sets --moe-backend to something other than marlin (and doesn't force Marlin via env).",
+      "action": "Change --moe-backend to marlin (or set VLLM_TEST_FORCE_FP8_MARLIN=1 / VLLM_NVFP4_GEMM_BACKEND=marlin) in the flagged profile.",
+      "match": {
+        "type": "moe_backend_not_marlin",
+        "marlin_signals": [
+          "--moe-backend marlin",
+          "FP8_MARLIN=1",
+          "VLLM_NVFP4_GEMM_BACKEND=marlin"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "Marlin mandatory for NVFP4 MoE on GB10",
+          "date": "2026-06-01"
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "cuda-graphs",
+      "kind": "config",
+      "severity": "medium",
+      "title": "Keep CUDA graphs enabled; current vLLM builds use them by default",
+      "summary": "The recommendation remains valid, but explicit enablement is generally unnecessary on current vLLM builds. The actionable check is to avoid eager mode or other graph-disabling settings unless required for compatibility.",
+      "action": "Remove --enforce-eager from normal Spark profiles and rely on the current vLLM default. Retain an eager-mode compatibility profile only for models or releases with demonstrated graph failures.",
+      "match": {
+        "type": "script_contains_any",
+        "patterns": [
+          "--enforce-eager",
+          "enforce_eager"
+        ],
+        "suggested": "DGX Spark vLLM profiles using --enforce-eager, disabling CUDA graphs, or carrying legacy flags intended to enable behavior that current builds already select by default."
+      },
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "The official Spark article states that current vLLM builds should use CUDA graphs by default unless a deployment has a specific reason to disable them.",
+          "date": "2026-06-01"
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "prefix-caching",
+      "kind": "tuning",
+      "severity": "medium",
+      "title": "Enable prefix caching \u2014 free throughput",
+      "summary": "--enable-prefix-caching is free throughput for any workload with repeated system prompts (agents, routers, RAG).",
+      "action": "Add --enable-prefix-caching to profiles serving repeated system prompts.",
+      "match": {
+        "type": "script_missing_flag",
+        "patterns": [
+          "enable-prefix-caching",
+          "enable_prefix_caching"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "prefix caching free throughput",
+          "date": "2026-06-01"
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "raise-gpu-util",
+      "kind": "tuning",
+      "severity": "high",
+      "title": "Tune gpu-memory-utilization conservatively on unified memory",
+      "summary": "Raising utilization can expand KV-cache capacity, but Spark's 128 GB is shared by the OS, container runtime, CPU, weights, and KV cache. Replace blanket advice to maximize the setting with workload testing that preserves system headroom; one community Qwen3-Next stack already consumes 115\u2013120 GB.",
+      "action": "Expose --gpu-memory-utilization as a profile-specific setting. Increase it incrementally while monitoring total unified-memory pressure and KV-cache usage; avoid presets that leave virtually no OS/container headroom, especially when embeddings or rerankers are colocated.",
+      "match": {
+        "type": "script_low_util",
+        "threshold": 0.6,
+        "suggested": "Profiles on DGX Spark that set unusually high gpu-memory-utilization, load a near-capacity model, or colocate the generation server with embedding, reranking, RAG, or other GPU services."
+      },
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "Official vLLM guidance says Spark's unified pool is shared by the OS, runtime, weights, and KV cache, and gpu-memory-utilization must leave headroom.",
+          "date": "2026-06-01"
+        },
+        {
+          "url": "https://forums.developer.nvidia.com/t/building-local-hybrid-llms-on-dgx-spark-that-outperform-top-cloud-models/359569",
+          "note": "A Qwen3-Next-80B-A3B plus embedding/reranker deployment reports 115\u2013120 GB total memory use, illustrating the narrow margin near capacity.",
+          "date": "2026-02-03"
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "model-gemma4-26b-a4b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Consider Gemma 4 26B-A4B \u2014 the pragmatic Spark default",
+      "summary": "16.5GB MoE footprint, multimodal (text/image/video), ~52 tok/s and 108+ tok/s with MTP speculative decoding, 82GB free for KV. Note: one head-to-head put Qwen 3.6 35B-A3B well ahead on quality (75% vs 46%), so pick per use-case.",
+      "action": "Add a Gemma 4 26B-A4B profile (NVFP4/FP8) for a fast multimodal default; benchmark quality vs your Qwen 3.6 A3B.",
+      "match": {
+        "type": "model_absent",
+        "signals": [
+          "gemma-4",
+          "gemma4",
+          "26b-a4b"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked",
+          "note": "Gemma 4 26B-A4B throughput + MTP",
+          "date": "2026-04"
+        }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "model-gpt-oss-120b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Consider gpt-oss-120B (MXFP4) \u2014 largest-capable, MoE-light",
+      "summary": "120B total but 128 experts / 4 active = ~5B active params/token, so it fits and runs ~65+ tok/s single-seq on GB10. Unlike the dense Super-120B you retired for overcommit, MoE active-param count keeps it tractable.",
+      "action": "Evaluate gpt-oss-120B MXFP4 for a high-capability profile; verify VRAM footprint fits your admission floor before enabling.",
+      "match": {
+        "type": "model_absent",
+        "signals": [
+          "gpt-oss-120",
+          "gpt_oss_120"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://forums.developer.nvidia.com/t/building-local-hybrid-llms-on-dgx-spark-that-outperform-top-cloud-models/359569",
+          "note": "gpt-oss-120B 65+ tok/s reports",
+          "date": "2026"
+        }
+      ],
+      "confidence": "medium"
+    },
+    {
+      "id": "arm64-image",
+      "kind": "config",
+      "severity": "low",
+      "title": "Verify ARM64/CUDA vLLM image on suspect tags (GB10 is aarch64)",
+      "summary": "Default Docker Hub :latest is amd64; on GB10 that is an exec-format error at runtime. Only fires on suspect image tags (:latest or an explicit amd64 tag) \u2014 a running container already proves aarch64, so working profiles stay quiet. Community image nologik/vllm-dgx-spark targets TORCH_CUDA_ARCH_LIST=12.1f / CUDA 13.",
+      "action": "Pin the start script to an aarch64/sm_121 image (an ARM vllm-openai build or nologik/vllm-dgx-spark).",
+      "match": {
+        "type": "image_tag_suspect",
+        "patterns": [
+          ":latest",
+          "amd64",
+          "x86_64"
+        ]
+      },
+      "sources": [
+        {
+          "url": "https://medium.com/@michael.hannecke/four-inference-engines-one-box-when-to-use-which-on-the-dgx-spark-6b32a53db768",
+          "note": "engine/image selection on Spark",
+          "date": "2026"
+        }
+      ],
+      "confidence": "high"
+    },
+    {
+      "id": "spark-small-batch-default",
+      "kind": "tuning",
+      "severity": "medium",
+      "title": "Default Spark profiles to modest max-num-seqs",
+      "summary": "Official guidance positions one Spark as a single-user or small-batch target and recommends keeping --max-num-seqs low. Very high concurrency can improve aggregate throughput, but it is workload-specific and can collapse after KV-cache saturation: Nemotron Super 49B peaked at 695.11 aggregate tok/s at 256 streams, then fell to 514.69 at 320.",
+      "action": "Use a modest --max-num-seqs in general interactive profiles. Offer a separate throughput preset whose concurrency is benchmarked against the actual prompt length, output length, model, and KV-cache budget; do not assume that increasing it is monotonic.",
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "Official vLLM guidance recommends low max-num-seqs and characterizes Spark as best suited to local single-user or small-batch inference.",
+          "date": "2026-06-01"
+        },
+        {
+          "url": "https://dendro-logic.com/engineering/nvidia-dgx-spark-concurrency-benchmark/",
+          "note": "Measured Nemotron Super 49B throughput rises through 256 streams but regresses at 320 when KV-cache saturation causes scheduler thrashing.",
+          "date": "2026-04-22"
+        }
+      ],
+      "confidence": "high",
+      "match": {
+        "type": "script_high_num_seqs",
+        "threshold": 16,
+        "suggested": "Single-Spark profiles with a large max-num-seqs value, or profiles labeled interactive/single-user that are configured for high-concurrency serving."
+      }
+    },
+    {
+      "id": "model-nemotron-3-nano-30b-a3b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Offer Nemotron-3-Nano-30B-A3B-NVFP4 as the safest Spark starter model",
+      "summary": "This 30B-total, roughly 3.5B-active NVFP4 MoE is NVIDIA's reference model for DGX Spark. It has documented vLLM and SGLang support, up to 1M context, and only small reported benchmark losses versus BF16, making it a strong compatibility-first choice.",
+      "action": "Add an NVIDIA-reference preset for Nemotron-3-Nano-30B-A3B-NVFP4 using the validated SM121 image and normal CUDA-graph behavior. Cap max-model-len below the advertised 1M by default and let users expand it according to their KV-cache budget.",
+      "sources": [
+        {
+          "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked",
+          "note": "Identifies Nano as the official Spark reference model, describes its NVFP4 MoE architecture and 1M context, and reports vLLM/SGLang support plus BF16-versus-NVFP4 quality results.",
+          "date": "2026-04"
+        }
+      ],
+      "confidence": "medium",
+      "match": {
+        "type": "model_absent",
+        "signals": [
+          "nemotron-3-nano-30b-a3b",
+          "nano-30b-a3b",
+          "nemotron-3-nano"
+        ],
+        "suggested": "Users requesting a first model, a low-risk NVIDIA-supported Spark setup, long-context experimentation, or a fast small-active-parameter MoE with vLLM/SGLang compatibility."
+      }
+    },
+    {
+      "id": "model-nemotron-3-super-120b-a12b",
+      "kind": "model",
+      "severity": "low",
+      "title": "Offer Nemotron-3-Super-120B-A12B-NVFP4 for agentic and MTP workloads",
+      "summary": "This is a 120B-total, 12B-active LatentMoE trained with NVFP4 and built-in Multi-Token Prediction, distinct from dense or older similarly named Super models. It fits one 128 GB Spark and is aligned with the roughly 10\u201315B-active NVFP4 MoE range recommended by vLLM for GB10.",
+      "action": "Add a dedicated preset for the exact Nemotron-3-Super-120B-A12B-NVFP4 model ID. Enable its release-supported MTP speculative-decoding path, but keep a non-MTP fallback because the official vLLM guidance says kernel and MTP tuning is release-specific.",
+      "sources": [
+        {
+          "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html",
+          "note": "Official guidance calls 10\u201315B-active NVFP4 MoEs a strong Spark fit and notes that MTP can improve tuned deployments but is release-specific.",
+          "date": "2026-06-01"
+        },
+        {
+          "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked",
+          "note": "Describes the 120B/A12B LatentMoE, native NVFP4 training, built-in MTP, single-Spark fit, and close NVFP4/BF16 evaluation results.",
+          "date": "2026-04"
+        }
+      ],
+      "confidence": "medium",
+      "match": {
+        "type": "model_absent",
+        "signals": [
+          "super-120b-a12b",
+          "nemotron-3-super-120b",
+          "nemotron-3-super"
+        ],
+        "suggested": "Agentic, reasoning, or batch profiles wanting a high-quality large MoE on one Spark, particularly when the runtime version explicitly supports this model's MTP path; exclude older dense or 49B Super variants."
+      }
+    },
+    {
+      "id": "model-qwen36-35b-a3b-dflash",
+      "kind": "model",
+      "severity": "low",
+      "title": "Consider Qwen3.6-35B-A3B NVFP4 with DFlash for fast interactive serving",
+      "summary": "A GB10-specific Qwen3.6-35B-A3B community package reports 83.9 tok/s median single-stream at 200 output tokens and 115\u2013118 tok/s at longer DFlash steady state, with 62\u201378% draft-token acceptance. It also reports 313.6 aggregate tok/s at 128 requests without errors across more than 1,200 requests.",
+      "action": "Add an opt-in community preset pairing the exact NVFP4 target with its matching DFlash drafter. Use the published SM121-patched container/Compose configuration as a version-locked recipe, and retain a target-only fallback if the drafter or patched runtime is unavailable.",
+      "sources": [
+        {
+          "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked",
+          "note": "Reports the target/drafter pairing, acceptance rates, single-stream and 128-request throughput, zero-error run, and published SM121 patches and Docker Compose assets.",
+          "date": "2026-04"
+        }
+      ],
+      "confidence": "medium",
+      "match": {
+        "type": "model_absent",
+        "signals": [
+          "dflash"
+        ],
+        "suggested": "Users prioritizing interactive speed on one Spark who permit community models and images, especially Qwen3.6 profiles without speculative decoding or profiles explicitly requesting DFlash; do not apply the drafter to unrelated Qwen checkpoints."
+      }
+    }
+  ]
+}
