@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "note": "Curated inputs for the KB research-refresh job. URLs are fetched and fed to the synthesis engine; topics guide what to look for. Add Spark/GB10-specific, high-signal sources.",
+    "max_chars_per_source": 6000
+  },
+  "sources": [
+    { "url": "https://vllm-project.github.io/2026/06/01/vllm-dgx-spark.html", "note": "vLLM DGX Spark architecture + config" },
+    { "url": "https://devsnack.hashnode.dev/optimized-models-nvidia-dgx-spark-gb10-ranked", "note": "Ranked optimized GB10 models" },
+    { "url": "https://dendro-logic.com/engineering/nvidia-dgx-spark-concurrency-benchmark/", "note": "Concurrency/batched throughput benchmark" },
+    { "url": "https://explainx.ai/blog/nvidia-dgx-spark-local-llm-best-setup-2026", "note": "Best local LLM setup 2026" },
+    { "url": "https://forums.developer.nvidia.com/t/building-local-hybrid-llms-on-dgx-spark-that-outperform-top-cloud-models/359569", "note": "NVIDIA DGX Spark developer forum thread" }
+  ],
+  "topics": [
+    "vLLM/SGLang configs that work on GB10 (sm_121): MoE backend, quantization (NVFP4/FP8/MXFP4), CUDA graphs, speculative decoding (MTP), gpu-memory-utilization",
+    "New Spark-optimized models and their measured tok/s (single-stream and batched)",
+    "Known GB10 pitfalls: kernel/backend rejections, arm64 image requirements, NVFP4-vs-FP8 regressions",
+    "Emerging community Docker images and recommended flags"
+  ]
+}

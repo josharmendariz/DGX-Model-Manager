@@ -6,6 +6,12 @@ custom_dirs.json
 hf_meta_cache.json
 alert_state.json
 
+# Research-refresh working + review artifacts (recommendations.json IS tracked)
+recommendations.proposed.json
+.research_prompt.txt
+.research_schema.json
+.research_out.json
+
 # Local working dirs
 backup/
 
