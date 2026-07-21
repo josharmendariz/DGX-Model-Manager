@@ -2180,9 +2180,15 @@ for _ek, _ev in _ENGINES.items():
 # ── HuggingFace Download ───────────────────────────────────────────────────────
 
 _HF_DOWNLOAD_SCRIPT = """
-import sys, json, os, time, fnmatch
+import sys, json, os, time, fnmatch, importlib.util
 sys.stdout.reconfigure(line_buffering=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# Enable the Rust-accelerated parallel downloader when installed — several times
+# faster than the pure-Python path on large shards. Must be set before importing
+# huggingface_hub. Guarded so downloads still work if the package is absent.
+_HF_XFER = importlib.util.find_spec("hf_transfer") is not None
+if _HF_XFER:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 from huggingface_hub import list_repo_tree, hf_hub_download
 from pathlib import Path
 
@@ -2192,6 +2198,8 @@ ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
 allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
 J = lambda **kw: print(json.dumps(kw), flush=True)
 J(status="starting", repo=repo)
+if _HF_XFER:
+    J(status="hf_transfer acceleration enabled")
 
 def _keep(p):
     if allow and not any(fnmatch.fnmatch(p, g) for g in allow):
