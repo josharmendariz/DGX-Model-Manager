@@ -154,7 +154,10 @@
           "date": "2026-04"
         }
       ],
-      "confidence": "medium"
+      "confidence": "medium",
+      "download": {
+        "repo_id": "google/gemma-4-26b-a4b-it"
+      }
     },
     {
       "id": "model-gpt-oss-120b",
@@ -177,7 +180,10 @@
           "date": "2026"
         }
       ],
-      "confidence": "medium"
+      "confidence": "medium",
+      "download": {
+        "repo_id": "openai/gpt-oss-120b"
+      }
     },
     {
       "id": "arm64-image",
