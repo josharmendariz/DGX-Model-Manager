@@ -6,6 +6,7 @@ Run via systemd: model-manager.service
 """
 
 import asyncio
+import difflib
 import hashlib
 import hmac
 import json
@@ -294,6 +295,11 @@ class CreateVLLMProfileRequest(BaseModel):
 class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
+
+class ApplyRecRequest(BaseModel):
+    id: str
+    profile: str
+    confirm: bool = False
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1392,6 +1398,92 @@ async def refresh_recommendations():
         _logger.info("Research-refresh produced %d proposal(s)", len(props))
         return {"ok": True, "engine": research_refresh.ENGINE,
                 "summary": result.get("summary", ""), "proposed": props}
+
+
+def _apply_rec_edit(spec: dict, text: str) -> tuple[str, bool, str]:
+    """Apply a recommendation's `apply` spec to a profile script's text.
+
+    Returns (new_text, changed, note). Edits anchor on the `--model` line
+    (present in every vLLM start script and always continued with a trailing
+    backslash), so inserts stay inside the docker-run argument block.
+    """
+    typ = spec.get("type")
+    trailing_nl = "\n" if text.endswith("\n") else ""
+    if typ == "add_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag:
+            raise HTTPException(400, "apply.add_flag requires 'flag'")
+        token = flag.split("=", 1)[0]
+        if token in text:
+            return text, False, f"{token} already present"
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if _re.match(r"\s*--model\b", ln):
+                indent = ln[:len(ln) - len(ln.lstrip())]
+                lines.insert(i + 1, f"{indent}{flag} \\")
+                return "\n".join(lines) + trailing_nl, True, f"added {flag}"
+        raise HTTPException(422, "No --model line to anchor the flag")
+    if typ == "remove_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag or flag not in text:
+            return text, False, f"{flag or 'flag'} not present"
+        out = []
+        for ln in text.splitlines():
+            if ln.strip() in (flag, flag + " \\"):
+                continue  # flag owned the whole line — drop it
+            if flag in ln:
+                ln = _re.sub(r"\s*" + _re.escape(flag) + r"\b", "", ln)
+            out.append(ln)
+        return "\n".join(out) + trailing_nl, True, f"removed {flag}"
+    if typ == "set_flag":
+        flag = str(spec.get("flag", "")).strip()
+        value = str(spec.get("value", "")).strip()
+        if not flag or not value:
+            raise HTTPException(400, "apply.set_flag requires 'flag' and 'value'")
+        pat = _re.compile(_re.escape(flag) + r"\s+(\S+)")
+        m = pat.search(text)
+        if not m:
+            raise HTTPException(422, f"{flag} not found in profile")
+        if m.group(1) == value:
+            return text, False, f"{flag} already {value}"
+        return pat.sub(f"{flag} {value}", text, count=1), True, f"{flag} -> {value}"
+    raise HTTPException(400, f"Unknown apply.type '{typ}'")
+
+
+@app.post("/api/recommendations/apply", dependencies=[Depends(verify_auth)])
+async def apply_recommendation(req: ApplyRecRequest):
+    """Apply a config/tuning rec's edit to a flagged profile script.
+
+    Two-phase: without `confirm` it returns a unified diff for preview; with
+    `confirm` it writes the script atomically (tmp + os.replace, mode 0755)."""
+    kb = _load_recommendations()
+    rec = next((r for r in kb.get("recommendations", []) if r.get("id") == req.id), None)
+    if not rec:
+        raise HTTPException(404, f"No recommendation '{req.id}'")
+    spec = rec.get("apply")
+    if not spec:
+        raise HTTPException(400, f"Recommendation '{req.id}' has no apply action")
+    prof = next((p for p in _scan_profiles("vllm") if p["id"] == req.profile), None)
+    if not prof:
+        raise HTTPException(404, f"No vLLM profile '{req.profile}'")
+    path = Path(prof["script"])
+    old = path.read_text()
+    new, changed, note = _apply_rec_edit(spec, old)
+    if not changed:
+        return {"changed": False, "note": note, "profile": req.profile}
+    diff = "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path.name, tofile=path.name + " (proposed)"))
+    if not req.confirm:
+        return {"changed": True, "confirm_required": True,
+                "note": note, "diff": diff, "profile": req.profile}
+    tmp = path.with_suffix(path.suffix + ".apply.tmp")
+    tmp.write_text(new)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    _logger.info("Applied rec %s to %s (%s)", req.id, path.name, note)
+    return {"changed": True, "applied": True, "note": note,
+            "diff": diff, "profile": req.profile}
 
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
@@ -4913,6 +5005,65 @@ async function startApproveDownload(id) {
     toast('Download failed: ' + e.message, 'err');
     go.disabled = false;
     go.innerHTML = 'Retry';
+  }
+}
+
+// Apply a config/tuning rec to a flagged profile: fetch a diff preview, then
+// confirm to write the edited start script.
+function _diffHtml(diff) {
+  return (diff || '').split('\n').map(l => {
+    let c = 'var(--muted)';
+    if (l.startsWith('+') && !l.startsWith('+++')) c = '#34d399';
+    else if (l.startsWith('-') && !l.startsWith('---')) c = '#f87171';
+    else if (l.startsWith('@@')) c = 'var(--blue)';
+    return '<span style="color:' + c + '">' + _escHtml(l) + '</span>';
+  }).join('\n');
+}
+
+async function applyRec(id, profile) {
+  toast('Computing diff…', '');
+  let d;
+  try {
+    d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile});
+  } catch(e) { toast('Apply failed: ' + e.message, 'err'); return; }
+  if (!d.changed) { toast('Already applied: ' + (d.note || 'no change'), 'ok'); return; }
+  const short = profile.replace(/^start_/, '').replace(/\.sh$/, '');
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:640px;max-width:94vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Apply to ' + _escHtml(short) + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' + _escHtml(d.note || '') +
+        ' — review the change to the start script, then confirm.</div>' +
+      '<pre style="font-size:11px;line-height:1.45;background:var(--s2);border:1px solid var(--border);' +
+        'border-radius:8px;padding:12px;max-height:340px;overflow:auto;white-space:pre">' + _diffHtml(d.diff) + '</pre>' +
+      '<div id="rec-apply-note" style="font-size:11px;color:var(--muted);margin-top:8px">' +
+        'The profile takes effect the next time you start it.</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+        '<button class="btn btn-sm" id="rec-apply-cancel" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-apply-go" onclick="confirmApplyRec(\'' +
+          id.replace(/'/g, "\\'") + '\',\'' + profile.replace(/'/g, "\\'") + '\')">Apply change</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+}
+
+async function confirmApplyRec(id, profile) {
+  const go = document.getElementById('rec-apply-go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Applying…';
+  try {
+    const d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile, confirm: true});
+    toast('✓ ' + (d.note || 'applied'), 'ok');
+    closeRecModal();
+    loadRecommendations();
+    loadEngineProfiles(engines.vllm);
+  } catch(e) {
+    toast('Apply failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Apply change';
   }
 }
 
