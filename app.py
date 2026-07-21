@@ -1302,6 +1302,13 @@ def _eval_profile_match(match: dict, text: str) -> Optional[str]:
         util = float(m.group(1))
         thr = match.get("threshold", 0.6)
         return f"gpu-memory-utilization {util:g} < {thr:g}" if util < thr else None
+    if mt == "script_high_num_seqs":
+        m = _re.search(r"--max-num-seqs\s+(\d+)", text)
+        if not m:
+            return None
+        seqs = int(m.group(1))
+        thr = match.get("threshold", 16)
+        return f"max-num-seqs {seqs} > {thr}" if seqs > thr else None
     if mt == "image_tag_suspect":
         for p in match.get("patterns", []):
             if p in text:

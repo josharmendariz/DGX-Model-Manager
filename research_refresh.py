@@ -65,11 +65,14 @@ PROPOSAL_SCHEMA = {
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["url", "note"],
+                            # Strict structured-output mode requires every key in
+                            # `properties` to be listed in `required`; `date` is
+                            # optional in practice, so make it nullable instead.
+                            "required": ["url", "note", "date"],
                             "properties": {
                                 "url": {"type": "string"},
                                 "note": {"type": "string"},
-                                "date": {"type": "string"},
+                                "date": {"type": ["string", "null"]},
                             },
                         },
                     },
@@ -137,13 +140,26 @@ def _build_prompt(kb: dict, sources_cfg: dict) -> str:
 
 
 def _synthesize_codex(prompt: str) -> dict:
+    # Pass the prompt as Codex's positional argument (not via a file it must
+    # read): Codex's read-only sandbox re-inits bwrap for every tool call, and
+    # bwrap can't set up loopback in this environment ("RTM_NEWADDR: Operation
+    # not permitted"), so any sandboxed file-read fails. As a positional arg the
+    # prompt lands directly in-context — no tool call. A tiny host-side runner
+    # cat's the prompt file into argv so we avoid quoting 34K chars through the
+    # `script` pty wrapper (needed because Codex requires a controlling TTY).
     PROMPT_FILE.write_text(prompt)
     SCHEMA_FILE.write_text(json.dumps(PROPOSAL_SCHEMA))
     out = APP_DIR / ".research_out.json"
-    inner = (f"codex exec --sandbox read-only --skip-git-repo-check --ephemeral "
-             f"--output-schema {SCHEMA_FILE} -o {out} "
-             f"'Read the file {PROMPT_FILE} in full and produce the JSON it asks for.'")
-    proc = subprocess.run(["script", "-qec", inner, "/dev/null"],
+    if out.exists():
+        out.unlink()
+    runner = APP_DIR / ".research_run.sh"
+    runner.write_text(
+        "#!/bin/bash\n"
+        "codex exec --sandbox read-only --skip-git-repo-check --ephemeral "
+        f"--output-schema {SCHEMA_FILE} -o {out} \"$(cat {PROMPT_FILE})\"\n"
+    )
+    runner.chmod(0o755)
+    proc = subprocess.run(["script", "-qec", f"bash {runner}", "/dev/null"],
                           stdin=subprocess.DEVNULL, capture_output=True,
                           text=True, timeout=300)
     if not out.exists():
@@ -214,9 +230,20 @@ def apply() -> None:
     for p in proposed.get("proposed", []):
         entry = {k: p[k] for k in ("id", "kind", "severity", "title", "summary",
                                    "action", "sources", "confidence") if k in p}
-        # suggested_match -> a placeholder match a human must formalize before it fires.
-        entry["match"] = {"type": "manual", "suggested": p.get("suggested_match", "")}
-        by_id[p["id"]] = {**by_id.get(p["id"], {}), **entry}
+        prior = by_id.get(p["id"], {})
+        prior_match = prior.get("match", {})
+        suggested = p.get("suggested_match", "")
+        if prior_match.get("type") not in (None, "manual"):
+            # An update to an existing rec that already has a real, firing match.
+            # Don't clobber it to an inert placeholder (that would silently
+            # disable a working rule). Keep it firing; record the proposal's new
+            # intent under `suggested` so a human can decide whether to re-tune.
+            entry["match"] = {**prior_match, "suggested": suggested}
+        else:
+            # New item (or one still awaiting first formalization): inert manual
+            # placeholder that never fires until a human writes the real rule.
+            entry["match"] = {"type": "manual", "suggested": suggested}
+        by_id[p["id"]] = {**prior, **entry}
         applied += 1
     kb["recommendations"] = list(by_id.values())
     kb.setdefault("meta", {})["last_updated"] = __import__("datetime").date.today().isoformat()

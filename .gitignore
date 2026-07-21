@@ -11,6 +11,7 @@ recommendations.proposed.json
 .research_prompt.txt
 .research_schema.json
 .research_out.json
+.research_run.sh
 
 # Local working dirs
 backup/
