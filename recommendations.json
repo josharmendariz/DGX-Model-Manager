@@ -195,7 +195,11 @@
       ],
       "confidence": "medium",
       "download": {
-        "repo_id": "openai/gpt-oss-120b"
+        "repo_id": "openai/gpt-oss-120b",
+        "ignore_patterns": [
+          "metal/*",
+          "original/*"
+        ]
       }
     },
     {

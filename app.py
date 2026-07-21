@@ -295,6 +295,8 @@ class CreateVLLMProfileRequest(BaseModel):
 class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
+    ignore_patterns: Optional[list[str]] = None
+    allow_patterns: Optional[list[str]] = None
 
 class ApplyRecRequest(BaseModel):
     id: str
@@ -2178,7 +2180,7 @@ for _ek, _ev in _ENGINES.items():
 # ── HuggingFace Download ───────────────────────────────────────────────────────
 
 _HF_DOWNLOAD_SCRIPT = """
-import sys, json, os, time
+import sys, json, os, time, fnmatch
 sys.stdout.reconfigure(line_buffering=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from huggingface_hub import list_repo_tree, hf_hub_download
@@ -2186,12 +2188,28 @@ from pathlib import Path
 
 repo = os.environ["HF_REPO_ID"]
 local_dir = os.environ.get("HF_LOCAL_DIR") or None
+ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
+allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
 J = lambda **kw: print(json.dumps(kw), flush=True)
 J(status="starting", repo=repo)
+
+def _keep(p):
+    if allow and not any(fnmatch.fnmatch(p, g) for g in allow):
+        return False
+    if ignore and any(fnmatch.fnmatch(p, g) for g in ignore):
+        return False
+    return True
 
 try:
     entries = [e for e in list_repo_tree(repo, recursive=True)
                if hasattr(e, 'size') and not e.path.startswith('.')]
+    if ignore or allow:
+        kept = [e for e in entries if _keep(e.path)]
+        skipped = len(entries) - len(kept)
+        skipped_gb = sum(e.size or 0 for e in entries if not _keep(e.path)) / 1024**3
+        if skipped:
+            J(status=f"Skipping {skipped} file(s) ({skipped_gb:.1f} GB) by pattern")
+        entries = kept
     total_files = len(entries)
     total_bytes = sum(e.size or 0 for e in entries)
     J(status=f"Found {total_files} files ({total_bytes/1024**3:.1f} GB)")
@@ -2464,6 +2482,10 @@ async def hf_download(req: HFDownloadRequest):
     sub_env = {**os.environ, "HF_REPO_ID": repo_id}
     if local_dir:
         sub_env["HF_LOCAL_DIR"] = local_dir
+    if req.ignore_patterns:
+        sub_env["HF_IGNORE_PATTERNS"] = json.dumps(req.ignore_patterns)
+    if req.allow_patterns:
+        sub_env["HF_ALLOW_PATTERNS"] = json.dumps(req.allow_patterns)
 
     async def stream() -> AsyncGenerator[str, None]:
         try:
@@ -4901,6 +4923,7 @@ function closeRecModal() { const m = document.getElementById('rec-modal'); if (m
 function approveModel(id) {
   const r = _lastRecs.find(x => x.id === id);
   if (!r || !r.download) { toast('No download info for this recommendation', 'err'); return; }
+  window._approveRecId = id;
   const repo = r.download.repo_id || '';
   const dir = r.download.local_dir || '';
   closeRecModal();
@@ -4951,9 +4974,12 @@ async function startApproveDownload(id) {
   log.textContent = lines[0];
   let wired = false;
   try {
+    const r = _lastRecs.find(x => x.id === (window._approveRecId || ''));
+    const dl = (r && r.download) || {};
     const resp = await fetch('/api/hf/download', {
       method: 'POST', headers: authHeaders(),
-      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined}),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined,
+        ignore_patterns: dl.ignore_patterns, allow_patterns: dl.allow_patterns}),
     });
     if (!resp.ok) {
       let msg = resp.statusText;
@@ -4968,11 +4994,17 @@ async function startApproveDownload(id) {
       for (const line of dec.decode(value).split('\n')) {
         if (!line.startsWith('data: ')) continue;
         let ev; try { ev = JSON.parse(line.slice(6)); } catch(e) { continue; }
-        if (ev.progress) {
+        if (ev.file_start) {
+          const f = ev.file_start;
+          bar.className = 'prog-bar spin';
+          lines.push('[' + f.idx + '/' + f.total + '] ⤓ ' + f.name + ' (' + f.size_str + ')…');
+        } else if (ev.progress) {
           const p = ev.progress;
           bar.className = 'prog-bar'; bar.style.width = p.pct + '%';
-          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ' + p.pct + '%  ·  ' +
-            p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file + '  ·  ' +
+            p.pct + '%  ·  ' + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+        } else if (ev.status && typeof ev.status === 'string' && ev.status !== 'complete' && ev.status !== 'error') {
+          lines.push(ev.status);  // "Skipping N files…", "Found N files…"
         } else if (ev.status === 'complete') {
           bar.className = 'prog-bar'; bar.style.width = '100%';
           lines.push('✓ Downloaded → ' + ev.path + (ev.errors > 0 ? '  ⚠ ' + ev.errors + ' error(s)' : ''));
