@@ -1331,7 +1331,7 @@ async def get_recommendations():
         match = rec.get("match", {})
         base = {k: rec[k] for k in
                 ("id", "kind", "severity", "title", "summary", "action",
-                 "sources", "confidence") if k in rec}
+                 "sources", "confidence", "download", "apply") if k in rec}
         if match.get("type") == "model_absent":
             signals = match.get("signals", [])
             if not any(s.lower() in haystack for s in signals):
@@ -4665,6 +4665,7 @@ const _SEV = {
   medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
   low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
 };
+let _lastRecs = [];  // last fired recommendations, for approve/apply lookups by id
 
 async function loadRecommendations() {
   const root = document.getElementById('recs-root');
@@ -4672,6 +4673,7 @@ async function loadRecommendations() {
   try {
     const d = await apiFetch('/api/recommendations');
     const recs = d.recommendations || [];
+    _lastRecs = recs;
     document.getElementById('badge-recs').textContent = recs.length;
     const st = d.state || {};
     meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
@@ -4700,6 +4702,21 @@ async function loadRecommendations() {
         'style="color:var(--blue);text-decoration:none">' +
         _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
       ).join(' · ');
+      const rid = (r.id || '').replace(/'/g, "\\'");
+      const actions = [];
+      if (r.kind === 'model' && r.download && r.download.repo_id) {
+        actions.push('<button class="btn btn-sm btn-primary" onclick="approveModel(\'' + rid + '\')">' +
+          '⬇ Approve &amp; download</button>');
+      }
+      if (r.apply && (r.fired_for || []).length) {
+        r.fired_for.forEach(h => {
+          const pid = (h.profile || '').replace(/'/g, "\\'");
+          actions.push('<button class="btn btn-sm" onclick="applyRec(\'' + rid + '\',\'' + pid + '\')">' +
+            '✎ Apply to ' + _escHtml(h.profile.replace(/^start_/, '').replace(/\.sh$/, '')) + '</button>');
+        });
+      }
+      const actionBar = actions.length
+        ? '<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">' + actions.join('') + '</div>' : '';
       return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
           chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
@@ -4712,6 +4729,7 @@ async function loadRecommendations() {
           _escHtml(r.action) + '</div>' +
         fired +
         (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+        actionBar +
       '</div>';
     }).join('');
   } catch(e) {
@@ -4781,6 +4799,120 @@ async function refreshKB() {
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
+  }
+}
+
+// Approve a model recommendation → confirm the HF repo, then run the existing
+// download flow (SSE), which auto-wires a vLLM profile on completion.
+function closeRecModal() { const m = document.getElementById('rec-modal'); if (m) m.remove(); }
+
+function approveModel(id) {
+  const r = _lastRecs.find(x => x.id === id);
+  if (!r || !r.download) { toast('No download info for this recommendation', 'err'); return; }
+  const repo = r.download.repo_id || '';
+  const dir = r.download.local_dir || '';
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:520px;max-width:92vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Approve &amp; download</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">' + _escHtml(r.title) +
+        '. This pulls the model from Hugging Face and auto-creates a vLLM profile when the download finishes.</div>' +
+      '<label style="font-size:11px;color:var(--muted)">HF repo</label>' +
+      '<input class="input" id="rec-dl-repo" value="' + _escHtml(repo).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="owner/model-name" style="width:100%;margin:4px 0 12px">' +
+      '<label style="font-size:11px;color:var(--muted)">Target dir (blank = HF cache)</label>' +
+      '<input class="input" id="rec-dl-dir" value="' + _escHtml(dir).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="~/.cache/huggingface" style="width:100%;margin:4px 0 12px">' +
+      '<div id="rec-dl-progress" style="display:none;margin:8px 0 4px">' +
+        '<div class="prog" style="height:6px;background:var(--s2);border-radius:4px;overflow:hidden">' +
+          '<div id="rec-dl-bar" class="prog-bar" style="height:100%;width:0"></div></div>' +
+        '<pre id="rec-dl-log" style="font-size:11px;color:var(--muted);margin:8px 0 0;white-space:pre-wrap;' +
+          'max-height:160px;overflow:auto"></pre>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
+        '<button class="btn btn-sm" id="rec-dl-close" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-dl-go" onclick="startApproveDownload(\'' +
+          id.replace(/'/g, "\\'") + '\')">Download</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  document.getElementById('rec-dl-repo').focus();
+}
+
+async function startApproveDownload(id) {
+  const repo = document.getElementById('rec-dl-repo').value.trim();
+  const dir = document.getElementById('rec-dl-dir').value.trim();
+  if (!repo) { document.getElementById('rec-dl-repo').focus(); return; }
+  const go = document.getElementById('rec-dl-go');
+  const cancel = document.getElementById('rec-dl-close');
+  const prog = document.getElementById('rec-dl-progress');
+  const bar = document.getElementById('rec-dl-bar');
+  const log = document.getElementById('rec-dl-log');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Downloading…';
+  prog.style.display = 'block';
+  bar.className = 'prog-bar spin';
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
+  let wired = false;
+  try {
+    const resp = await fetch('/api/hf/download', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined}),
+    });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch(e) { continue; }
+        if (ev.progress) {
+          const p = ev.progress;
+          bar.className = 'prog-bar'; bar.style.width = p.pct + '%';
+          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ' + p.pct + '%  ·  ' +
+            p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+        } else if (ev.status === 'complete') {
+          bar.className = 'prog-bar'; bar.style.width = '100%';
+          lines.push('✓ Downloaded → ' + ev.path + (ev.errors > 0 ? '  ⚠ ' + ev.errors + ' error(s)' : ''));
+          toast('✓ Downloaded: ' + repo, 'ok');
+        } else if (ev.auto_profile) {
+          wired = true;
+          const p = ev.auto_profile.profile || {};
+          lines.push('✓ vLLM profile wired: ' + (p.name || p.id || 'profile'));
+          toast('✓ Profile wired — recommendation satisfied', 'ok');
+        } else if (ev.auto_profile_error) {
+          lines.push('⚠ Profile not auto-created: ' + ev.auto_profile_error);
+        } else if (ev.status === 'error') {
+          throw new Error(ev.error || 'download failed');
+        } else if (ev.log) {
+          lines.push(ev.log);
+        }
+        log.textContent = lines.join('\n');
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    go.innerHTML = wired ? '✓ Done' : 'Finished';
+    cancel.textContent = 'Close';
+    loadRecommendations();          // fired model rec should now clear
+    loadEngineProfiles(engines.vllm);
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch(e) {
+    bar.className = 'prog-bar'; bar.style.width = '0';
+    lines.push('✗ ' + e.message);
+    log.textContent = lines.join('\n');
+    toast('Download failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Retry';
   }
 }
 
