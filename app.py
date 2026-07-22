@@ -6,6 +6,7 @@ Run via systemd: model-manager.service
 """
 
 import asyncio
+import difflib
 import hashlib
 import hmac
 import json
@@ -294,6 +295,13 @@ class CreateVLLMProfileRequest(BaseModel):
 class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
+    ignore_patterns: Optional[list[str]] = None
+    allow_patterns: Optional[list[str]] = None
+
+class ApplyRecRequest(BaseModel):
+    id: str
+    profile: str
+    confirm: bool = False
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1331,7 +1339,7 @@ async def get_recommendations():
         match = rec.get("match", {})
         base = {k: rec[k] for k in
                 ("id", "kind", "severity", "title", "summary", "action",
-                 "sources", "confidence") if k in rec}
+                 "sources", "confidence", "download", "apply") if k in rec}
         if match.get("type") == "model_absent":
             signals = match.get("signals", [])
             if not any(s.lower() in haystack for s in signals):
@@ -1392,6 +1400,92 @@ async def refresh_recommendations():
         _logger.info("Research-refresh produced %d proposal(s)", len(props))
         return {"ok": True, "engine": research_refresh.ENGINE,
                 "summary": result.get("summary", ""), "proposed": props}
+
+
+def _apply_rec_edit(spec: dict, text: str) -> tuple[str, bool, str]:
+    """Apply a recommendation's `apply` spec to a profile script's text.
+
+    Returns (new_text, changed, note). Edits anchor on the `--model` line
+    (present in every vLLM start script and always continued with a trailing
+    backslash), so inserts stay inside the docker-run argument block.
+    """
+    typ = spec.get("type")
+    trailing_nl = "\n" if text.endswith("\n") else ""
+    if typ == "add_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag:
+            raise HTTPException(400, "apply.add_flag requires 'flag'")
+        token = flag.split("=", 1)[0]
+        if token in text:
+            return text, False, f"{token} already present"
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if _re.match(r"\s*--model\b", ln):
+                indent = ln[:len(ln) - len(ln.lstrip())]
+                lines.insert(i + 1, f"{indent}{flag} \\")
+                return "\n".join(lines) + trailing_nl, True, f"added {flag}"
+        raise HTTPException(422, "No --model line to anchor the flag")
+    if typ == "remove_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag or flag not in text:
+            return text, False, f"{flag or 'flag'} not present"
+        out = []
+        for ln in text.splitlines():
+            if ln.strip() in (flag, flag + " \\"):
+                continue  # flag owned the whole line — drop it
+            if flag in ln:
+                ln = _re.sub(r"\s*" + _re.escape(flag) + r"\b", "", ln)
+            out.append(ln)
+        return "\n".join(out) + trailing_nl, True, f"removed {flag}"
+    if typ == "set_flag":
+        flag = str(spec.get("flag", "")).strip()
+        value = str(spec.get("value", "")).strip()
+        if not flag or not value:
+            raise HTTPException(400, "apply.set_flag requires 'flag' and 'value'")
+        pat = _re.compile(_re.escape(flag) + r"\s+(\S+)")
+        m = pat.search(text)
+        if not m:
+            raise HTTPException(422, f"{flag} not found in profile")
+        if m.group(1) == value:
+            return text, False, f"{flag} already {value}"
+        return pat.sub(f"{flag} {value}", text, count=1), True, f"{flag} -> {value}"
+    raise HTTPException(400, f"Unknown apply.type '{typ}'")
+
+
+@app.post("/api/recommendations/apply", dependencies=[Depends(verify_auth)])
+async def apply_recommendation(req: ApplyRecRequest):
+    """Apply a config/tuning rec's edit to a flagged profile script.
+
+    Two-phase: without `confirm` it returns a unified diff for preview; with
+    `confirm` it writes the script atomically (tmp + os.replace, mode 0755)."""
+    kb = _load_recommendations()
+    rec = next((r for r in kb.get("recommendations", []) if r.get("id") == req.id), None)
+    if not rec:
+        raise HTTPException(404, f"No recommendation '{req.id}'")
+    spec = rec.get("apply")
+    if not spec:
+        raise HTTPException(400, f"Recommendation '{req.id}' has no apply action")
+    prof = next((p for p in _scan_profiles("vllm") if p["id"] == req.profile), None)
+    if not prof:
+        raise HTTPException(404, f"No vLLM profile '{req.profile}'")
+    path = Path(prof["script"])
+    old = path.read_text()
+    new, changed, note = _apply_rec_edit(spec, old)
+    if not changed:
+        return {"changed": False, "note": note, "profile": req.profile}
+    diff = "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path.name, tofile=path.name + " (proposed)"))
+    if not req.confirm:
+        return {"changed": True, "confirm_required": True,
+                "note": note, "diff": diff, "profile": req.profile}
+    tmp = path.with_suffix(path.suffix + ".apply.tmp")
+    tmp.write_text(new)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    _logger.info("Applied rec %s to %s (%s)", req.id, path.name, note)
+    return {"changed": True, "applied": True, "note": note,
+            "diff": diff, "profile": req.profile}
 
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
@@ -2086,20 +2180,44 @@ for _ek, _ev in _ENGINES.items():
 # ── HuggingFace Download ───────────────────────────────────────────────────────
 
 _HF_DOWNLOAD_SCRIPT = """
-import sys, json, os, time
+import sys, json, os, time, fnmatch, importlib.util
 sys.stdout.reconfigure(line_buffering=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# Enable the Rust-accelerated parallel downloader when installed — several times
+# faster than the pure-Python path on large shards. Must be set before importing
+# huggingface_hub. Guarded so downloads still work if the package is absent.
+_HF_XFER = importlib.util.find_spec("hf_transfer") is not None
+if _HF_XFER:
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 from huggingface_hub import list_repo_tree, hf_hub_download
 from pathlib import Path
 
 repo = os.environ["HF_REPO_ID"]
 local_dir = os.environ.get("HF_LOCAL_DIR") or None
+ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
+allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
 J = lambda **kw: print(json.dumps(kw), flush=True)
 J(status="starting", repo=repo)
+if _HF_XFER:
+    J(status="hf_transfer acceleration enabled")
+
+def _keep(p):
+    if allow and not any(fnmatch.fnmatch(p, g) for g in allow):
+        return False
+    if ignore and any(fnmatch.fnmatch(p, g) for g in ignore):
+        return False
+    return True
 
 try:
     entries = [e for e in list_repo_tree(repo, recursive=True)
                if hasattr(e, 'size') and not e.path.startswith('.')]
+    if ignore or allow:
+        kept = [e for e in entries if _keep(e.path)]
+        skipped = len(entries) - len(kept)
+        skipped_gb = sum(e.size or 0 for e in entries if not _keep(e.path)) / 1024**3
+        if skipped:
+            J(status=f"Skipping {skipped} file(s) ({skipped_gb:.1f} GB) by pattern")
+        entries = kept
     total_files = len(entries)
     total_bytes = sum(e.size or 0 for e in entries)
     J(status=f"Found {total_files} files ({total_bytes/1024**3:.1f} GB)")
@@ -2225,7 +2343,18 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
             size_gb = _dir_size_gb(hf_root)
     else:
         size_gb = _dir_size_gb(launch_dir)
-    vram_gb = int(min(112, max(16, round((size_gb * 1.35) + 12))))
+    # VRAM estimate = weights (≈ on-disk size, scaled by how much the format
+    # expands when loaded) + a fixed overhead for CUDA context, activations and
+    # the fp8 KV cache. Already-quantized weights load ~1:1, so the old flat
+    # 1.35× over-inflated every 4-/8-bit model by ~35% and tripped admission on
+    # a model that actually fits (e.g. gpt-oss-120b FP4: 100→81 GB).
+    _dtype = (inferred.get("dtype") or "").upper()
+    _weight_mult = (
+        1.05 if _dtype in ("FP4", "INT4") else
+        1.15 if _dtype in ("FP8", "INT8") else
+        1.35  # BF16/FP16/Unknown: fp16 weights + workspace headroom
+    )
+    vram_gb = int(min(112, max(16, round((size_gb * _weight_mult) + 12))))
     return {
         "name": model_name,
         "served": model_name.replace("/", "--"),
@@ -2263,12 +2392,28 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
     is_moe = bool(info["is_moe"]) or "moe" in info["name"].lower() or "a3b" in info["name"].lower()
+    # gpt-oss family uses the OpenAI harmony chat format + MXFP4 weights. On GB10
+    # (sm_121) the stock vllm-openai Marlin MXFP4 kernel miscomputes the first decode
+    # token (vLLM #37030) → harmony parser desync → OpenWebUI token-soup. The
+    # SM121-patched eugr/spark-vllm image (vLLM 0.23.1) fixes it. See
+    # profiles/vLLM/start_hf_openai_gpt-oss-120b.sh for the full root-cause writeup.
+    is_gpt_oss = "gpt-oss" in info["name"].lower() or "gpt_oss" in info["name"].lower()
 
     env_lines = [
         "  -e HF_HUB_OFFLINE=1 \\",
         "  -e CUDA_DEVICE_MAX_CONNECTIONS=8 \\",
     ]
-    if is_fp4:
+    if is_gpt_oss:
+        # Harmony/MXFP4 on sm_121: seed the o200k vocab for offline openai_harmony,
+        # force Marlin MoE with the SM121 split-K atomic-add race fix. NOT
+        # VLLM_NVFP4_GEMM_BACKEND (that's for NVFP4 models and is a no-op here).
+        env_lines += [
+            "  -e TIKTOKEN_ENCODINGS_BASE=/root/.cache/huggingface/harmony-encodings \\",
+            "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
+            "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
+            "  -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \\",
+        ]
+    elif is_fp4:
         env_lines += [
             "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
             "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
@@ -2281,10 +2426,20 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
         "  --gpu-memory-utilization 0.75 \\",
-        "  --max-model-len 32768 --max-num-seqs 2 \\",
-        "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
     ]
-    if is_moe:
+    if is_gpt_oss:
+        # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
+        # sampling-tail noise on the harmony path); 65536 = ~324K token KV capacity.
+        arg_lines += [
+            "  --max-model-len 65536 --max-num-seqs 2 \\",
+            "  --enable-chunked-prefill \\",
+        ]
+    else:
+        arg_lines += [
+            "  --max-model-len 32768 --max-num-seqs 2 \\",
+            "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+        ]
+    if is_moe or is_gpt_oss:
         arg_lines.append("  --moe-backend marlin \\")
     if "qwen" in info["name"].lower():
         arg_lines += [
@@ -2292,6 +2447,14 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             "  --tool-call-parser qwen3_coder \\",
         ]
     arg_lines.append("  --generation-config vllm")
+
+    # gpt-oss runs on the SM121-patched eugr image, whose entrypoint is
+    # nvidia_entrypoint.sh (not `vllm serve`), so the serve subcommand is explicit.
+    if is_gpt_oss:
+        image = "eugr/spark-vllm:latest"
+        arg_lines.insert(0, "  vllm serve \\")
+    else:
+        image = "vllm/vllm-openai:v0.20.0"
 
     script = f"""#!/bin/bash
 # Name: HF {info['name']}
@@ -2307,7 +2470,7 @@ docker rm -f vllm_node 2>/dev/null || true
 exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
-  vllm/vllm-openai:v0.20.0 \\
+  {image} \\
 {chr(10).join(arg_lines)}
 """
     return script_name, script, info
@@ -2341,6 +2504,9 @@ async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
     return _create_vllm_profile_from_path(req.path, req.model_name)
 
 
+_active_downloads: set = set()  # (repo_id, local_dir) of in-progress HF downloads
+
+
 @app.post("/api/hf/download", dependencies=[Depends(verify_auth)])
 async def hf_download(req: HFDownloadRequest):
     repo_id = req.repo_id.strip()
@@ -2372,8 +2538,21 @@ async def hf_download(req: HFDownloadRequest):
     sub_env = {**os.environ, "HF_REPO_ID": repo_id}
     if local_dir:
         sub_env["HF_LOCAL_DIR"] = local_dir
+    if req.ignore_patterns:
+        sub_env["HF_IGNORE_PATTERNS"] = json.dumps(req.ignore_patterns)
+    if req.allow_patterns:
+        sub_env["HF_ALLOW_PATTERNS"] = json.dumps(req.allow_patterns)
+
+    # Reject a duplicate download of the same target while one is in progress.
+    # Two writers to the same HF cache blob corrupt/stall each other — this is
+    # easy to trigger by clicking Approve twice or reloading the stream.
+    dl_key = (repo_id, local_dir)
+    if dl_key in _active_downloads:
+        raise HTTPException(409, f"A download of {repo_id} is already in progress")
+    _active_downloads.add(dl_key)
 
     async def stream() -> AsyncGenerator[str, None]:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
@@ -2401,6 +2580,16 @@ async def hf_download(req: HFDownloadRequest):
             await proc.wait()
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # Client disconnect (GeneratorExit) also lands here: terminate the
+            # child so it can't orphan and block on a full stdout pipe, and free
+            # the repo so a later download can start.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            _active_downloads.discard(dl_key)
 
     return StreamingResponse(
         stream(), media_type="text/event-stream",
@@ -4665,6 +4854,7 @@ const _SEV = {
   medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
   low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
 };
+let _lastRecs = [];  // last fired recommendations, for approve/apply lookups by id
 
 async function loadRecommendations() {
   const root = document.getElementById('recs-root');
@@ -4672,6 +4862,7 @@ async function loadRecommendations() {
   try {
     const d = await apiFetch('/api/recommendations');
     const recs = d.recommendations || [];
+    _lastRecs = recs;
     document.getElementById('badge-recs').textContent = recs.length;
     const st = d.state || {};
     meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
@@ -4700,6 +4891,21 @@ async function loadRecommendations() {
         'style="color:var(--blue);text-decoration:none">' +
         _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
       ).join(' · ');
+      const rid = (r.id || '').replace(/'/g, "\\'");
+      const actions = [];
+      if (r.kind === 'model' && r.download && r.download.repo_id) {
+        actions.push('<button class="btn btn-sm btn-primary" onclick="approveModel(\'' + rid + '\')">' +
+          '⬇ Approve &amp; download</button>');
+      }
+      if (r.apply && (r.fired_for || []).length) {
+        r.fired_for.forEach(h => {
+          const pid = (h.profile || '').replace(/'/g, "\\'");
+          actions.push('<button class="btn btn-sm" onclick="applyRec(\'' + rid + '\',\'' + pid + '\')">' +
+            '✎ Apply to ' + _escHtml(h.profile.replace(/^start_/, '').replace(/\.sh$/, '')) + '</button>');
+        });
+      }
+      const actionBar = actions.length
+        ? '<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">' + actions.join('') + '</div>' : '';
       return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
           chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
@@ -4712,6 +4918,7 @@ async function loadRecommendations() {
           _escHtml(r.action) + '</div>' +
         fired +
         (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+        actionBar +
       '</div>';
     }).join('');
   } catch(e) {
@@ -4781,6 +4988,189 @@ async function refreshKB() {
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;
+  }
+}
+
+// Approve a model recommendation → confirm the HF repo, then run the existing
+// download flow (SSE), which auto-wires a vLLM profile on completion.
+function closeRecModal() { const m = document.getElementById('rec-modal'); if (m) m.remove(); }
+
+function approveModel(id) {
+  const r = _lastRecs.find(x => x.id === id);
+  if (!r || !r.download) { toast('No download info for this recommendation', 'err'); return; }
+  window._approveRecId = id;
+  const repo = r.download.repo_id || '';
+  const dir = r.download.local_dir || '';
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:520px;max-width:92vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Approve &amp; download</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">' + _escHtml(r.title) +
+        '. This pulls the model from Hugging Face and auto-creates a vLLM profile when the download finishes.</div>' +
+      '<label style="font-size:11px;color:var(--muted)">HF repo</label>' +
+      '<input class="input" id="rec-dl-repo" value="' + _escHtml(repo).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="owner/model-name" style="width:100%;margin:4px 0 12px">' +
+      '<label style="font-size:11px;color:var(--muted)">Target dir (blank = HF cache)</label>' +
+      '<input class="input" id="rec-dl-dir" value="' + _escHtml(dir).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="~/.cache/huggingface" style="width:100%;margin:4px 0 12px">' +
+      '<div id="rec-dl-progress" style="display:none;margin:8px 0 4px">' +
+        '<div class="prog" style="height:6px;background:var(--s2);border-radius:4px;overflow:hidden">' +
+          '<div id="rec-dl-bar" class="prog-bar" style="height:100%;width:0"></div></div>' +
+        '<pre id="rec-dl-log" style="font-size:11px;color:var(--muted);margin:8px 0 0;white-space:pre-wrap;' +
+          'max-height:160px;overflow:auto"></pre>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
+        '<button class="btn btn-sm" id="rec-dl-close" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-dl-go" onclick="startApproveDownload(\'' +
+          id.replace(/'/g, "\\'") + '\')">Download</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  document.getElementById('rec-dl-repo').focus();
+}
+
+async function startApproveDownload(id) {
+  const repo = document.getElementById('rec-dl-repo').value.trim();
+  const dir = document.getElementById('rec-dl-dir').value.trim();
+  if (!repo) { document.getElementById('rec-dl-repo').focus(); return; }
+  const go = document.getElementById('rec-dl-go');
+  const cancel = document.getElementById('rec-dl-close');
+  const prog = document.getElementById('rec-dl-progress');
+  const bar = document.getElementById('rec-dl-bar');
+  const log = document.getElementById('rec-dl-log');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Downloading…';
+  prog.style.display = 'block';
+  bar.className = 'prog-bar spin';
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
+  let wired = false;
+  try {
+    const r = _lastRecs.find(x => x.id === (window._approveRecId || ''));
+    const dl = (r && r.download) || {};
+    const resp = await fetch('/api/hf/download', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined,
+        ignore_patterns: dl.ignore_patterns, allow_patterns: dl.allow_patterns}),
+    });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch(e) { continue; }
+        if (ev.file_start) {
+          const f = ev.file_start;
+          bar.className = 'prog-bar spin';
+          lines.push('[' + f.idx + '/' + f.total + '] ⤓ ' + f.name + ' (' + f.size_str + ')…');
+        } else if (ev.progress) {
+          const p = ev.progress;
+          bar.className = 'prog-bar'; bar.style.width = p.pct + '%';
+          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file + '  ·  ' +
+            p.pct + '%  ·  ' + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+        } else if (ev.status && typeof ev.status === 'string' && ev.status !== 'complete' && ev.status !== 'error') {
+          lines.push(ev.status);  // "Skipping N files…", "Found N files…"
+        } else if (ev.status === 'complete') {
+          bar.className = 'prog-bar'; bar.style.width = '100%';
+          lines.push('✓ Downloaded → ' + ev.path + (ev.errors > 0 ? '  ⚠ ' + ev.errors + ' error(s)' : ''));
+          toast('✓ Downloaded: ' + repo, 'ok');
+        } else if (ev.auto_profile) {
+          wired = true;
+          const p = ev.auto_profile.profile || {};
+          lines.push('✓ vLLM profile wired: ' + (p.name || p.id || 'profile'));
+          toast('✓ Profile wired — recommendation satisfied', 'ok');
+        } else if (ev.auto_profile_error) {
+          lines.push('⚠ Profile not auto-created: ' + ev.auto_profile_error);
+        } else if (ev.status === 'error') {
+          throw new Error(ev.error || 'download failed');
+        } else if (ev.log) {
+          lines.push(ev.log);
+        }
+        log.textContent = lines.join('\n');
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    go.innerHTML = wired ? '✓ Done' : 'Finished';
+    cancel.textContent = 'Close';
+    loadRecommendations();          // fired model rec should now clear
+    loadEngineProfiles(engines.vllm);
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch(e) {
+    bar.className = 'prog-bar'; bar.style.width = '0';
+    lines.push('✗ ' + e.message);
+    log.textContent = lines.join('\n');
+    toast('Download failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Retry';
+  }
+}
+
+// Apply a config/tuning rec to a flagged profile: fetch a diff preview, then
+// confirm to write the edited start script.
+function _diffHtml(diff) {
+  return (diff || '').split('\n').map(l => {
+    let c = 'var(--muted)';
+    if (l.startsWith('+') && !l.startsWith('+++')) c = '#34d399';
+    else if (l.startsWith('-') && !l.startsWith('---')) c = '#f87171';
+    else if (l.startsWith('@@')) c = 'var(--blue)';
+    return '<span style="color:' + c + '">' + _escHtml(l) + '</span>';
+  }).join('\n');
+}
+
+async function applyRec(id, profile) {
+  toast('Computing diff…', '');
+  let d;
+  try {
+    d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile});
+  } catch(e) { toast('Apply failed: ' + e.message, 'err'); return; }
+  if (!d.changed) { toast('Already applied: ' + (d.note || 'no change'), 'ok'); return; }
+  const short = profile.replace(/^start_/, '').replace(/\.sh$/, '');
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:640px;max-width:94vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Apply to ' + _escHtml(short) + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' + _escHtml(d.note || '') +
+        ' — review the change to the start script, then confirm.</div>' +
+      '<pre style="font-size:11px;line-height:1.45;background:var(--s2);border:1px solid var(--border);' +
+        'border-radius:8px;padding:12px;max-height:340px;overflow:auto;white-space:pre">' + _diffHtml(d.diff) + '</pre>' +
+      '<div id="rec-apply-note" style="font-size:11px;color:var(--muted);margin-top:8px">' +
+        'The profile takes effect the next time you start it.</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+        '<button class="btn btn-sm" id="rec-apply-cancel" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-apply-go" onclick="confirmApplyRec(\'' +
+          id.replace(/'/g, "\\'") + '\',\'' + profile.replace(/'/g, "\\'") + '\')">Apply change</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+}
+
+async function confirmApplyRec(id, profile) {
+  const go = document.getElementById('rec-apply-go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Applying…';
+  try {
+    const d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile, confirm: true});
+    toast('✓ ' + (d.note || 'applied'), 'ok');
+    closeRecModal();
+    loadRecommendations();
+    loadEngineProfiles(engines.vllm);
+  } catch(e) {
+    toast('Apply failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Apply change';
   }
 }
 

@@ -57,7 +57,12 @@
           "date": "2026-06-01"
         }
       ],
-      "confidence": "high"
+      "confidence": "high",
+      "apply": {
+        "type": "set_flag",
+        "flag": "--moe-backend",
+        "value": "marlin"
+      }
     },
     {
       "id": "cuda-graphs",
@@ -81,7 +86,11 @@
           "date": "2026-06-01"
         }
       ],
-      "confidence": "high"
+      "confidence": "high",
+      "apply": {
+        "type": "remove_flag",
+        "flag": "--enforce-eager"
+      }
     },
     {
       "id": "prefix-caching",
@@ -104,7 +113,11 @@
           "date": "2026-06-01"
         }
       ],
-      "confidence": "high"
+      "confidence": "high",
+      "apply": {
+        "type": "add_flag",
+        "flag": "--enable-prefix-caching"
+      }
     },
     {
       "id": "raise-gpu-util",
@@ -154,7 +167,10 @@
           "date": "2026-04"
         }
       ],
-      "confidence": "medium"
+      "confidence": "medium",
+      "download": {
+        "repo_id": "google/gemma-4-26b-a4b-it"
+      }
     },
     {
       "id": "model-gpt-oss-120b",
@@ -177,7 +193,14 @@
           "date": "2026"
         }
       ],
-      "confidence": "medium"
+      "confidence": "medium",
+      "download": {
+        "repo_id": "openai/gpt-oss-120b",
+        "ignore_patterns": [
+          "metal/*",
+          "original/*"
+        ]
+      }
     },
     {
       "id": "arm64-image",
