@@ -2343,7 +2343,18 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
             size_gb = _dir_size_gb(hf_root)
     else:
         size_gb = _dir_size_gb(launch_dir)
-    vram_gb = int(min(112, max(16, round((size_gb * 1.35) + 12))))
+    # VRAM estimate = weights (≈ on-disk size, scaled by how much the format
+    # expands when loaded) + a fixed overhead for CUDA context, activations and
+    # the fp8 KV cache. Already-quantized weights load ~1:1, so the old flat
+    # 1.35× over-inflated every 4-/8-bit model by ~35% and tripped admission on
+    # a model that actually fits (e.g. gpt-oss-120b FP4: 100→81 GB).
+    _dtype = (inferred.get("dtype") or "").upper()
+    _weight_mult = (
+        1.05 if _dtype in ("FP4", "INT4") else
+        1.15 if _dtype in ("FP8", "INT8") else
+        1.35  # BF16/FP16/Unknown: fp16 weights + workspace headroom
+    )
+    vram_gb = int(min(112, max(16, round((size_gb * _weight_mult) + 12))))
     return {
         "name": model_name,
         "served": model_name.replace("/", "--"),
@@ -2381,12 +2392,28 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
     is_moe = bool(info["is_moe"]) or "moe" in info["name"].lower() or "a3b" in info["name"].lower()
+    # gpt-oss family uses the OpenAI harmony chat format + MXFP4 weights. On GB10
+    # (sm_121) the stock vllm-openai Marlin MXFP4 kernel miscomputes the first decode
+    # token (vLLM #37030) → harmony parser desync → OpenWebUI token-soup. The
+    # SM121-patched eugr/spark-vllm image (vLLM 0.23.1) fixes it. See
+    # profiles/vLLM/start_hf_openai_gpt-oss-120b.sh for the full root-cause writeup.
+    is_gpt_oss = "gpt-oss" in info["name"].lower() or "gpt_oss" in info["name"].lower()
 
     env_lines = [
         "  -e HF_HUB_OFFLINE=1 \\",
         "  -e CUDA_DEVICE_MAX_CONNECTIONS=8 \\",
     ]
-    if is_fp4:
+    if is_gpt_oss:
+        # Harmony/MXFP4 on sm_121: seed the o200k vocab for offline openai_harmony,
+        # force Marlin MoE with the SM121 split-K atomic-add race fix. NOT
+        # VLLM_NVFP4_GEMM_BACKEND (that's for NVFP4 models and is a no-op here).
+        env_lines += [
+            "  -e TIKTOKEN_ENCODINGS_BASE=/root/.cache/huggingface/harmony-encodings \\",
+            "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
+            "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
+            "  -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \\",
+        ]
+    elif is_fp4:
         env_lines += [
             "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
             "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
@@ -2399,10 +2426,20 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
         "  --gpu-memory-utilization 0.75 \\",
-        "  --max-model-len 32768 --max-num-seqs 2 \\",
-        "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
     ]
-    if is_moe:
+    if is_gpt_oss:
+        # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
+        # sampling-tail noise on the harmony path); 65536 = ~324K token KV capacity.
+        arg_lines += [
+            "  --max-model-len 65536 --max-num-seqs 2 \\",
+            "  --enable-chunked-prefill \\",
+        ]
+    else:
+        arg_lines += [
+            "  --max-model-len 32768 --max-num-seqs 2 \\",
+            "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+        ]
+    if is_moe or is_gpt_oss:
         arg_lines.append("  --moe-backend marlin \\")
     if "qwen" in info["name"].lower():
         arg_lines += [
@@ -2410,6 +2447,14 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             "  --tool-call-parser qwen3_coder \\",
         ]
     arg_lines.append("  --generation-config vllm")
+
+    # gpt-oss runs on the SM121-patched eugr image, whose entrypoint is
+    # nvidia_entrypoint.sh (not `vllm serve`), so the serve subcommand is explicit.
+    if is_gpt_oss:
+        image = "eugr/spark-vllm:latest"
+        arg_lines.insert(0, "  vllm serve \\")
+    else:
+        image = "vllm/vllm-openai:v0.20.0"
 
     script = f"""#!/bin/bash
 # Name: HF {info['name']}
@@ -2425,7 +2470,7 @@ docker rm -f vllm_node 2>/dev/null || true
 exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
-  vllm/vllm-openai:v0.20.0 \\
+  {image} \\
 {chr(10).join(arg_lines)}
 """
     return script_name, script, info
@@ -2457,6 +2502,9 @@ def _create_vllm_profile_from_path(path: str, model_name: str | None = None) -> 
 @app.post("/api/vllm/profiles/from-hf", dependencies=[Depends(verify_auth)])
 async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
     return _create_vllm_profile_from_path(req.path, req.model_name)
+
+
+_active_downloads: set = set()  # (repo_id, local_dir) of in-progress HF downloads
 
 
 @app.post("/api/hf/download", dependencies=[Depends(verify_auth)])
@@ -2495,7 +2543,16 @@ async def hf_download(req: HFDownloadRequest):
     if req.allow_patterns:
         sub_env["HF_ALLOW_PATTERNS"] = json.dumps(req.allow_patterns)
 
+    # Reject a duplicate download of the same target while one is in progress.
+    # Two writers to the same HF cache blob corrupt/stall each other — this is
+    # easy to trigger by clicking Approve twice or reloading the stream.
+    dl_key = (repo_id, local_dir)
+    if dl_key in _active_downloads:
+        raise HTTPException(409, f"A download of {repo_id} is already in progress")
+    _active_downloads.add(dl_key)
+
     async def stream() -> AsyncGenerator[str, None]:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
@@ -2523,6 +2580,16 @@ async def hf_download(req: HFDownloadRequest):
             await proc.wait()
         except Exception as e:
             yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # Client disconnect (GeneratorExit) also lands here: terminate the
+            # child so it can't orphan and block on a full stdout pipe, and free
+            # the repo so a later download can start.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            _active_downloads.discard(dl_key)
 
     return StreamingResponse(
         stream(), media_type="text/event-stream",
