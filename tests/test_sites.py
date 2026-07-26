@@ -26,11 +26,11 @@ def test_sites_port_resolved_against_app_host(monkeypatch):
     monkeypatch.setattr(appmod, "_SITES",
                         [{"name": "Grafana", "port": 30000, "group": "Metrics", "desc": "d"}])
     monkeypatch.setattr(appmod, "_SITES_BASE", "")
-    monkeypatch.setattr(appmod, "APP_HOST", "100.115.54.83")
+    monkeypatch.setattr(appmod, "APP_HOST", "192.0.2.10")
     _stub_reachable(monkeypatch, True)
     d = _client().get("/api/sites").json()
     assert d["sites"] == [{"name": "Grafana", "desc": "d", "group": "Metrics",
-                           "url": "http://100.115.54.83:30000", "reachable": True}]
+                           "url": "http://192.0.2.10:30000", "reachable": True}]
 
 
 def test_sites_verbatim_url_and_wildcard_host_fallback(monkeypatch):
