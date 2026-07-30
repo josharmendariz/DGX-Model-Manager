@@ -14,6 +14,12 @@
     "localai_base":  "http://127.0.0.1:9090",
     "comfyui_base":  "http://127.0.0.1:8188"
   },
+  "vllm": {
+    "_comment": "Optional — defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
+    "image":         "vllm/vllm-openai:v0.20.0",
+    "image_gpt_oss": "eugr/spark-vllm:latest",
+    "moe_backend":   "marlin"
+  },
   "paths": {
     "litellm_config": "~/litellm/litellm_config.yaml",
     "hf_cache":       "~/.cache/huggingface/hub"

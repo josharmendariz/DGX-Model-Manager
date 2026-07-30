@@ -2183,12 +2183,13 @@ _HF_DOWNLOAD_SCRIPT = """
 import sys, json, os, time, fnmatch, importlib.util
 sys.stdout.reconfigure(line_buffering=True)
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-# Enable the Rust-accelerated parallel downloader when installed — several times
-# faster than the pure-Python path on large shards. Must be set before importing
-# huggingface_hub. Guarded so downloads still work if the package is absent.
-_HF_XFER = importlib.util.find_spec("hf_transfer") is not None
-if _HF_XFER:
-    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+# huggingface_hub 1.x downloads Xet-backed repos through hf_xet automatically; the
+# perf knob is HF_XET_HIGH_PERFORMANCE (raises hf_xet concurrency/throughput on big
+# shards). The old HF_HUB_ENABLE_HF_TRANSFER/hf_transfer path is superseded by Xet.
+# Must be set before importing huggingface_hub; guarded so downloads still work if
+# hf_xet is absent (falls back to the default HTTP path).
+if importlib.util.find_spec("hf_xet") is not None:
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 from huggingface_hub import list_repo_tree, hf_hub_download
 from pathlib import Path
 
@@ -2375,6 +2376,26 @@ def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]
         return [
             f'  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
         ], "/root/.cache/huggingface/" + str(rel).replace(os.sep, "/")
+    # HF-layout repo outside HF_CACHE_DIR (i.e. under a custom dir such as
+    # /opt/models or /mnt/models). Entries in snapshots/<rev>/ are relative
+    # symlinks to ../../blobs/<hash>, so mounting the snapshot dir alone leaves
+    # every file dangling inside the container and vLLM aborts with
+    # "Invalid repository ID or local directory specified". Mount the whole
+    # models--* repo (blobs/ + snapshots/) and point --model at the subpath.
+    resolved = launch_dir.resolve()
+    for repo_root in (resolved, *resolved.parents):
+        if (repo_root.name.startswith("models--")
+                and (repo_root / "blobs").is_dir()
+                and (repo_root / "snapshots").is_dir()):
+            rel = resolved.relative_to(repo_root)
+            container_root = f"/models/{slug}"
+            container_model = container_root
+            if rel.parts:
+                container_model += "/" + rel.as_posix()
+            return [
+                f'  -v "{repo_root}:{container_root}:ro" \\',
+            ], container_model
+    # Flat model dir: files live directly inside, safe to mount on its own.
     return [
         f'  -v "{launch_dir}:/models/{slug}:ro" \\',
     ], f"/models/{slug}"
@@ -2388,6 +2409,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         raise HTTPException(400, f"Only text/vision LLM snapshots can be added to vLLM; detected {info.get('task_label')}")
     slug = _safe_profile_slug(info["name"])
     script_name = f"start_hf_{slug}.sh"
+    _vllm_cfg = _app_config.get("vllm", {}) or {}
     mounts, container_model = _container_model_mount(launch_dir, slug)
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
@@ -2439,8 +2461,12 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             "  --max-model-len 32768 --max-num-seqs 2 \\",
             "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
         ]
-    if is_moe or is_gpt_oss:
-        arg_lines.append("  --moe-backend marlin \\")
+    # On GB10 (sm_121) Marlin MoE miscomputes for some architectures; setting
+    # vllm.moe_backend to "" in config.json omits the flag and lets vLLM autoselect.
+    _moe_backend = _vllm_cfg.get("moe_backend", "marlin")
+    _moe_backend = "" if _moe_backend is None else str(_moe_backend).strip()
+    if (is_moe or is_gpt_oss) and _moe_backend:
+        arg_lines.append(f"  --moe-backend {_moe_backend} \\")
     if "qwen" in info["name"].lower():
         arg_lines += [
             "  --enable-auto-tool-choice \\",
@@ -2451,10 +2477,10 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     # gpt-oss runs on the SM121-patched eugr image, whose entrypoint is
     # nvidia_entrypoint.sh (not `vllm serve`), so the serve subcommand is explicit.
     if is_gpt_oss:
-        image = "eugr/spark-vllm:latest"
+        image = _vllm_cfg.get("image_gpt_oss") or "eugr/spark-vllm:latest"
         arg_lines.insert(0, "  vllm serve \\")
     else:
-        image = "vllm/vllm-openai:v0.20.0"
+        image = _vllm_cfg.get("image") or "vllm/vllm-openai:v0.20.0"
 
     script = f"""#!/bin/bash
 # Name: HF {info['name']}
