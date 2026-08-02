@@ -16,6 +16,7 @@
   },
   "vllm": {
     "_comment": "Optional — defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
+    "_comment_serve": "serve_command is normally omitted — it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
     "image":         "vllm/vllm-openai:v0.20.0",
     "image_gpt_oss": "eugr/spark-vllm:latest",
     "moe_backend":   "marlin"

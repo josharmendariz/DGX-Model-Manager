@@ -14,6 +14,7 @@ import logging
 import os
 import platform
 import re as _re
+import shlex
 import socket
 import subprocess
 import sys
@@ -218,9 +219,44 @@ for _ek, _ev in _ENGINES.items():
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def _auth_open_unauthenticated() -> bool:
+    """True when no key is set AND we are bound somewhere other than loopback.
+
+    Reads the module globals at call time rather than caching: PUT /api/config mutates
+    _API_KEY_HASH through a `global` statement, and the next request must see it.
+    """
+    return not _API_KEY_HASH and APP_HOST not in _LOOPBACK_HOSTS
+
+
 async def verify_auth(request: Request):
-    """Check API key on mutating endpoints. No-op when no key is configured."""
+    """Check the API key on mutating endpoints. Four states:
+
+      1. Key set + valid Bearer header      → allow.
+      2. Key set + missing/wrong header     → 401.
+      3. No key, bound to loopback          → allow (local-only deployments are fine).
+      4. No key, bound to a real interface  → 503, unless MODEL_MANAGER_ALLOW_UNAUTH is
+         set, in which case allow but log every unauthenticated mutation. Never silent.
+
+    Bootstrap consequence of state 4: with the 503 active, PUT /api/config cannot install
+    the first API key from a remote host. That is intentional — an endpoint that lets an
+    unauthenticated caller set the credential is not a fix. Bootstrap by setting
+    app.api_key in config.json, or by reaching the UI over loopback.
+    """
     if not _API_KEY_HASH:
+        if not _auth_open_unauthenticated():
+            return  # loopback-only deployment
+        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+            raise HTTPException(
+                503,
+                f"Refusing to serve a mutating request: bound to {APP_HOST} with no API "
+                "key configured. Set app.api_key in config.json (or via the UI over "
+                "loopback), or set MODEL_MANAGER_ALLOW_UNAUTH=1 to accept the risk.")
+        _logger.warning("UNAUTHENTICATED mutating request allowed by "
+                        "MODEL_MANAGER_ALLOW_UNAUTH: %s %s",
+                        request.method, request.url.path)
         return
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
@@ -2182,25 +2218,37 @@ for _ek, _ev in _ENGINES.items():
 _HF_DOWNLOAD_SCRIPT = """
 import sys, json, os, time, fnmatch, importlib.util
 sys.stdout.reconfigure(line_buffering=True)
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-# huggingface_hub 1.x downloads Xet-backed repos through hf_xet automatically; the
-# perf knob is HF_XET_HIGH_PERFORMANCE (raises hf_xet concurrency/throughput on big
-# shards). The old HF_HUB_ENABLE_HF_TRANSFER/hf_transfer path is superseded by Xet.
-# Must be set before importing huggingface_hub; guarded so downloads still work if
-# hf_xet is absent (falls back to the default HTTP path).
-if importlib.util.find_spec("hf_xet") is not None:
-    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-from huggingface_hub import list_repo_tree, hf_hub_download
-from pathlib import Path
-
-repo = os.environ["HF_REPO_ID"]
-local_dir = os.environ.get("HF_LOCAL_DIR") or None
-ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
-allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
+# Define the event reporter FIRST. Anything that raises before J exists dies as a bare
+# traceback on stderr, which the parent turns into `log` events the UI discards — that is
+# exactly how an orphaned hf_transfer NameError here stayed invisible while every download
+# failed. Keep initialization inside the guarded block below so it can never regress.
 J = lambda **kw: print(json.dumps(kw), flush=True)
-J(status="starting", repo=repo)
-if _HF_XFER:
-    J(status="hf_transfer acceleration enabled")
+
+try:
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    # huggingface_hub 1.x downloads Xet-backed repos through hf_xet automatically; the
+    # perf knob is HF_XET_HIGH_PERFORMANCE (raises hf_xet concurrency/throughput on big
+    # shards). The old HF_HUB_ENABLE_HF_TRANSFER/hf_transfer path is superseded by Xet.
+    # Must be set before importing huggingface_hub; guarded so downloads still work if
+    # hf_xet is absent (falls back to the default HTTP path).
+    _has_xet = importlib.util.find_spec("hf_xet") is not None
+    if _has_xet:
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    from huggingface_hub import list_repo_tree, hf_hub_download
+    from pathlib import Path
+
+    repo = os.environ.get("HF_REPO_ID")
+    if not repo:
+        raise RuntimeError("HF_REPO_ID is not set")
+    local_dir = os.environ.get("HF_LOCAL_DIR") or None
+    ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
+    allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
+    J(status="starting", repo=repo)
+    if _has_xet:
+        J(status="Xet acceleration enabled")
+except Exception as e:
+    J(status="error", error=f"startup failed: {e}")
+    raise SystemExit(0)
 
 def _keep(p):
     if allow and not any(fnmatch.fnmatch(p, g) for g in allow):
@@ -2373,6 +2421,9 @@ def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]
     hf_cache_parent = HF_CACHE_DIR.parent.resolve()  # ~/.cache/huggingface
     if _path_under(launch_dir, hf_cache_parent):
         rel = launch_dir.resolve().relative_to(hf_cache_parent)
+        # Deliberately NOT shlex.quote'd: this line is a constant, and it relies on the
+        # shell expanding $HOME at launch time. Quoting would make $HOME a literal and
+        # break every cache-backed profile. No untrusted value is interpolated here.
         return [
             f'  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
         ], "/root/.cache/huggingface/" + str(rel).replace(os.sep, "/")
@@ -2393,12 +2444,63 @@ def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]
             if rel.parts:
                 container_model += "/" + rel.as_posix()
             return [
-                f'  -v "{repo_root}:{container_root}:ro" \\',
+                f'  -v {shlex.quote(f"{repo_root}:{container_root}:ro")} \\',
             ], container_model
     # Flat model dir: files live directly inside, safe to mount on its own.
     return [
-        f'  -v "{launch_dir}:/models/{slug}:ro" \\',
+        f'  -v {shlex.quote(f"{launch_dir}:/models/{slug}:ro")} \\',
     ], f"/models/{slug}"
+
+
+# A served model name ends up as a shell word in a generated start script AND in the
+# `# Name:` comment header that _parse_script_meta reads back. Anything outside this set is
+# rejected outright: grammar first, shlex.quote second, because defence-in-depth here is
+# cheap and the blast radius is arbitrary code execution as the service user.
+_SERVED_NAME_RE = _re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
+_MOE_BACKEND_RE = _re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def _validate_served_name(name: str) -> str:
+    """Reject any model name that could break out of a shell word or a comment line."""
+    if not isinstance(name, str) or not _SERVED_NAME_RE.match(name):
+        raise HTTPException(
+            400,
+            "Invalid model name. Allowed characters: letters, digits, dot, underscore, "
+            "hyphen and forward slash (max 128 chars).")
+    return name
+
+
+def _one_line(value: str) -> str:
+    """Flatten a value destined for a single-line `# Header:` comment."""
+    return _re.sub(r"[\r\n]+", " ", str(value)).strip()
+
+
+def _vllm_serve_command(image: str, cfg: dict) -> str:
+    """Return the serve subcommand this image needs, or "" if its entrypoint serves already.
+
+    Entrypoint semantics belong to the image, not to the model. Two shapes verified on this
+    box:
+
+      eugr/spark-vllm:latest → Entrypoint ["/opt/nvidia/nvidia_entrypoint.sh"], Cmd null.
+                               That script execs its arguments, so without an explicit
+                               `vllm serve` the container tries to exec `--model` and dies.
+      vllm/vllm-openai:*     → its entrypoint already starts the OpenAI API server, so
+                               arguments are server flags and `vllm serve` must NOT be added.
+
+    The known-good hand-written profiles/vLLM/start_hf_qwen_qwen3-8b.sh uses exactly this
+    form on the eugr image. Deliberately NOT using `docker run --entrypoint vllm`: that
+    bypasses nvidia_entrypoint.sh, which does CUDA environment setup inside the image.
+
+    Unknown images default to the explicit form, which is the safe direction — `vllm serve`
+    also works when passed as the container command to an image that execs its arguments.
+    """
+    if "serve_command" in (cfg or {}):
+        # Explicit wins, including an empty string meaning "add nothing" (same idiom as
+        # vllm.moe_backend).
+        val = (cfg or {}).get("serve_command")
+        return "" if val is None else str(val).strip()
+    ref = (image or "").split("@")[0]  # drop any @sha256: digest before matching
+    return "" if "vllm-openai" in ref else "vllm serve"
 
 
 def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) -> tuple[str, str, dict]:
@@ -2407,6 +2509,10 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         raise HTTPException(400, f"Only safetensors/PyTorch snapshots can be used with vLLM; found {info['fmt']}")
     if info.get("task_label") not in ("Text Gen", "Vision LLM"):
         raise HTTPException(400, f"Only text/vision LLM snapshots can be added to vLLM; detected {info.get('task_label')}")
+    # Validate the name that actually reaches the script — including one recovered from a
+    # models--* ancestor, not just the caller-supplied one.
+    _validate_served_name(info["name"])
+    _validate_served_name(info["served"])
     slug = _safe_profile_slug(info["name"])
     script_name = f"start_hf_{slug}.sh"
     _vllm_cfg = _app_config.get("vllm", {}) or {}
@@ -2442,9 +2548,13 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             "  -e VLLM_NVFP4_GEMM_BACKEND=marlin \\",
         ]
 
+    # shlex.quote every dynamic atom (defence-in-depth behind _validate_served_name). It
+    # supplies its own quoting, so these must NOT also be wrapped in double quotes —
+    # double-quoting its output would reintroduce $(...) evaluation. `vllm-active` is a
+    # literal and needs none.
     arg_lines = [
-        f'  --model "{container_model}" \\',
-        f'  --served-model-name "{info["name"]}" "{info["served"]}" vllm-active \\',
+        f'  --model {shlex.quote(container_model)} \\',
+        f'  --served-model-name {shlex.quote(info["name"])} {shlex.quote(info["served"])} vllm-active \\',
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
         "  --gpu-memory-utilization 0.75 \\",
@@ -2466,6 +2576,9 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     _moe_backend = _vllm_cfg.get("moe_backend", "marlin")
     _moe_backend = "" if _moe_backend is None else str(_moe_backend).strip()
     if (is_moe or is_gpt_oss) and _moe_backend:
+        if not _MOE_BACKEND_RE.match(_moe_backend):
+            raise HTTPException(400, "Invalid vllm.moe_backend: expected lowercase letters, "
+                                     "digits and underscores only.")
         arg_lines.append(f"  --moe-backend {_moe_backend} \\")
     if "qwen" in info["name"].lower():
         arg_lines += [
@@ -2474,21 +2587,27 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         ]
     arg_lines.append("  --generation-config vllm")
 
-    # gpt-oss runs on the SM121-patched eugr image, whose entrypoint is
-    # nvidia_entrypoint.sh (not `vllm serve`), so the serve subcommand is explicit.
+    # Whether an explicit `vllm serve` is needed is a property of the IMAGE, not of the
+    # model family. Treating it as model-specific meant every generated non-gpt-oss script
+    # was unlaunchable whenever config.json pointed `vllm.image` at an exec-args image.
     if is_gpt_oss:
         image = _vllm_cfg.get("image_gpt_oss") or "eugr/spark-vllm:latest"
-        arg_lines.insert(0, "  vllm serve \\")
     else:
         image = _vllm_cfg.get("image") or "vllm/vllm-openai:v0.20.0"
+    _serve_cmd = _vllm_serve_command(image, _vllm_cfg)
+    if _serve_cmd:
+        arg_lines.insert(0, f"  {_serve_cmd} \\")
+    image = shlex.quote(str(image))
 
+    # Headers are parsed back by _parse_script_meta one line at a time, so flatten anything
+    # that could introduce a newline and forge an extra header.
     script = f"""#!/bin/bash
-# Name: HF {info['name']}
-# Description: Local HF snapshot via vLLM ({dtype}, {info['size_gb']:.1f} GB on disk)
+# Name: HF {_one_line(info['name'])}
+# Description: Local HF snapshot via vLLM ({_one_line(dtype)}, {info['size_gb']:.1f} GB on disk)
 # VRAM: {info['vram_gb']}
 #
 # Auto-generated by DGX Model Manager from:
-# {launch_dir}
+# {_one_line(launch_dir)}
 set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
@@ -2531,6 +2650,97 @@ async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
 
 
 _active_downloads: set = set()  # (repo_id, local_dir) of in-progress HF downloads
+
+
+def _is_terminal_hf_event(ev: dict) -> bool:
+    """A download stream is finished once the worker reports complete or error."""
+    return isinstance(ev, dict) and ev.get("status") in ("complete", "error")
+
+
+# Cap on the stderr tail echoed back to the client. A traceback storm must not blow up the
+# SSE frame, and only the worker's own stderr is ever echoed — never sub_env, which carries
+# HF tokens and the rest of the process environment.
+_HF_STDERR_TAIL_CHARS = 2000
+
+
+async def _hf_download_events(sub_env: dict, repo_id: str,
+                              dl_key: tuple) -> AsyncGenerator[str, None]:
+    """Run the HF download worker and yield SSE frames, exactly one of them terminal.
+
+    Module-level (rather than nested in the route) so the terminal-event contract is
+    directly testable without a live HTTP request. The contract: every stream ends with
+    exactly one `complete` or `error` event. A worker that dies before emitting one — the
+    failure mode that hid the orphaned hf_transfer NameError — gets one synthesized here
+    from its return code and stderr tail, so a dead download can never look in-progress.
+    """
+    proc = None
+    saw_terminal = False
+    stderr_tail = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=sub_env,
+        )
+        assert proc.stdout
+        async for raw in proc.stdout:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            # Parse first, so a malformed line can't masquerade as an auto-profile failure.
+            try:
+                ev = json.loads(line)
+            except Exception:
+                yield f"data: {line}\n\n"
+                continue
+            if _is_terminal_hf_event(ev):
+                if saw_terminal:
+                    # Never emit a second terminal event; demote it to a log line.
+                    yield f"data: {json.dumps({'log': line})}\n\n"
+                    continue
+                saw_terminal = True
+            yield f"data: {line}\n\n"
+            if (ev.get("status") == "complete"
+                    and int(ev.get("errors", 0) or 0) == 0 and ev.get("path")):
+                try:
+                    profile_result = _create_vllm_profile_from_path(str(ev["path"]), repo_id)
+                    yield f"data: {json.dumps({'auto_profile': profile_result})}\n\n"
+                except Exception as profile_exc:
+                    yield f"data: {json.dumps({'auto_profile_error': str(profile_exc)})}\n\n"
+        stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
+        decoded = stderr_data.decode(errors="replace")
+        stderr_tail = "\n".join(
+            ln.strip() for ln in decoded.split("\n") if ln.strip()
+        )[-_HF_STDERR_TAIL_CHARS:]
+        for line in decoded.split("\n"):
+            stripped = line.strip()
+            if stripped and "%" not in stripped and "it/s" not in stripped:
+                yield f"data: {json.dumps({'log': stripped})}\n\n"
+        rc = await proc.wait()
+        if not saw_terminal:
+            # A silent worker is a failed worker, whatever its return code says.
+            msg = f"Download worker exited with code {rc} without reporting a result"
+            if stderr_tail:
+                msg += f": {stderr_tail}"
+            saw_terminal = True
+            yield f"data: {json.dumps({'status': 'error', 'error': msg, 'returncode': rc})}\n\n"
+    except Exception as e:
+        if not saw_terminal:
+            saw_terminal = True
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+    finally:
+        # Client disconnect (GeneratorExit) also lands here: terminate the
+        # child so it can't orphan and block on a full stdout pipe, and free
+        # the repo so a later download can start. A terminal event cannot be
+        # yielded from here after GeneratorExit, which is why the synthesized
+        # one belongs in the normal path above.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        _active_downloads.discard(dl_key)
 
 
 @app.post("/api/hf/download", dependencies=[Depends(verify_auth)])
@@ -2577,48 +2787,8 @@ async def hf_download(req: HFDownloadRequest):
         raise HTTPException(409, f"A download of {repo_id} is already in progress")
     _active_downloads.add(dl_key)
 
-    async def stream() -> AsyncGenerator[str, None]:
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=sub_env,
-            )
-            assert proc.stdout
-            async for raw in proc.stdout:
-                line = raw.decode().strip()
-                if line:
-                    yield f"data: {line}\n\n"
-                    try:
-                        ev = json.loads(line)
-                        if ev.get("status") == "complete" and int(ev.get("errors", 0) or 0) == 0 and ev.get("path"):
-                            profile_result = _create_vllm_profile_from_path(str(ev["path"]), repo_id)
-                            yield f"data: {json.dumps({'auto_profile': profile_result})}\n\n"
-                    except Exception as profile_exc:
-                        yield f"data: {json.dumps({'auto_profile_error': str(profile_exc)})}\n\n"
-            stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
-            for line in stderr_data.decode().split("\n"):
-                stripped = line.strip()
-                if stripped and "%" not in stripped and "it/s" not in stripped:
-                    yield f"data: {json.dumps({'log': stripped})}\n\n"
-            await proc.wait()
-        except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
-        finally:
-            # Client disconnect (GeneratorExit) also lands here: terminate the
-            # child so it can't orphan and block on a full stdout pipe, and free
-            # the repo so a later download can start.
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-            _active_downloads.discard(dl_key)
-
     return StreamingResponse(
-        stream(), media_type="text/event-stream",
+        _hf_download_events(sub_env, repo_id, dl_key), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
