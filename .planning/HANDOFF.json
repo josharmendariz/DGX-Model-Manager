@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "timestamp": "2026-08-02T20:13:37.346Z",
+  "phase": "2",
+  "phase_name": "Derived launch spec",
+  "phase_dir": ".planning/phases/02-derived-launch-spec",
+  "plan": 0,
+  "task": 0,
+  "total_tasks": 0,
+  "status": "paused",
+  "completed_tasks": [
+    {"id": 1, "name": "Phase 1 plan 01-01 — fix HF download worker + terminal-event guarantee", "status": "done", "commit": "ebee651"},
+    {"id": 2, "name": "Phase 1 plan 01-02 — serve subcommand as image property; regenerate DeepSeek profiles", "status": "done", "commit": "ebee651"},
+    {"id": 3, "name": "Phase 1 plan 01-03 — shell-quote dynamic atoms; verify_auth fails closed", "status": "done", "commit": "ebee651"}
+  ],
+  "remaining_tasks": [
+    {"id": 4, "name": "Phase 2: plan and implement _derive_launch_spec (hybrid-aware KV/context/util solver)", "status": "not_started"},
+    {"id": 5, "name": "Phase 3: curated recipe overrides + tool-parser capability map", "status": "not_started"},
+    {"id": 6, "name": "Phase 4: parameterized scripts + UI context/utilization controls", "status": "not_started"},
+    {"id": 7, "name": "Phase 5: admission truth (executor budget, docker-label reclaim, launch lock)", "status": "not_started"}
+  ],
+  "blockers": [
+    {
+      "description": "vLLM is intentionally DOWN — the GB10 is running local Helix training. No profile has been launched, so Phase 1's fixes are verified by tests, bash -n and container mount inspection, but not by a live model load.",
+      "type": "external",
+      "workaround": "Phases 2 and 3 need no vLLM and can proceed fully. Defer the live launch check until Helix training finishes."
+    }
+  ],
+  "human_actions_pending": [
+    {
+      "action": "Launch one regenerated profile (e.g. start_hf_deepseek-ai_deepseek-r1-distill-qwen-14b.sh) once vLLM is free",
+      "context": "Confirms the entrypoint fix and repo-root mount work end to end. Everything else about Phase 1 is already proven offline.",
+      "blocking": false
+    },
+    {
+      "action": "Decide whether to set app.api_key in config.json",
+      "context": "verify_auth now fails closed on a non-loopback bind, but the installed unit sets MODEL_MANAGER_ALLOW_UNAUTH=1, so the service currently runs in acknowledged-open mode and logs every unauthenticated mutation. Setting a key would close it properly.",
+      "blocking": false
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "Bootstrapped .planning/ by hand instead of running /gsd-new-project",
+      "rationale": "The repo had no .planning. /gsd-new-project spawns four research agents to derive context that an 18-minute Codex xhigh audit plus live verification had just established. Roadmap was written directly from verified findings.",
+      "phase": "1"
+    },
+    {
+      "decision": "Keep nvidia_entrypoint.sh and pass `vllm serve` as the container command, rather than `docker run --entrypoint vllm`",
+      "rationale": "Bypassing the entrypoint discards the image's CUDA environment setup. With vLLM down that regression class cannot be detected, and the known-good hand-written qwen3-8b profile on this box already uses the command form.",
+      "phase": "1"
+    },
+    {
+      "decision": "verify_auth fails closed at the request layer (503), not at startup",
+      "rationale": "The installed unit already carries MODEL_MANAGER_ALLOW_UNAUTH=1, so the live service keeps running and merely starts logging unauthenticated mutations, while an unconfigured deployment refuses them. A startup abort would have taken the running service down on restart.",
+      "phase": "1"
+    },
+    {
+      "decision": "Grammar validation AND shlex.quote, not either alone",
+      "rationale": "Grammar makes the injection unreachable; quoting is defence-in-depth if the grammar is ever loosened. The $HOME cache mount is deliberately exempt from quoting because it relies on launch-time shell expansion.",
+      "phase": "1"
+    },
+    {
+      "decision": "Derived settings must be hybrid-attention-aware before anything else in Phase 2",
+      "rationale": "Measured on this box: a naive num_hidden_layers KV estimate overestimates by 4-11x on every hybrid model here. A recommender without it would refuse context that is actually free.",
+      "phase": "2"
+    }
+  ],
+  "uncommitted_files": [],
+  "next_action": "Run /gsd-plan-phase 2 to plan the derived launch spec. The solver's shape is already validated — see the prototype at /tmp/kvcalc.py and the KV table in .continue-here.md. It produced 0.54 for qwen3-next-80b against a hand-measured 0.55, which is the calibration check to reproduce as a test.",
+  "context_notes": "Phase 1 was reactive (three confirmed outages found by audit). Phase 2 is the work Josh originally asked for: context options and recommended settings. The key insight driving it is that --max-model-len is nearly free on this box's hybrid/MoE models (Qwen3.6 needs only ~2.7 GB of fp8 KV at its full 262144 context) while --gpu-memory-utilization is the real memory lever. The generator's flat 32768/0.75 defaults contradict the hand-measured recipes on both counts. Phase 2 is a pure function and fully testable with vLLM down."
+}

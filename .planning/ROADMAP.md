@@ -16,7 +16,7 @@ into the generator and the UI.
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 1: Unbreak the load path** - Fix the three confirmed outages and the injection hole
+- [x] **Phase 1: Unbreak the load path** - Fix the three confirmed outages and the injection hole
 - [ ] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [ ] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
@@ -43,9 +43,9 @@ request can put shell metacharacters into an executable start script.
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Fix the HF download worker (`_HF_XFER`); guarantee exactly one terminal event per download stream (wave 1)
-- [ ] 01-02-PLAN.md — Make `vllm serve` an image property; regenerate the stale DeepSeek profiles (wave 2)
-- [ ] 01-03-PLAN.md — Shell-quote every dynamic atom; close the non-loopback no-key auth hole (wave 3)
+- [x] 01-01-PLAN.md — Fix the HF download worker (`_HF_XFER`); guarantee exactly one terminal event per download stream (wave 1)
+- [x] 01-02-PLAN.md — Make `vllm serve` an image property; regenerate the stale DeepSeek profiles (wave 2)
+- [x] 01-03-PLAN.md — Shell-quote every dynamic atom; close the non-loopback no-key auth hole (wave 3)
 
 ### Phase 2: Derived launch spec
 **Goal**: A pure function turns a model's `config.json` into correct context/memory numbers,
