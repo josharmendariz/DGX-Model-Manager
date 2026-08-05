@@ -32,6 +32,18 @@ with MODEL_FIXTURES_PATH.open(encoding="utf-8") as _fh:
 MODEL_ROWS = _SNAPSHOT["models"]
 MODEL_IDS = [row["name"] for row in MODEL_ROWS]
 
+# The 5 models that declare a sliding_window while having use_sliding_window false. Reading
+# the window without the guard reclassifies all of them as fully-sliding and collapses a
+# 17.2 GB dense KV estimate to near zero — a silent wrong answer, not a crash (T-02-02).
+TRAPPED_ROWS = [
+    row for row in MODEL_ROWS
+    if row.get("sliding_window") and row.get("use_sliding_window") is False
+]
+TRAPPED_IDS = [row["name"] for row in TRAPPED_ROWS]
+
+NESTED_ROWS = [row for row in MODEL_ROWS if row.get("nested_text_config")]
+NESTED_IDS = [row["name"] for row in NESTED_ROWS]
+
 # Transformer fields copied verbatim from a fixture row into the rebuilt config.
 _PLAIN_FIELDS = (
     "num_hidden_layers",
@@ -103,6 +115,84 @@ def test_precedence_fixture_vocabulary_is_closed():
     assert seen <= known, f"snapshot names an unimplemented branch: {seen - known}"
 
 
+def test_precedence_first_hit_wins_as_fields_are_removed():
+    """One config carrying every topology field resolves them in a fixed order.
+
+    Peeling the fields off one at a time is the only way to prove the *order* rather than
+    the individual branches — a refactor that reorders the chain still passes every
+    single-field test.
+    """
+    config = {
+        "num_hidden_layers": 48,
+        "layer_types": ["full_attention"] * 12 + ["linear_attention"] * 36,
+        "hybrid_override_pattern": "*" * 6 + "M" * 42,
+        "full_attention_interval": 4,
+        "sliding_window": 4096,
+        "use_sliding_window": True,
+    }
+    assert appmod._resolve_attention_topology(config)["source_field"] == "layer_types"
+
+    config.pop("layer_types")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "hybrid_override_pattern"
+
+    config.pop("hybrid_override_pattern")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "full_attention_interval"
+
+    config.pop("full_attention_interval")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "sliding_window"
+
+    config.pop("sliding_window")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "dense"
+
+
+def test_precedence_empty_topology_fields_do_not_claim_the_chain():
+    """An empty list or empty string must fall through, not resolve to zero layers."""
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 10, "layer_types": [], "hybrid_override_pattern": ""}
+    )
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 10
+
+
+def test_precedence_full_attention_interval_is_synthetic_only():
+    """V1b: no model on this box selects this branch, so it needs a synthetic config.
+
+    Qwen3.6 and qwen3-next both declare full_attention_interval=4 *and* layer_types, and
+    layer_types wins — the counts coincide (48//4 == 12) purely by arithmetic luck, which is
+    exactly why the handoff's attribution was wrong. Without this test the branch ships
+    untested.
+    """
+    assert not any(row["precedence_field"] == "full_attention_interval" for row in MODEL_ROWS)
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 48, "full_attention_interval": 4}
+    )
+    assert topo["source_field"] == "full_attention_interval"
+    assert topo["full_attention_layers"] == 12
+    assert topo["stateless_layers"] == 36
+    assert topo["bounded_kv_layers"] == 0
+
+
+def test_precedence_interval_larger_than_layer_count_does_not_crash():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 2, "full_attention_interval": 8}
+    )
+    assert topo["full_attention_layers"] == 0
+    assert topo["stateless_layers"] == 2
+
+
+def test_precedence_returns_exactly_the_interface_keys():
+    expected = {
+        "num_hidden_layers",
+        "full_attention_layers",
+        "bounded_kv_layers",
+        "stateless_layers",
+        "sliding_window",
+        "source_field",
+        "warnings",
+    }
+    assert set(appmod._resolve_attention_topology({})) == expected
+
+
 # ── V2 hybrid counts (17-model table) ─────────────────────────────────────────
 
 @pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
@@ -138,6 +228,62 @@ def test_unknown_layer_types_absent_from_snapshot():
             assert set(dist) <= known_pattern_chars, row["name"]
 
 
+def test_unknown_layer_type_counts_as_full_and_warns():
+    """T-02-01: an unrecognized layer type must over-reserve loudly, never score zero.
+
+    The prototype counted `x == "full_attention"` and `"sliding" in x`, so anything else fell
+    through both buckets and silently contributed zero KV. That is accidentally correct for
+    linear_attention today and actively dangerous for any future type that does carry KV: the
+    recommender would confidently under-reserve and OOM at model load.
+    """
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 1, "layer_types": ["quantum_attention"]}
+    )
+    assert topo["full_attention_layers"] == 1
+    assert topo["stateless_layers"] == 0
+    assert topo["bounded_kv_layers"] == 0
+    assert len(topo["warnings"]) == 1
+    assert topo["warnings"][0].startswith("unknown layer type: ")
+    assert "quantum_attention" in topo["warnings"][0]
+
+
+def test_unknown_layer_type_mixed_with_known_types_keeps_the_partition():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 4, "layer_types": ["full_attention", "linear_attention",
+                                                 "quantum_attention", "sliding_attention"]}
+    )
+    assert topo["full_attention_layers"] == 2  # the known full one plus the unknown one
+    assert topo["bounded_kv_layers"] == 1
+    assert topo["stateless_layers"] == 1
+    assert len(topo["warnings"]) == 1
+
+
+def test_unknown_layer_pattern_character_counts_as_full_and_warns():
+    """Same rule for an unrecognized character in a Nemotron-style pattern."""
+    topo = appmod._resolve_attention_topology({"hybrid_override_pattern": "*MEZ"})
+    assert topo["full_attention_layers"] == 2  # '*' plus the unknown 'Z'
+    assert topo["stateless_layers"] == 2
+    # num_hidden_layers falls back to the pattern length when the config omits it, so the
+    # three classes always partition the reported total.
+    assert topo["num_hidden_layers"] == 4
+    assert len(topo["warnings"]) == 1
+    assert topo["warnings"][0].startswith("unknown layer type: ")
+
+
+def test_unknown_layer_types_warn_once_per_distinct_type():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 30, "layer_types": ["quantum_attention"] * 20 + ["warp_attention"] * 10}
+    )
+    assert topo["full_attention_layers"] == 30
+    assert len(topo["warnings"]) == 2
+
+
+def test_unknown_layer_types_absent_means_no_warnings_on_real_models():
+    for row in MODEL_ROWS:
+        topo = appmod._resolve_attention_topology(config_from_fixture(row))
+        assert topo["warnings"] == [], f"{row['name']}: {topo['warnings']}"
+
+
 # ── V4 use_sliding_window guard ───────────────────────────────────────────────
 
 def test_sliding_guard_snapshot_anomalies_are_recorded_dense():
@@ -153,6 +299,44 @@ def test_sliding_guard_snapshot_anomalies_are_recorded_dense():
         assert row["bounded_kv_layers"] == 0, row["name"]
 
 
+def test_sliding_guard_window_without_use_flag_stays_dense():
+    """T-02-02: `sliding_window` alone must not claim the chain."""
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 64, "sliding_window": 131072, "use_sliding_window": False}
+    )
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 64
+    assert topo["bounded_kv_layers"] == 0
+    # The vestigial window is not reported: no layer is bounded, so no window applies.
+    assert topo["sliding_window"] is None
+
+
+def test_sliding_guard_window_with_use_flag_bounds_every_layer():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 32, "sliding_window": 4096, "use_sliding_window": True}
+    )
+    assert topo["source_field"] == "sliding_window"
+    assert topo["bounded_kv_layers"] == 32
+    assert topo["full_attention_layers"] == 0
+    assert topo["sliding_window"] == 4096
+
+
+def test_sliding_guard_missing_use_flag_stays_dense():
+    """Absent is not truthy: a config that never declares the flag is dense, not sliding."""
+    topo = appmod._resolve_attention_topology({"num_hidden_layers": 8, "sliding_window": 512})
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 8
+
+
+@pytest.mark.parametrize("row", TRAPPED_ROWS, ids=TRAPPED_IDS)
+def test_sliding_guard_real_trapped_model_keeps_full_kv(row):
+    """The 5 real configs carrying the trap resolve dense against the shipped helper."""
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == row["num_hidden_layers"]
+    assert topo["bounded_kv_layers"] == 0
+
+
 # ── V5 text_config nesting ────────────────────────────────────────────────────
 
 def test_text_config_nesting_and_hybridity_are_independent_axes():
@@ -161,6 +345,34 @@ def test_text_config_nesting_and_hybridity_are_independent_axes():
     assert len(nested) >= 2
     fields = {row["precedence_field"] for row in nested}
     assert "dense" in fields and fields - {"dense"}
+
+
+def test_text_config_nested_resolves_identically_to_flat():
+    """Nesting is a packaging detail; it must not change a single number."""
+    flat = {
+        "num_hidden_layers": 40,
+        "layer_types": ["full_attention"] * 10 + ["linear_attention"] * 30,
+    }
+    nested = {"text_config": dict(flat)}
+    assert appmod._resolve_attention_topology(nested) == appmod._resolve_attention_topology(flat)
+
+
+def test_text_config_nested_fields_are_not_read_as_zero():
+    """A VL-style config with nothing at top level must not resolve to an empty model."""
+    topo = appmod._resolve_attention_topology(
+        {"text_config": {"num_hidden_layers": 40,
+                         "layer_types": ["full_attention"] * 10 + ["linear_attention"] * 30}}
+    )
+    assert topo["num_hidden_layers"] == 40
+    assert topo["full_attention_layers"] == 10
+    assert topo["stateless_layers"] == 30
+
+
+@pytest.mark.parametrize("row", NESTED_ROWS, ids=NESTED_IDS)
+def test_text_config_real_nested_model_resolves(row):
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["num_hidden_layers"] == row["num_hidden_layers"]
+    assert topo["full_attention_layers"] == row["full_attention_layers"]
 
 
 # ── V6 head_dim fallback ──────────────────────────────────────────────────────
