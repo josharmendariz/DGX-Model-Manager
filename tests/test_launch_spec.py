@@ -521,6 +521,230 @@ def test_head_dim_kv_heads_fall_back_to_attention_heads():
     assert result["per_layer_bytes"] == 1024
 
 
+# ── Budget: the page-cache-corrected KV headroom ──────────────────────────────
+
+# Qwen3.6-35B-A3B-FP8's weights in decimal GB, the row the GB10 page-cache regime change was
+# measured on. Kept as a constant so the budget tests and the calibration tests below cannot
+# drift apart on the input.
+QWEN36_WEIGHTS_GB = 37.46366216
+
+
+def test_budget_idle_box_matches_the_hand_measured_recipe():
+    """At the hand-validated 0.55 with nothing resident, Qwen3.6 has ~23.09 GB of KV headroom."""
+    assert round(appmod._kv_budget_gb(0.55, 121.0, QWEN36_WEIGHTS_GB), 2) == 23.09
+
+
+def test_budget_resident_page_cache_is_charged_against_the_pool():
+    """The measured Phase 1.1 failure: CUDA reports MemFree, not MemAvailable.
+
+    With ~25 GB of page cache resident, an unchanged 0.55 yielded 0.19 GiB of usable KV
+    instead of 25.97 GiB and the engine refused to start, blaming max_model_len. The budget
+    must reproduce that collapse rather than assume the whole pool is free.
+    """
+    assert appmod._kv_budget_gb(0.55, 121.0, QWEN36_WEIGHTS_GB, resident_gb=25.0) == 0.0
+
+
+def test_budget_never_returns_a_negative_headroom():
+    """A budget smaller than the model is 0.0, not a negative number a caller would add."""
+    assert appmod._kv_budget_gb(0.95, 121.0, 10_000.0) == 0.0
+    assert appmod._kv_budget_gb(0.0, 121.0, 0.0) == 0.0
+
+
+def test_budget_is_the_pool_share_minus_resident_weights_and_overhead():
+    assert appmod._kv_budget_gb(0.5, 100.0, 10.0, overhead_gb=5.0, resident_gb=5.0) == 30.0
+
+
+def test_budget_rises_with_util_and_falls_with_resident():
+    rising = [appmod._kv_budget_gb(u, 121.0, 30.0) for u in (0.5, 0.6, 0.7)]
+    assert rising == sorted(rising) and len(set(rising)) == 3
+    falling = [appmod._kv_budget_gb(0.9, 121.0, 30.0, resident_gb=r) for r in (0.0, 5.0, 10.0)]
+    assert falling == sorted(falling, reverse=True) and len(set(falling)) == 3
+
+
+# ── Fitting: context, max_model_len and the utilization solver ────────────────
+
+QWEN3_NEXT_CONFIG = {
+    "num_hidden_layers": 48,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "max_position_embeddings": 262144,
+    "layer_types": ["full_attention"] * 12 + ["linear_attention"] * 36,
+}
+QWEN3_NEXT_WEIGHTS_GB = 50.75774832
+
+
+def test_fitting_returns_exactly_the_sixteen_interface_keys():
+    expected = {
+        "topology",
+        "num_hidden_layers",
+        "full_attention_layers",
+        "bounded_kv_layers",
+        "stateless_layers",
+        "source_field",
+        "kv_bytes_per_token",
+        "bounded_bytes_total",
+        "declared_max_context",
+        "max_fitting_context",
+        "max_model_len",
+        "kv_gb",
+        "weights_gb",
+        "overhead_gb",
+        "recommended_util",
+        "warnings",
+    }
+    spec = appmod._derive_launch_spec({})
+    assert set(spec) == expected
+    assert len(spec) == 16
+
+
+def test_fitting_echoes_the_topology_and_its_source_field():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG)
+    assert spec["source_field"] == spec["topology"]["source_field"] == "layer_types"
+    assert spec["full_attention_layers"] == 12
+    assert spec["stateless_layers"] == 36
+    assert spec["bounded_kv_layers"] == 0
+    assert spec["num_hidden_layers"] == 48
+    assert appmod._derive_launch_spec(
+        {"num_hidden_layers": 4, "hybrid_override_pattern": "*MMM"}
+    )["source_field"] == "hybrid_override_pattern"
+
+
+def test_fitting_kv_gb_is_the_rate_times_context_plus_the_bounded_total():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=QWEN3_NEXT_WEIGHTS_GB)
+    assert spec["kv_bytes_per_token"] == 12288
+    assert spec["max_model_len"] == 262144
+    assert round(spec["kv_gb"], 3) == 3.221
+    expected = (spec["kv_bytes_per_token"] * spec["max_model_len"]
+                + spec["bounded_bytes_total"]) / 1e9
+    assert abs(spec["kv_gb"] - expected) < 1e-9
+
+
+def test_fitting_bounded_layers_add_a_context_independent_total():
+    """gpt-oss's 18 windowed layers cost the same at 8k as at 131k."""
+    config = {
+        "num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 64,
+        "sliding_window": 128, "max_position_embeddings": 131072,
+        "layer_types": ["full_attention"] * 18 + ["sliding_attention"] * 18,
+    }
+    spec = appmod._derive_launch_spec(config, weights_gb=65.248893184)
+    assert spec["bounded_bytes_total"] == 2359296
+    assert spec["kv_gb"] == (18432 * spec["max_model_len"] + 2359296) / 1e9
+
+
+def test_fitting_max_model_len_never_exceeds_the_declared_maximum():
+    """A huge budget must not invent context the model was never trained for."""
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=1.0)
+    assert spec["max_fitting_context"] > spec["declared_max_context"] == 262144
+    assert spec["max_model_len"] == 262144
+
+
+def test_fitting_budget_binds_below_the_declared_maximum_and_warns():
+    """When memory is the binding limit, the warning must name both numbers."""
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=107.0)
+    assert 0 < spec["max_model_len"] == spec["max_fitting_context"] < 262144
+    assert any("262144" in w and str(spec["max_fitting_context"]) in w
+               for w in spec["warnings"]), spec["warnings"]
+
+
+def test_fitting_all_stateless_model_is_not_kv_bounded():
+    """With no full-attention layer, context costs nothing and the declared max applies."""
+    spec = appmod._derive_launch_spec(
+        {"num_hidden_layers": 40, "layer_types": ["linear_attention"] * 40,
+         "max_position_embeddings": 262144}
+    )
+    assert spec["kv_bytes_per_token"] == 0
+    assert spec["max_fitting_context"] == 262144
+    assert spec["max_model_len"] == 262144
+    assert any("not KV-bounded" in w for w in spec["warnings"])
+
+
+def test_fitting_nested_text_config_resolves_context_and_layers_from_the_nest():
+    spec = appmod._derive_launch_spec(
+        {"text_config": {"num_hidden_layers": 36, "num_key_value_heads": 8,
+                         "head_dim": 128, "max_position_embeddings": 262144}},
+        weights_gb=6.021235456,
+    )
+    assert spec["declared_max_context"] == 262144
+    assert spec["full_attention_layers"] == 36
+
+
+def test_fitting_requested_context_caps_max_model_len():
+    spec = appmod._derive_launch_spec(
+        QWEN3_NEXT_CONFIG, weights_gb=QWEN3_NEXT_WEIGHTS_GB, requested_context=32768
+    )
+    assert spec["max_model_len"] == 32768
+    assert spec["kv_gb"] < 1.0
+
+
+def test_fitting_util_reproduces_the_prototype_on_an_idle_box():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=QWEN3_NEXT_WEIGHTS_GB)
+    assert spec["recommended_util"] == 0.54
+
+
+def test_fitting_util_rises_with_resident_memory():
+    """Resident bytes are charged against the same budget, so the ask must grow."""
+    utils = [
+        appmod._derive_launch_spec(
+            QWEN3_NEXT_CONFIG, weights_gb=QWEN3_NEXT_WEIGHTS_GB, resident_gb=r
+        )["recommended_util"]
+        for r in (0.0, 10.0, 20.0)
+    ]
+    assert utils == [0.54, 0.62, 0.7]
+    assert utils == sorted(utils) and len(set(utils)) == 3
+
+
+def test_fitting_util_clamps_up_to_the_floor_on_a_tiny_model():
+    """Qwen2.5-0.5B computes ~0.091, which must not be handed to a launch as 0.09."""
+    spec = appmod._derive_launch_spec(
+        {"num_hidden_layers": 24, "num_key_value_heads": 2, "head_dim": 64,
+         "max_position_embeddings": 32768},
+        weights_gb=0.011488523,
+    )
+    assert spec["recommended_util"] == 0.10
+
+
+def test_fitting_util_clamps_down_to_the_cap_on_an_absurd_model():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=10_000.0)
+    assert spec["recommended_util"] == 0.95
+    assert spec["max_fitting_context"] == 0
+
+
+def test_fitting_invalid_pool_short_circuits_instead_of_dividing_by_zero():
+    """T-02-07: pool_gb <= 0 is a caller bug, and must surface as a warning not a traceback."""
+    spec = appmod._derive_launch_spec({"num_hidden_layers": 4}, pool_gb=0)
+    assert spec["recommended_util"] == 0.95
+    assert spec["max_fitting_context"] == 0
+    assert spec["warnings"][0].startswith("invalid pool_gb")
+
+
+def test_fitting_non_numeric_scalars_are_coerced_and_named_in_a_warning():
+    """T-02-06: a bad input is visible in `warnings`, never silently zero."""
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb="banana")
+    assert spec["weights_gb"] == 0.0
+    assert any("weights_gb" in w for w in spec["warnings"]), spec["warnings"]
+
+
+def test_fitting_negative_scalars_floor_at_zero_and_warn():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=-40.0)
+    assert spec["weights_gb"] == 0.0
+    assert any("weights_gb" in w for w in spec["warnings"]), spec["warnings"]
+
+
+def test_fitting_topology_warnings_are_propagated_to_the_caller():
+    """T-02-11: an unknown layer type must stay visible at the public entry point."""
+    spec = appmod._derive_launch_spec(
+        {"num_hidden_layers": 2, "num_key_value_heads": 2, "head_dim": 64,
+         "layer_types": ["full_attention", "quantum_attention"]}
+    )
+    assert any("quantum_attention" in w for w in spec["warnings"]), spec["warnings"]
+
+
+def test_fitting_echoes_its_scalar_inputs_back():
+    spec = appmod._derive_launch_spec(QWEN3_NEXT_CONFIG, weights_gb=12.5, overhead_gb=7.5)
+    assert spec["weights_gb"] == 12.5
+    assert spec["overhead_gb"] == 7.5
+
+
 # ── V7 calibration (plan 02-02) ───────────────────────────────────────────────
 
 @pytest.mark.skip(reason="plan 02-02")
