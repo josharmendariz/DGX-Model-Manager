@@ -732,6 +732,137 @@ def _infer_from_config(config: dict, name_hints: dict) -> dict:
             "modalities": modalities, "arch_str": arch_str}
 
 
+# ── Derived launch spec: attention topology and KV sizing ────────────────────
+# Layer types that hold NO KV cache at all: their state is a fixed-size recurrent tensor,
+# independent of context length. Mis-filing one of these as attention is what produces the
+# 4-11x overestimate the naive num_hidden_layers count gives on every hybrid model here.
+_KV_STATELESS_LAYER_TYPES = frozenset({"linear_attention", "mamba", "recurrent"})
+# Nemotron's hybrid_override_pattern alphabet: M = Mamba, E = MLP/expert, * = attention.
+# Only '*' carries KV, so len(pattern) - count('*') is a stateless count, NOT a sliding one.
+_PATTERN_FULL_CHAR = "*"
+_PATTERN_STATELESS_CHARS = frozenset({"M", "E"})
+
+
+def _as_int(value, default: int = 0) -> int:
+    """Coerce a vendor-authored config value to int, falling back instead of raising."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_attention_topology(config: dict) -> dict:
+    """Classify a model's layers into full / bounded / stateless KV from its parsed config.
+
+    WHY this exists: a naive `num_hidden_layers` KV estimate overestimates by 4-11x on every
+    hybrid model on this box, because most of their layers hold no KV cache at all. A
+    recommender without this classification refuses context that is actually free — an
+    88-layer Nemotron carries only 8 attention layers, and a 40-layer Qwen3.6 only 10.
+
+    There are THREE KV classes, not two:
+      full      — grows with context: bytes/token x max_model_len
+      bounded   — capped by a sliding window: bytes/token x sliding_window
+      stateless — zero, a fixed recurrent state (linear_attention, Mamba/expert layers)
+
+    Precedence chain, first hit wins, verified against all 17 configs present here:
+      layer_types -> hybrid_override_pattern -> full_attention_interval ->
+      sliding_window AND use_sliding_window -> dense.
+    The order matters and is not cosmetic: Qwen3.6 and qwen3-next declare BOTH `layer_types`
+    and `full_attention_interval`, and only agree by arithmetic luck (48 // 4 == 12).
+
+    Two traps this deliberately guards:
+      1. An unrecognized layer type is counted as FULL attention and reported in `warnings`,
+         never silently dropped to zero. Over-reserving memory is recoverable; under-reserving
+         OOMs at model load, and it is a silent wrong answer rather than a crash.
+      2. `sliding_window` is only honoured when `use_sliding_window` is also truthy. Five of
+         the seventeen models here declare a window while having the flag false; reading the
+         window alone would collapse a 17.2 GB dense KV estimate to near zero.
+
+    Pure: dict in, dict out. No filesystem, network, /proc or vLLM. Pool size and weights are
+    the caller's parameters, not lookups — the whole phase must be verifiable with vLLM down.
+
+    Returns {num_hidden_layers, full_attention_layers, bounded_kv_layers, stateless_layers,
+    sliding_window, source_field, warnings}. `sliding_window` is the window that applies to
+    the bounded layers, or None when no layer is bounded — a dense model's vestigial window is
+    deliberately not reported, so a caller cannot multiply by it.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    # VL and nested-text models carry the transformer fields under text_config; read there.
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    declared = _as_int(t.get("num_hidden_layers"))
+    warns: list[str] = []
+    seen_unknown: set[str] = set()
+
+    def _warn_unknown(label: str) -> None:
+        # One warning per distinct unknown type: a 40-layer model of unknown layers should
+        # produce one actionable line, not forty.
+        if label in seen_unknown:
+            return
+        seen_unknown.add(label)
+        warns.append(f"unknown layer type: {label!r} — counted as full attention")
+
+    def _result(source: str, total: int, full: int, bounded: int, stateless: int,
+                window) -> dict:
+        return {
+            "num_hidden_layers": total,
+            "full_attention_layers": full,
+            "bounded_kv_layers": bounded,
+            "stateless_layers": stateless,
+            "sliding_window": window if bounded > 0 else None,
+            "source_field": source,
+            "warnings": warns,
+        }
+
+    # 1. Explicit per-layer list (Qwen3.6, qwen3-next, gpt-oss).
+    layer_types = t.get("layer_types")
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        full = bounded = stateless = 0
+        for entry in layer_types:
+            name = str(entry)
+            if name == "full_attention":
+                full += 1
+            elif "sliding" in name:
+                bounded += 1
+            elif name in _KV_STATELESS_LAYER_TYPES:
+                stateless += 1
+            else:
+                _warn_unknown(name)
+                full += 1
+        return _result("layer_types", declared or len(layer_types), full, bounded, stateless,
+                       _as_int(t.get("sliding_window")) or None)
+
+    # 2. Nemotron-style pattern string.
+    pattern = t.get("hybrid_override_pattern")
+    if isinstance(pattern, str) and pattern:
+        full = stateless = 0
+        for ch in pattern:
+            if ch == _PATTERN_FULL_CHAR:
+                full += 1
+            elif ch in _PATTERN_STATELESS_CHARS:
+                stateless += 1
+            else:
+                _warn_unknown(ch)
+                full += 1
+        return _result("hybrid_override_pattern", declared or len(pattern), full, 0, stateless,
+                       None)
+
+    # 3. Every Nth layer is attention; the rest hold no KV.
+    interval = _as_int(t.get("full_attention_interval"))
+    if interval > 0:
+        full = declared // interval
+        return _result("full_attention_interval", declared, full, 0, declared - full, None)
+
+    # 4. Uniformly windowed — only when the model actually enables the window.
+    window = _as_int(t.get("sliding_window"))
+    if window > 0 and t.get("use_sliding_window"):
+        return _result("sliding_window", declared, 0, declared, 0, window)
+
+    # 5. Dense fallback: every layer is full attention.
+    return _result("dense", declared, declared, 0, 0, None)
+
+
 def _parse_hf_model_dir(model_dir: Path, all_profiles: list = None) -> dict:
     """Parse a single HF cache model directory (models--owner--name)."""
     stem = model_dir.name
