@@ -2185,6 +2185,739 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
     return {"ok": True, "message": f"Launched {profile['name']} — logs at {log_path}"}
 
 
+# ── Unified-memory visibility ─────────────────────────────────────────────────
+# On GB10 the GPU and system RAM are one pool, and CUDA's mem_get_info reports
+# *free* memory — NOT MemAvailable. Page cache is reclaimable by the kernel but
+# CUDA counts it as unavailable, so vLLM's budget is
+#
+#     usable = MemTotal * gpu_memory_utilization - (MemTotal - MemFree)
+#
+# Reading a 37 GB safetensors set fills the page cache, and that cache is then
+# charged against the very budget that has to hold those weights. Observed
+# 2026-08-04 on Qwen3.6-35B-A3B-FP8 at an unchanged util of 0.55:
+#
+#     buff/cache ~25 GB  ->  Available KV cache memory  0.19 GiB  (refused to start)
+#     buff/cache  ~2 GB  ->  Available KV cache memory 25.97 GiB  (ready in 165s)
+#
+# This is why admission based on MemAvailable (see _get_available_memory_gb) can
+# pass while the launch still dies in engine init: MemAvailable counts the page
+# cache as free, and CUDA does not.
+
+_MEM_RECLAIM_WARN_GIB = 8      # page cache above this measurably shrinks the budget
+_MEM_RECLAIM_FAIL_GIB = 20     # at this point a full-context launch will very likely fail
+_DROP_CACHES_CMD = "sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+
+
+def _cuda_visible_memory() -> dict:
+    """MemTotal/MemFree/reclaimable in GiB, from CUDA's point of view.
+
+    Deliberately reports MemFree rather than MemAvailable: the gap between them
+    is exactly the page cache that vLLM cannot use but is still billed for.
+    """
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                vals[k] = int(v.split()[0])
+    except Exception as e:
+        return {"error": str(e)}
+    gib = lambda kb: kb / 1024 / 1024
+    total = gib(vals.get("MemTotal", 0))
+    free = gib(vals.get("MemFree", 0))
+    reclaimable = gib(vals.get("Cached", 0) + vals.get("Buffers", 0)
+                      - vals.get("Shmem", 0))
+    return {
+        "total_gib": round(total, 1),
+        "free_gib": round(free, 1),
+        "available_gib": round(gib(vals.get("MemAvailable", 0)), 1),
+        "reclaimable_gib": round(max(reclaimable, 0.0), 1),
+        "cuda_unavailable_gib": round(max(total - free, 0.0), 1),
+    }
+
+
+def _vllm_budget_gib(util: float, mem: dict) -> dict:
+    """What vLLM will actually have to work with at `util`, and what a cache drop buys."""
+    total = mem.get("total_gib", 0.0)
+    unavailable = mem.get("cuda_unavailable_gib", 0.0)
+    reclaimable = mem.get("reclaimable_gib", 0.0)
+    budget = total * util
+    return {
+        "util": util,
+        "budget_gib": round(budget, 1),
+        "charged_gib": round(unavailable, 1),
+        "usable_gib": round(budget - unavailable, 1),
+        "usable_after_reclaim_gib": round(budget - max(unavailable - reclaimable, 0.0), 1),
+    }
+
+
+# ── vLLM load-progress parsing ────────────────────────────────────────────────
+# Phase weights are wall-clock share of a measured cold start, not equal slices:
+# on this box weight load is ~30s of a ~165s start while torch.compile plus graph
+# capture is ~65s, so an evenly-weighted bar would sit at "loading weights" and
+# then jump. Percentages are the value at which the phase BEGINS.
+
+_LOAD_PHASES = [
+    ("starting",         3,  "Container starting"),
+    ("engine_init",     10,  "Initializing engine"),
+    ("loading_weights", 30,  "Loading weights"),
+    ("compiling",       45,  "Compiling model (torch.compile)"),
+    ("profiling",       62,  "Profiling memory"),
+    ("kv_cache",        78,  "Sizing KV cache"),
+    ("capturing",       88,  "Capturing CUDA graphs"),
+    ("ready",          100,  "Ready"),
+]
+_PHASE_PCT = {p: pct for p, pct, _ in _LOAD_PHASES}
+_PHASE_LABEL = {p: label for p, _, label in _LOAD_PHASES}
+
+# Ordered longest-lived first: a single line can match several, and the LAST
+# matching rule wins so progress only ever moves forward.
+_LOAD_PATTERNS = [
+    ("engine_init",     _re.compile(r"Initializing a V1 LLM engine|api_utils.*non-default args")),
+    # "Model loading took" belongs here, not to profiling: it is emitted when the
+    # weights finish, and treating it as the start of profiling skipped the whole
+    # compile phase and parked the bar at 65% for a minute.
+    ("loading_weights", _re.compile(r"Loading weights|default_loader|Loading safetensors"
+                                    r"|Model loading took")),
+    ("compiling",       _re.compile(r"torch\.compile|Compiling a graph|Dynamo bytecode"
+                                    r"|Directly load the compiled graph|torch_compile_cache"
+                                    r"|backend='inductor'")),
+    ("profiling",       _re.compile(r"Memory profiling|Profiling CUDA graph memory")),
+    # Measured order on this box: estimated graph memory and the KV verdict are
+    # both logged ~10s BEFORE capture actually starts, so they precede capturing.
+    ("kv_cache",        _re.compile(r"Estimated CUDA graph memory|Available KV cache memory"
+                                    r"|GPU KV cache size|maximum concurrency")),
+    ("capturing",       _re.compile(r"Capturing CUDA graph|Graph capturing finished"
+                                    r"|CuTeDSL warmup")),
+    ("ready",           _re.compile(r"Application startup complete|Starting vLLM API server")),
+]
+
+# A container that is `Up` proves nothing: the recipe path keeps the container
+# alive and runs vLLM as an exec inside it, so engine death leaves a healthy-
+# looking container with a dead server. Death must be read from the log.
+_LOAD_FAILED_RE = _re.compile(
+    r"Engine core initialization failed"
+    r"|EngineDeadError"
+    r"|raise (ValueError|RuntimeError)\("
+    r"|torch\.OutOfMemoryError"
+    r"|CUDA out of memory"
+    r"|Error response from daemon"
+    r"|invalid option"
+)
+
+# The line worth putting in front of a human, extracted from a traceback storm.
+# Searched, not anchored: vLLM prefixes every line with "(EngineCore pid=217) ERROR
+# 08-04 03:51:46 [core.py:1231] " and the prefix shape varies by subsystem, so the
+# exception has to be found mid-line. Requiring the colon excludes the `raise
+# ValueError(` frames that appear in the traceback body above the real message.
+_LOAD_CAUSE_RE = _re.compile(
+    r"((?:torch\.)?(?:ValueError|RuntimeError|OutOfMemoryError|AssertionError|OSError|"
+    r"ImportError|MemoryError)\s*:\s*\S.*)$")
+
+
+def _classify_vllm_log_line(line: str) -> Optional[str]:
+    """Map one container log line to a load phase, or None if it says nothing new."""
+    for phase, pat in _LOAD_PATTERNS:
+        if pat.search(line):
+            return phase
+    return None
+
+
+def _load_failure_reason(lines: list) -> str:
+    """Pull the one explanatory line out of a failed startup's log tail.
+
+    vLLM reports the same error three times (EngineCore, its re-raise, then the
+    APIServer's RuntimeError wrapper) wrapped in ~90 lines of traceback. The
+    useful one is the first concrete exception message; the RuntimeError wrapper
+    ("See root cause above") is the least useful and is only a fallback.
+    """
+    fallback = ""
+    for line in lines:
+        m = _LOAD_CAUSE_RE.search(line.strip())
+        if not m:
+            continue
+        msg = " ".join(m.group(1).split())
+        if "See root cause above" in msg or "Engine core initialization failed" in msg:
+            fallback = fallback or msg
+            continue
+        return msg
+    if fallback:
+        return fallback
+    for line in reversed(lines):
+        if line.strip():
+            # Label it honestly. Presenting an arbitrary trailing line as "the
+            # error" is how a routine access-log entry got reported as the cause
+            # of a failure that had not actually happened.
+            return ("No exception was logged. Last output: "
+                    + " ".join(line.split())[:300])
+    return "Container exited without logging a cause."
+
+
+# ── Launch preflight ("dry load") ─────────────────────────────────────────────
+# Every real launch failure on this box so far was knowable before committing
+# ~100 GB of unified memory and 3 minutes of weight load:
+#
+#   2026-07-30  mount scope   — snapshots/<sha> mounted without blobs/, every
+#                               weight file a dangling symlink inside the container
+#   2026-08-04  entrypoint    — `docker run <image> --model ...` against an image
+#                               whose entrypoint execs its arguments; dead in 2s
+#   2026-08-04  memory budget — page cache charged against gpu-memory-utilization
+#
+# So preflight is static-first: parse the script, check the things that are true
+# before anything runs, and only then spend a couple of seconds in a container.
+
+_PF_IMAGE_RE   = _re.compile(r"^\s*(?:--\S+\s+)*([a-z0-9][\w./-]*(?::[\w.-]+)?)\s*\\\s*$", _re.M)
+_PF_MOUNT_RE   = _re.compile(r"-v\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+_PF_MODEL_RE   = _re.compile(r"--model[= ]\s*(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+_PF_UTIL_RE    = _re.compile(r"--gpu-memory-utilization[= ]\s*([0-9.]+)")
+_PF_RESTART_RE = _re.compile(r"--restart[= ]\s*(\S+)")
+_PF_RECIPE_RE  = _re.compile(r"run-recipe\.sh\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+
+
+def _pf(level: str, check: str, title: str, detail: str, fix: str = "") -> dict:
+    return {"level": level, "check": check, "title": title, "detail": detail, "fix": fix}
+
+
+def _first_group(m) -> str:
+    return next((g for g in m.groups() if g), "") if m else ""
+
+
+_PF_ASSIGN_RE = _re.compile(r"^\s*([A-Za-z_]\w*)=(?:\"([^\"]*)\"|'([^']*)'|(\S+))\s*$", _re.M)
+_PF_VAR_RE = _re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+# Only these come from the process environment. Scripts legitimately use $HOME in
+# mount paths, but the preflight result is returned over HTTP, so expansion is an
+# allowlist rather than a blanket os.environ lookup — nothing else gets echoed back.
+_PF_ENV_ALLOWED = ("HOME", "USER")
+
+
+def _expand_script_vars(value: str, text: str) -> str:
+    """Resolve `$VAR` against literal assignments in the same script.
+
+    Launch scripts name things once at the top (`RECIPE="qwen3.6-…-solo"`,
+    `-v "$HOME/.cache/huggingface:…"`) and use the variable below, so a parser
+    that reads the use site literally comes away with "$RECIPE" or a mount docker
+    rejects as "invalid characters for a local volume name" — and every check
+    downstream of it degrades into a false failure.
+    """
+    if "$" not in value:
+        return value
+    env = {k: os.environ[k] for k in _PF_ENV_ALLOWED if k in os.environ}
+    for m in _PF_ASSIGN_RE.finditer(text):
+        env[m.group(1)] = next((g for g in m.groups()[1:] if g is not None), "")
+    return _PF_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), value)
+
+
+def _script_code(text: str) -> str:
+    """The script with whole-line comments removed.
+
+    Load scripts carry long rationale headers that quote the very commands being
+    looked for — the Qwen3.6 profile's own comments mention `run-recipe.sh` and
+    `docker rm -f vllm_node`. Parsing the raw text makes preflight read the
+    documentation instead of the code, so every fact is taken from here.
+    """
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+def _parse_launch_script(text: str) -> dict:
+    """Extract the launch facts preflight reasons about, for either script shape."""
+    code = _script_code(text)
+    recipe = _expand_script_vars(_first_group(_PF_RECIPE_RE.search(code)), code)
+    image = ""
+    for m in _PF_IMAGE_RE.finditer(code):
+        cand = m.group(1)
+        if "/" in cand or ":" in cand:
+            image = cand
+            break
+    mounts = [_expand_script_vars(_first_group(m), code)
+              for m in _PF_MOUNT_RE.finditer(code)]
+    return {
+        "code": code,
+        "recipe": recipe,
+        "recipe_backed": bool(recipe),
+        "image": image,
+        "mounts": mounts,
+        "model": _expand_script_vars(_first_group(_PF_MODEL_RE.search(code)), code),
+        "util": float(_first_group(_PF_UTIL_RE.search(code)) or 0) or None,
+        "restart": _first_group(_PF_RESTART_RE.search(code)),
+        "has_serve": bool(_re.search(r"^\s*vllm serve\b", code, _re.M)),
+        "clears_container": "docker rm -f vllm_node" in code,
+    }
+
+
+def _preflight_static(text: str, cfg: dict) -> list:
+    """Checks that need nothing but the script text. Pure — unit-testable."""
+    facts = _parse_launch_script(text)
+    out = []
+
+    if facts["recipe_backed"]:
+        out.append(_pf("ok", "shape", "Recipe-backed profile",
+                       f"Delegates to run-recipe.sh recipe '{facts['recipe']}'. "
+                       "Launch flags are owned by the recipe YAML, not by this script."))
+    else:
+        expected = _vllm_serve_command(facts["image"], cfg)
+        if expected and not facts["has_serve"]:
+            out.append(_pf(
+                "fail", "entrypoint", "Missing `vllm serve` subcommand",
+                f"Image '{facts['image'] or '(unparsed)'}' execs its arguments, so the "
+                f"container will try to exec `--model` and exit 2 within seconds.",
+                f"Insert `{expected} \\` immediately after the image line."))
+        elif not expected and facts["has_serve"]:
+            out.append(_pf(
+                "fail", "entrypoint", "Unexpected `vllm serve` subcommand",
+                f"Image '{facts['image']}' already starts the API server, so `vllm serve` "
+                f"is passed to it as a positional model argument.",
+                "Remove the `vllm serve` line."))
+        else:
+            out.append(_pf("ok", "entrypoint", "Entrypoint contract matches image",
+                           f"'{facts['image'] or 'image'}' "
+                           f"{'needs' if expected else 'does not need'} an explicit "
+                           f"`vllm serve`, and the script "
+                           f"{'has' if facts['has_serve'] else 'omits'} one."))
+
+    if facts["restart"]:
+        out.append(_pf(
+            "warn", "restart_policy", f"Script sets --restart {facts['restart']}",
+            "A failed launch will be resurrected across reboot under the name "
+            "vllm_node. run-recipe.sh treats any existing vllm_node as 'already "
+            "running' and skips its own launch, so a broken profile can keep the "
+            "box's default model down indefinitely.",
+            "Remove --restart; vllm-default-model.service owns boot recovery."))
+
+    if not facts["clears_container"]:
+        out.append(_pf(
+            "warn", "collision", "Script does not clear the existing container",
+            "Without `docker rm -f vllm_node` a previous container keeps the name and "
+            "the port, and the launch either fails or is silently skipped.",
+            "Add `docker rm -f vllm_node 2>/dev/null || true` before launching."))
+
+    if facts["model"] and not facts["recipe_backed"]:
+        under_mount = any(facts["model"].startswith(m.split(":", 1)[-1].rstrip("/"))
+                          for m in facts["mounts"] if ":" in m)
+        if not under_mount:
+            out.append(_pf(
+                "warn", "mount_scope", "Model path is not under any bind mount",
+                f"--model points at {facts['model']} but no -v maps a container path "
+                f"containing it. HF snapshot dirs are symlinks into ../../blobs/, so a "
+                f"mount scoped to snapshots/<sha> leaves every weight file dangling.",
+                "Mount the models--*/ root, not the snapshot subdirectory."))
+    return out
+
+
+def _preflight_memory(util: Optional[float]) -> list:
+    """The budget check. `util` None means the script did not declare one."""
+    mem = _cuda_visible_memory()
+    if "error" in mem:
+        return [_pf("warn", "memory", "Could not read /proc/meminfo", mem["error"])]
+    reclaim = mem["reclaimable_gib"]
+    budget = _vllm_budget_gib(util, mem) if util else None
+    arith = ""
+    if budget:
+        arith = (f" At util {util}, vLLM's budget is {budget['budget_gib']} GiB, of which "
+                 f"{budget['charged_gib']} GiB is already charged as unavailable — leaving "
+                 f"{budget['usable_gib']} GiB. Reclaiming the cache would raise that to "
+                 f"{budget['usable_after_reclaim_gib']} GiB.")
+    detail = (f"{reclaim} GiB of page cache is held. CUDA reports free memory, not "
+              f"MemAvailable, so cached pages are billed against "
+              f"--gpu-memory-utilization even though the kernel would happily drop "
+              f"them.{arith}")
+    if reclaim >= _MEM_RECLAIM_FAIL_GIB:
+        level = "fail"
+    elif reclaim >= _MEM_RECLAIM_WARN_GIB:
+        level = "warn"
+    else:
+        return [_pf("ok", "memory", "Page cache is not eating the budget",
+                    f"{reclaim} GiB cached; {mem['free_gib']} GiB genuinely free.{arith}")]
+    return [_pf(level, "memory", f"{reclaim} GiB of page cache will be charged to vLLM",
+                detail, _DROP_CACHES_CMD)]
+
+
+# Long enough for `import vllm` (~15s cold) plus argparse, short enough that the
+# button never feels hung. A timeout is reported as `skip`, never as `fail`: a
+# slow probe is not evidence of a bad script.
+_PF_SMOKE_TIMEOUT_S = 90
+
+# Validates flags without allocating a single byte of KV cache. Kept tolerant of
+# vLLM's module reshuffles — an ImportError here means "cannot check", not "bad".
+_PF_ARGPARSE_PROBE = (
+    "import sys\n"
+    "try:\n"
+    "    from vllm.utils.argparse_utils import FlexibleArgumentParser\n"
+    "except Exception:\n"
+    "    from vllm.utils import FlexibleArgumentParser\n"
+    "from vllm.entrypoints.openai.cli_args import make_arg_parser\n"
+    "make_arg_parser(FlexibleArgumentParser()).parse_args(sys.argv[1:])\n"
+    "print('ARGS_OK')\n"
+)
+
+
+async def _preflight_runtime(facts: dict, script: str) -> list:
+    """Checks that need docker. Each degrades to `skip` rather than a false failure."""
+    out = []
+
+    name = await _run("docker", "ps", "-a", "--filter", "name=^vllm_node$",
+                      "--format", "{{.Status}}", timeout=15)
+    existing = (name.stdout or "").strip()
+    if existing:
+        out.append(_pf(
+            "warn", "container_exists", f"A container named vllm_node exists ({existing})",
+            "It holds the name and port 8000. The script's `docker rm -f` clears it, but "
+            "run-recipe.sh would instead report 'already running' and skip launching.",
+            "docker rm -f vllm_node"))
+
+    image = facts.get("image")
+    if image:
+        insp = await _run("docker", "image", "inspect", image, "--format", "{{.Id}}",
+                          timeout=20)
+        if insp.returncode != 0:
+            out.append(_pf(
+                "warn", "image", f"Image '{image}' is not present locally",
+                "The launch will pull it first, which can take several minutes and will "
+                "look like a hung load.", f"docker pull {image}"))
+        else:
+            out.append(_pf("ok", "image", f"Image '{image}' present", insp.stdout.strip()[:19]))
+
+    # The mount-scope test from 2026-07-30, run for real: read the model's own
+    # config.json through the exact bind mounts the launch will use. A dangling
+    # symlink fails here in about a second instead of after a 3-minute load.
+    if "$" in (facts.get("model") or "") or any("$" in m for m in facts.get("mounts", [])):
+        # Scripts compute paths at runtime (`HASH=$(basename "$SNAP_HOST")`), and
+        # command substitution cannot be resolved without executing the script.
+        # An unresolved path is "unknown", never "broken" — reporting it as a
+        # failure would train the reader to ignore this check.
+        out.append(_pf(
+            "skip", "mount_readable", "Model path is computed at runtime",
+            f"{facts.get('model')} contains a shell substitution, so the files could "
+            f"not be read ahead of the launch. Static checks still apply."))
+    elif facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]:
+        args = ["docker", "run", "--rm", "--entrypoint", "/bin/sh"]
+        for m in facts["mounts"]:
+            args += ["-v", m]
+        target = facts["model"].rstrip("/") + "/config.json"
+        args += [image or "busybox", "-c", f"cat {shlex.quote(target)} >/dev/null"]
+        probe = await _run(*args, timeout=60)
+        if probe.returncode == 0:
+            out.append(_pf("ok", "mount_readable", "Model files readable inside the container",
+                           f"Read {target} through the configured bind mounts."))
+        else:
+            out.append(_pf(
+                "fail", "mount_readable", "Model files are NOT readable inside the container",
+                f"Reading {target} through the configured mounts failed: "
+                f"{(probe.stderr or probe.stdout or '').strip()[:300]}. This reads like a "
+                f"corrupt download but is almost always mount scope — HF snapshot entries "
+                f"are relative symlinks into ../../blobs/.",
+                "Mount the models--*/ root so blobs/ and snapshots/ are both in scope."))
+    return out
+
+
+async def _preflight_smoke(facts: dict, script: str) -> list:
+    """Spend a couple of seconds proving the arguments actually parse."""
+    if facts["recipe_backed"]:
+        recipe_dir = Path(os.path.expanduser("~/spark-vllm-docker"))
+        runner = recipe_dir / "run-recipe.sh"
+        if not runner.exists():
+            return [_pf("skip", "smoke", "Recipe runner not found",
+                        f"{runner} does not exist, so the recipe could not be dry-run.")]
+        proc = await asyncio.create_subprocess_exec(
+            str(runner), facts["recipe"], "--dry-run",
+            cwd=str(recipe_dir),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(),
+                                               timeout=_PF_SMOKE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill(); await proc.wait()
+            return [_pf("skip", "smoke", "Recipe dry-run timed out", "")]
+        text = (stdout or b"").decode(errors="replace")
+        if proc.returncode == 0:
+            return [_pf("ok", "smoke", "Recipe dry-run succeeded",
+                        text.strip()[-600:] or "run-recipe.sh --dry-run exited 0")]
+        return [_pf("fail", "smoke", "Recipe dry-run failed", text.strip()[-600:])]
+
+    if not facts.get("image"):
+        return [_pf("skip", "smoke", "No image parsed from the script", "")]
+    # Everything after the `vllm serve` line is a server flag; feed exactly those
+    # to vLLM's own parser inside the image.
+    code = facts.get("code") or _script_code(script)
+    body = code.split("vllm serve", 1)[1] if facts["has_serve"] else ""
+    flags = [_expand_script_vars(a, code)
+             for a in shlex.split(body.replace("\\\n", " "))] if body else []
+    if not flags:
+        return [_pf("skip", "smoke", "No server flags parsed from the script", "")]
+    args = ["docker", "run", "--rm", "--entrypoint", "python3"]
+    for m in facts["mounts"]:
+        args += ["-v", m]
+    args += [facts["image"], "-c", _PF_ARGPARSE_PROBE] + flags
+    probe = await _run(*args, timeout=_PF_SMOKE_TIMEOUT_S)
+    combined = ((probe.stdout or "") + (probe.stderr or "")).strip()
+    if "ARGS_OK" in combined:
+        return [_pf("ok", "smoke", "vLLM accepted every flag",
+                    f"{len(flags)} arguments parsed by vLLM's own argument parser "
+                    f"inside {facts['image']}, without loading weights.")]
+    # Only argparse's own vocabulary counts as the script being wrong. Everything
+    # else — an import that needs CUDA, a moved module, a slow pull — means the
+    # probe could not run, and saying "rejected" there would be a false alarm.
+    # vLLM builds pydantic config objects during parsing, and some of them touch
+    # the device, which this deliberately GPU-less probe cannot provide.
+    if _re.search(r"error: (unrecognized arguments|argument |invalid choice|"
+                  r"the following arguments are required|expected)", combined):
+        return [_pf("fail", "smoke", "vLLM rejected the launch arguments",
+                    combined[-600:])]
+    return [_pf("skip", "smoke", "Could not run the argument probe",
+                (combined[-400:] or "no output") +
+                "\n\nThe probe runs without a GPU, so vLLM config objects that touch "
+                "the device cannot be constructed. This says nothing about the script.")]
+
+
+@app.post("/api/vllm/preflight", dependencies=[Depends(verify_auth)])
+async def vllm_preflight(req: EngineStartRequest):
+    """Dry-load a profile: everything a real launch would hit, minus the weights."""
+    profiles = _scan_profiles("vllm")
+    profile = next((p for p in profiles if p["id"] == req.profile), None)
+    if not profile:
+        raise HTTPException(404, f"Profile '{req.profile}' not found")
+    script_path = Path(os.path.expanduser(profile.get("script", "")))
+    if not script_path.exists():
+        raise HTTPException(400, f"Script not found: {script_path}")
+    text = script_path.read_text(errors="ignore")
+    facts = _parse_launch_script(text)
+
+    checks = _preflight_static(text, _app_config.get("vllm", {}) or {})
+    util = facts["util"]
+    if util is None and facts["recipe_backed"]:
+        util = _recipe_util(facts["recipe"])
+    checks += _preflight_memory(util)
+    checks += await _preflight_runtime(facts, text)
+    checks += await _preflight_smoke(facts, text)
+
+    verdict = ("fail" if any(c["level"] == "fail" for c in checks)
+               else "warn" if any(c["level"] == "warn" for c in checks) else "ok")
+    return {
+        "profile": req.profile,
+        "verdict": verdict,
+        "checks": checks,
+        "facts": facts,
+        "memory": _cuda_visible_memory(),
+        "budget": _vllm_budget_gib(util, _cuda_visible_memory()) if util else None,
+    }
+
+
+def _recipe_util(recipe: str) -> Optional[float]:
+    """gpu_memory_utilization from a run-recipe YAML, without a YAML dependency."""
+    if not recipe or not _re.fullmatch(r"[\w.-]+", recipe):
+        return None
+    path = Path(os.path.expanduser("~/spark-vllm-docker/recipes")) / f"{recipe}.yaml"
+    try:
+        m = _re.search(r"^\s*gpu_memory_utilization:\s*([0-9.]+)", path.read_text(), _re.M)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+@app.post("/api/vllm/reclaim-cache", dependencies=[Depends(verify_auth)])
+async def vllm_reclaim_cache():
+    """Drop the page cache so it stops being charged against the launch budget.
+
+    Non-destructive: the kernel re-reads from disk on demand. Requires passwordless
+    sudo; a box without it gets a clear 501 rather than a silent no-op. This grants
+    no privilege the profile scripts did not already have — they run as the same
+    user — but it is behind verify_auth because it is a system-wide side effect.
+    """
+    before = _cuda_visible_memory()
+    probe = await _run("sudo", "-n", "true", timeout=10)
+    if probe.returncode != 0:
+        raise HTTPException(501, "Passwordless sudo is unavailable, so the page cache "
+                                 f"cannot be dropped from here. Run manually: {_DROP_CACHES_CMD}")
+    os.sync()
+    res = await _run("sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches", timeout=60)
+    if res.returncode != 0:
+        raise HTTPException(500, f"drop_caches failed: {(res.stderr or '').strip()[:300]}")
+    after = _cuda_visible_memory()
+    freed = round(after.get("free_gib", 0) - before.get("free_gib", 0), 1)
+    return {"ok": True, "freed_gib": freed, "before": before, "after": after,
+            "message": f"Reclaimed {freed} GiB — now visible to CUDA."}
+
+
+# ── Load progress stream ──────────────────────────────────────────────────────
+# Sourced from `docker logs -f`, NOT from the /tmp launch log, because the /tmp
+# log only ever captures the *first* foreground attempt: a detached or recipe-
+# backed launch writes almost nothing there, and after a reboot /tmp is gone
+# entirely. `docker logs` is the one source that works for every profile shape
+# and survives a manager restart.
+
+_PROGRESS_TAIL = 400          # enough to catch a load already in flight
+_PROGRESS_CAUSE_WINDOW = 120  # log lines kept for root-cause extraction
+
+
+async def _container_state(name: str) -> dict:
+    res = await _run("docker", "inspect", name,
+                     "--format", "{{.Id}}|{{.State.Status}}|{{.State.ExitCode}}",
+                     timeout=15)
+    if res.returncode != 0:
+        return {"exists": False, "status": "absent", "exit_code": None, "id": ""}
+    cid, _, rest = (res.stdout or "").strip().partition("|")
+    status, _, code = rest.partition("|")
+    return {"exists": True, "id": cid, "status": status,
+            "exit_code": int(code) if code.strip().lstrip("-").isdigit() else None}
+
+
+_PROGRESS_APPEAR_TIMEOUT_S = 45   # docker rm -f + docker run, plus an image pull check
+
+
+async def _vllm_health_ok() -> bool:
+    try:
+        r = await _http.get(_engine_bases["vllm"] + "/health", timeout=5.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _load_progress_events(container: str, fresh: bool = False) -> AsyncGenerator[str, None]:
+    """Stream load phases until the model is ready or the load provably failed.
+
+    Contract, mirroring _hf_download_events: exactly one terminal event (`ready`
+    or `failed`). The pre-existing UI polled /status every 20s for ten minutes and
+    called that "Model loading…", which is indistinguishable from a container that
+    died in two seconds — the exact reason a broken profile looked like nothing
+    happening at all.
+    """
+    started = _time.monotonic()
+    phase, pct = "starting", _PHASE_PCT["starting"]
+    recent: list = []
+    facts: dict = {}
+    sent_terminal = False
+
+    def frame(**kw) -> str:
+        kw.setdefault("elapsed_s", round(_time.monotonic() - started, 1))
+        return f"data: {json.dumps(kw)}\n\n"
+
+    # An already-serving model must report ready, not "starting": the log tail of a
+    # long-running container is full of request lines and the startup milestones
+    # have long since scrolled out of it. Skipped for a fresh launch, where the
+    # *previous* model may still be answering /health for another second or two.
+    if not fresh and await _vllm_health_ok():
+        yield frame(status="ready", phase="ready", percent=100,
+                    label=_PHASE_LABEL["ready"], line="Already serving")
+        return
+
+    # The launch script runs `docker rm -f` before `docker run`, so right after
+    # POST /start the name still resolves to the OUTGOING container. Attaching to
+    # that one and watching it get removed looks exactly like a crash — the first
+    # end-to-end test of this stream reported "failed" 3.6s in, quoting a stray
+    # access-log line from the model being replaced. So a fresh launch waits for a
+    # container with a different ID, and identity is the container ID, not the name.
+    state = await _container_state(container)
+    prior_id = state.get("id", "") if fresh else ""
+    if not state["exists"] or (fresh and state.get("id") == prior_id and prior_id):
+        deadline = _time.monotonic() + _PROGRESS_APPEAR_TIMEOUT_S
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            state = await _container_state(container)
+            if state["exists"] and state.get("id") != prior_id:
+                break
+            yield frame(status="loading", phase="starting", percent=2,
+                        label="Waiting for container", line="")
+    if not state["exists"] or (prior_id and state.get("id") == prior_id):
+        yield frame(status="failed", phase="absent", percent=0,
+                    error=f"No new container named {container} appeared within "
+                          f"{_PROGRESS_APPEAR_TIMEOUT_S}s. The launch script exited "
+                          f"without starting it — check the script's own log.")
+        return
+    container_id = state["id"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "logs", "-f", "--tail", str(_PROGRESS_TAIL), container_id,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    yield frame(status="loading", phase=phase, percent=pct,
+                label=_PHASE_LABEL[phase], line="Attached to container log")
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+            except asyncio.TimeoutError:
+                # Silence is normal during torch.compile. Use it to re-check that
+                # the container is still alive, then emit a heartbeat so the bar
+                # keeps showing elapsed time.
+                state = await _container_state(container_id)
+                if state["status"] in ("exited", "dead"):
+                    break
+                yield frame(status="loading", phase=phase, percent=pct,
+                            label=_PHASE_LABEL[phase], line="")
+                continue
+            if not raw:
+                break
+            line = raw.decode(errors="replace").rstrip()
+            recent.append(line)
+            del recent[:-_PROGRESS_CAUSE_WINDOW]
+
+            # Opportunistic telemetry — the two numbers worth seeing mid-load.
+            m = _re.search(r"Available KV cache memory:\s*([\d.]+)\s*GiB", line)
+            if m:
+                facts["kv_cache_gib"] = float(m.group(1))
+            m = _re.search(r"Model loading took\s*([\d.]+)\s*GiB", line)
+            if m:
+                facts["weights_gib"] = float(m.group(1))
+
+            if _LOAD_FAILED_RE.search(line):
+                reason = _load_failure_reason(recent)
+                hint = ""
+                if "KV cache" in reason or "out of memory" in reason.lower():
+                    hint = (f"On GB10 the page cache is charged against "
+                            f"--gpu-memory-utilization. Reclaim it and retry: "
+                            f"{_DROP_CACHES_CMD}")
+                yield frame(status="failed", phase="failed", percent=pct,
+                            error=reason, hint=hint, line=line, **facts)
+                sent_terminal = True
+                break
+
+            new = _classify_vllm_log_line(line)
+            if new and _PHASE_PCT[new] > pct:
+                phase, pct = new, _PHASE_PCT[new]
+            if new == "ready":
+                yield frame(status="ready", phase="ready", percent=100,
+                            label=_PHASE_LABEL["ready"], line=line, **facts)
+                sent_terminal = True
+                break
+            yield frame(status="loading", phase=phase, percent=pct,
+                        label=_PHASE_LABEL[phase], line=line[-300:], **facts)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+    if not sent_terminal:
+        # The stream ended without a verdict: the container died, or the log closed.
+        state = await _container_state(container_id)
+        if state["status"] in ("exited", "dead"):
+            yield frame(status="failed", phase="failed", percent=pct,
+                        error=_load_failure_reason(recent),
+                        exit_code=state.get("exit_code"), **facts)
+        else:
+            # Container is Up but the log ended — on the recipe path the container
+            # outlives a dead engine, so `Up` is not proof of health. Ask the API.
+            if await _vllm_health_ok():
+                yield frame(status="ready", phase="ready", percent=100,
+                            label=_PHASE_LABEL["ready"], **facts)
+            else:
+                yield frame(status="failed", phase="failed", percent=pct,
+                            error=_load_failure_reason(recent),
+                            hint="The container is running but the API is not "
+                                 "answering /health — on the recipe path vLLM runs as "
+                                 "an exec inside a container that survives its death.",
+                            **facts)
+
+
+@app.get("/api/vllm/progress")
+async def vllm_progress(container: str = "vllm_node", fresh: bool = False):
+    if not _re.fullmatch(r"[A-Za-z0-9][\w.-]{0,63}", container):
+        raise HTTPException(400, "Invalid container name")
+    return StreamingResponse(
+        _load_progress_events(container, fresh=fresh), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── Dynamic engine routes ─────────────────────────────────────────────────────
 # Auto-generate /api/{key}/profiles, status, stop, start for every engine.
 
@@ -2612,7 +3345,13 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \\
+# No --restart policy, deliberately. DMM is a manual switcher; vllm-default-model.service
+# owns what comes back after a reboot. A generated profile that carried
+# `--restart unless-stopped` resurrected itself at boot on 2026-08-04, and because it was
+# crash-looping under the name `vllm_node`, run-recipe.sh saw "already running", skipped
+# its launch, and the box's default model never came up. A restart policy on a container
+# whose launch may be wrong converts a bad script into a persistent outage.
+exec docker run --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
   {image} \\
@@ -3734,6 +4473,38 @@ a.model-card:hover{border-color:var(--amber)}
 .prog-bar{height:100%;background:var(--amber);border-radius:2px;transition:width .3s;width:0}
 .prog-bar.spin{width:35%!important;animation:pgslide 1.2s ease-in-out infinite}
 @keyframes pgslide{0%{transform:translateX(-200%)}100%{transform:translateX(500%)}}
+/* Phase line above the bar: the bar alone cannot distinguish a 30s weight load
+   from a 65s torch.compile, and that ambiguity is what made a dead container
+   look like a slow one. */
+.prog-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px}
+.prog-phase{font-size:12px;font-weight:600;color:var(--text)}
+.prog-meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.preflight-wrap{margin-top:12px}
+.preflight-wrap:empty{display:none}
+.preflight-head{
+  display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  font-size:12px;font-weight:600;padding:8px 10px;border-radius:5px 5px 0 0;
+  border:1px solid var(--border);border-bottom:none;background:var(--s2);
+}
+.preflight-head.pf-ok{color:var(--green)}
+.preflight-head.pf-warn{color:var(--amber)}
+.preflight-head.pf-fail{color:var(--red)}
+.preflight-budget{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--muted)}
+.preflight-row{
+  border:1px solid var(--border);border-top:none;padding:8px 10px;
+  border-left:3px solid var(--border);background:#04040a;
+}
+.preflight-row:last-child{border-radius:0 0 5px 5px}
+.preflight-row.pf-ok{border-left-color:var(--green)}
+.preflight-row.pf-warn{border-left-color:var(--amber)}
+.preflight-row.pf-fail{border-left-color:var(--red)}
+.preflight-row.pf-skip{border-left-color:var(--muted);opacity:.65}
+.pf-title{font-size:12px;font-weight:600;color:var(--text)}
+.pf-detail{font-size:11px;color:var(--muted);line-height:1.6;margin-top:3px}
+.pf-fix{
+  font-family:var(--mono);font-size:11px;color:var(--amber);
+  margin-top:5px;white-space:pre-wrap;word-break:break-word;
+}
 .prog-log{
   font-family:var(--mono);font-size:11px;color:var(--muted);
   background:#04040a;border:1px solid var(--border);
@@ -4485,12 +5256,18 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
       <div style="display:flex;align-items:center;gap:12px;margin-top:14px">
         <button class="btn btn-primary" id="{k}-start-btn" onclick="startEngine(engines.{k})">\u25b6 Start Selected</button>
-        <span style="font-size:12px;color:var(--muted)">Runs start script in background \u00b7 check status pill</span>
+        <button class="btn" id="{k}-dryrun-btn" onclick="dryRunProfile(engines.{k})">\u2697 Dry Run</button>
+        <span style="font-size:12px;color:var(--muted)">Dry Run checks the launch without loading weights</span>
       </div>
       <div class="progress-wrap" id="{k}-progress" style="margin-top:14px">
-        <div class="prog-bar-outer"><div class="prog-bar spin"></div></div>
+        <div class="prog-head" id="{k}-prog-head">
+          <span class="prog-phase" id="{k}-prog-phase">Starting\u2026</span>
+          <span class="prog-meta" id="{k}-prog-meta"></span>
+        </div>
+        <div class="prog-bar-outer"><div class="prog-bar spin" id="{k}-prog-bar"></div></div>
         <div class="prog-log" id="{k}-log"></div>
       </div>
+      <div id="{k}-preflight" class="preflight-wrap"></div>
     </div>
 ''' for k, e in _ENGINES.items()) + r"""
     <!-- ─── WARM MODELS ─── -->
@@ -5741,6 +6518,8 @@ const engines = {
     ids: {{ led: '{k}-engine-led', title: '{k}-engine-title', model: '{k}-engine-model',
            card: '{k}-engine-card', stop: '{k}-stop-btn', start: '{k}-start-btn',
            profiles: '{k}-profile-list', prog: '{k}-progress', log: '{k}-log',
+           bar: '{k}-prog-bar', phase: '{k}-prog-phase', meta: '{k}-prog-meta',
+           dryrun: '{k}-dryrun-btn', preflight: '{k}-preflight',
            footer: '{k}-engine-footer'{(", webui: '" + k + "-webui-btn'") if e.get("webui") else ""} }}
   }}''' for k, e in _ENGINES.items()) + r"""
 };
@@ -5849,29 +6628,14 @@ async function startEngine(eng) {
   prog.classList.add('show');
   log.textContent = 'Sending start command\u2026';
 
+  // Live load progress, streamed from `docker logs -f` server-side. Replaces a
+  // 20s status poll that reported "Model loading\u2026" for ten minutes whether the
+  // model was loading or the container had died two seconds in.
   const beginPoll = (d) => {
     toast('\u2713 ' + eng.name + ' starting', 'ok');
-    log.textContent = d.message + '\n\nPolling status every 20 seconds\u2026';
-    let pollCount = 0;
-    const poll = setInterval(async () => {
-      pollCount++;
-      await loadEngineStatus(eng);
-      const led = document.getElementById(eng.ids.led);
-      if (led.classList.contains('on')) {
-        const modelEl = document.getElementById(eng.ids.model);
-        if (modelEl.textContent && modelEl.textContent !== 'Model loading\u2026') {
-          clearInterval(poll);
-          toast('\u2713 ' + eng.name + ' is ready!', 'ok');
-          prog.classList.remove('show');
-        } else {
-          log.textContent = d.message + '\n\nContainer running \u2014 model still loading\u2026';
-        }
-      } else if (pollCount >= 30) {
-        clearInterval(poll);
-        log.textContent += '\n\n\u26a0 Timed out after 10 minutes \u2014 check logs';
-        toast(eng.name + ' did not start within 10 minutes', 'err');
-      }
-    }, 20000);
+    log.textContent = d.message;
+    if (eng.key !== 'vllm') { return legacyPoll(eng, d); }
+    followLoadProgress(eng, d);
   };
 
   const startWith = (force) =>
@@ -5895,6 +6659,166 @@ async function startEngine(eng) {
   } finally {
     btn.disabled = false;
     btn.innerHTML = '\u25b6 Start Selected';
+  }
+}
+
+// The pre-existing status poll, still used by engines with no progress stream.
+function legacyPoll(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  let pollCount = 0;
+  const poll = setInterval(async () => {
+    pollCount++;
+    await loadEngineStatus(eng);
+    const led = document.getElementById(eng.ids.led);
+    if (led.classList.contains('on')) {
+      const modelEl = document.getElementById(eng.ids.model);
+      if (modelEl.textContent && modelEl.textContent !== 'Model loading…') {
+        clearInterval(poll);
+        toast('✓ ' + eng.name + ' is ready!', 'ok');
+        prog.classList.remove('show');
+      } else {
+        log.textContent = d.message + '\n\nContainer running — model still loading…';
+      }
+    } else if (pollCount >= 30) {
+      clearInterval(poll);
+      log.textContent += '\n\n⚠ Timed out after 10 minutes — check logs';
+      toast(eng.name + ' did not start within 10 minutes', 'err');
+    }
+  }, 20000);
+}
+
+function setProgress(eng, pct, phaseLabel, meta) {
+  const bar   = document.getElementById(eng.ids.bar);
+  const phase = document.getElementById(eng.ids.phase);
+  const metaEl = document.getElementById(eng.ids.meta);
+  if (bar) {
+    // A real percentage means a determinate bar; drop the indeterminate sweep.
+    if (typeof pct === 'number') { bar.classList.remove('spin'); bar.style.width = pct + '%'; }
+    else { bar.classList.add('spin'); bar.style.width = ''; }
+  }
+  if (phase && phaseLabel) phase.textContent = phaseLabel;
+  if (metaEl) metaEl.textContent = meta || '';
+}
+
+function followLoadProgress(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  prog.classList.add('show');
+  setProgress(eng, 0, 'Attaching to container log…', '');
+
+  // fresh=1: a launch was just issued, so do not short-circuit on the *previous*
+  // model's /health, and tolerate the container not existing for a moment.
+  const es = new EventSource('/api/vllm/progress?fresh=1');
+  const finish = (ok, msg) => {
+    es.close();
+    loadEngineStatus(eng);
+    toast((ok ? '✓ ' : '✗ ') + msg, ok ? 'ok' : 'err');
+    if (ok) setTimeout(() => prog.classList.remove('show'), 4000);
+  };
+
+  es.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    const mins = e.elapsed_s != null
+      ? Math.floor(e.elapsed_s / 60) + 'm' + String(Math.round(e.elapsed_s % 60)).padStart(2, '0') + 's'
+      : '';
+    const bits = [mins];
+    if (e.weights_gib)   bits.push('weights ' + e.weights_gib + ' GiB');
+    if (e.kv_cache_gib)  bits.push('KV ' + e.kv_cache_gib + ' GiB');
+
+    if (e.status === 'ready') {
+      setProgress(eng, 100, 'Ready', bits.join(' · '));
+      finish(true, eng.name + ' is ready in ' + mins);
+      return;
+    }
+    if (e.status === 'failed') {
+      setProgress(eng, e.percent, 'Load failed', bits.join(' · '));
+      // textContent, never innerHTML — this string is container output.
+      log.textContent = 'LOAD FAILED\n\n' + (e.error || 'unknown cause')
+        + (e.exit_code != null ? '\n\nContainer exit code: ' + e.exit_code : '')
+        + (e.hint ? '\n\n→ ' + e.hint : '');
+      finish(false, eng.name + ' failed to load');
+      return;
+    }
+    setProgress(eng, e.percent, e.label || 'Loading…', bits.join(' · '));
+    if (e.line) log.textContent = e.line;
+  };
+  es.onerror = () => {
+    es.close();
+    log.textContent += '\n\n⚠ Progress stream dropped — falling back to status polling.';
+    legacyPoll(eng, d);
+  };
+}
+
+async function dryRunProfile(eng) {
+  if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  const btn = document.getElementById(eng.ids.dryrun);
+  const out = document.getElementById(eng.ids.preflight);
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Checking…';
+  out.textContent = '';
+  try {
+    const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+    renderPreflight(out, r);
+    const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    toast(t, r.verdict === 'fail' ? 'err' : 'ok');
+  } catch (e) {
+    toast('Dry run failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⚗ Dry Run';
+  }
+}
+
+function renderPreflight(out, r) {
+  const icons = {ok: '✓', warn: '⚠', fail: '✗', skip: '–'};
+  out.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'preflight-head pf-' + r.verdict;
+  head.textContent = icons[r.verdict] + ' ' + r.profile;
+  if (r.budget) {
+    const b = document.createElement('span');
+    b.className = 'preflight-budget';
+    b.textContent = 'util ' + r.budget.util + ' → ' + r.budget.usable_gib
+      + ' GiB usable of a ' + r.budget.budget_gib + ' GiB budget';
+    head.appendChild(b);
+  }
+  out.appendChild(head);
+
+  for (const c of r.checks) {
+    const row = document.createElement('div');
+    row.className = 'preflight-row pf-' + c.level;
+    const t = document.createElement('div');
+    t.className = 'pf-title';
+    t.textContent = (icons[c.level] || '·') + ' ' + c.title;
+    row.appendChild(t);
+    if (c.detail) {
+      const d = document.createElement('div');
+      d.className = 'pf-detail';
+      d.textContent = c.detail;
+      row.appendChild(d);
+    }
+    if (c.fix) {
+      const f = document.createElement('div');
+      f.className = 'pf-fix';
+      f.textContent = c.fix;
+      row.appendChild(f);
+      if (c.check === 'memory') {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-sm';
+        btn.textContent = 'Reclaim page cache';
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+            toast('✓ ' + res.message, 'ok');
+            dryRunProfile(engines.vllm);
+          } catch (e) { toast('Reclaim failed: ' + e.message, 'err'); btn.disabled = false; }
+        };
+        row.appendChild(btn);
+      }
+    }
+    out.appendChild(row);
   }
 }
 

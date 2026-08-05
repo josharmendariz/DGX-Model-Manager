@@ -17,6 +17,7 @@ into the generator and the UI.
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 - [x] **Phase 1: Unbreak the load path** - Fix the three confirmed outages and the injection hole
+- [x] **Phase 1.1: Launch feedback** - INSERTED - Repair the Qwen3.6 profile; preflight + live load progress
 - [ ] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [ ] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
@@ -46,6 +47,28 @@ Plans:
 - [x] 01-01-PLAN.md — Fix the HF download worker (`_HF_XFER`); guarantee exactly one terminal event per download stream (wave 1)
 - [x] 01-02-PLAN.md — Make `vllm serve` an image property; regenerate the stale DeepSeek profiles (wave 2)
 - [x] 01-03-PLAN.md — Shell-quote every dynamic atom; close the non-loopback no-key auth hole (wave 3)
+
+### Phase 1.1: Launch feedback (INSERTED 2026-08-04)
+**Goal**: A launch that will fail is caught before it costs ~100 GB and three minutes, and
+one that is running shows real progress instead of an indeterminate ten-minute spinner.
+**Trigger**: Loading `HF Qwen/Qwen3.6-35B-A3B-FP8` from the UI appeared to do nothing.
+**Depends on**: Phase 1
+**Success Criteria** (what must be TRUE):
+  1. The Qwen3.6 profile launches and serves — verified by a live 178s cold start. ✓
+  2. Generated profiles carry no `--restart` policy, so a bad script cannot survive a
+     reboot and shadow `vllm-default-model.service`. ✓
+  3. Preflight reports the entrypoint contract, restart policy, mount scope, container
+     collision, image presence and memory budget without launching anything. ✓
+  4. Preflight never reports a false failure: unresolvable paths and an unrunnable probe
+     degrade to `skip`. ✓
+  5. A container that dies during load surfaces its cause within seconds, not after ten
+     minutes of "Model loading…". ✓
+  6. `pytest` passes with regression tests for each of the three root causes. ✓ (130)
+**Plans**: none — reactive work, executed without a PLAN.md.
+
+**Not covered here, deliberately**: preflight's memory verdict does not credit the
+memory a running engine will release, so it reads `fail` during a live switch. That is
+Phase 5's admission-truth work (criterion 3, docker-label reclaim).
 
 ### Phase 2: Derived launch spec
 **Goal**: A pure function turns a model's `config.json` into correct context/memory numbers,
