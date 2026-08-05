@@ -863,6 +863,65 @@ def _resolve_attention_topology(config: dict) -> dict:
     return _result("dense", declared, declared, 0, 0, None)
 
 
+def _kv_bytes_per_token(config: dict, kv_dtype_bytes: int = 1) -> dict:
+    """Size one model's KV cache from its parsed config, split by how it scales with context.
+
+    per_layer_bytes      = 2 (K and V) x num_key_value_heads x head_dim x kv_dtype_bytes
+    full_bytes_per_token = full_attention_layers x per_layer_bytes
+    bounded_bytes_total  = bounded_kv_layers x per_layer_bytes x sliding_window
+
+    Note the deliberate asymmetry in those last two, because it is easy to misuse: the first
+    is a RATE and the caller multiplies it by max_model_len; the second is already a TOTAL and
+    must not be. A windowed layer holds `sliding_window` tokens whether the context is 8k or
+    262k, so growing the context does not grow its cost. Stateless layers contribute nothing
+    at all — they are excluded by construction in `_resolve_attention_topology`, not by
+    falling through an unmatched branch, which is the bug that made the prototype accidentally
+    correct.
+
+    `head_dim` falls back to `hidden_size // num_attention_heads` (13 of the 17 models on this
+    box derive it that way; only the hybrid Qwen/Nemotron families declare it). The division
+    is guarded: a config with zero or no attention heads yields a head_dim of 0 rather than a
+    ZeroDivisionError, because these dicts come from vendor-authored files that this codebase
+    does not control (T-02-04).
+
+    Pure: dict in, dict out. No filesystem, network, /proc or vLLM — pool size, weight size
+    and context length are the caller's parameters.
+
+    Returns {topology, num_key_value_heads, head_dim, head_dim_source, per_layer_bytes,
+    full_bytes_per_token, bounded_bytes_total}.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    topology = _resolve_attention_topology(cfg)
+
+    attention_heads = _as_int(t.get("num_attention_heads"))
+    # Grouped-query attention shrinks the KV width; without it the KV head count is the
+    # attention head count.
+    kv_heads = _as_int(t.get("num_key_value_heads")) or attention_heads
+
+    head_dim = _as_int(t.get("head_dim"))
+    if head_dim > 0:
+        head_dim_source = "explicit"
+    else:
+        head_dim_source = "hidden_size//num_attention_heads"
+        head_dim = _as_int(t.get("hidden_size")) // attention_heads if attention_heads > 0 else 0
+
+    per_layer_bytes = 2 * kv_heads * head_dim * _as_int(kv_dtype_bytes)
+
+    return {
+        "topology": topology,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "head_dim_source": head_dim_source,
+        "per_layer_bytes": per_layer_bytes,
+        "full_bytes_per_token": topology["full_attention_layers"] * per_layer_bytes,
+        "bounded_bytes_total": (topology["bounded_kv_layers"] * per_layer_bytes
+                                * (topology["sliding_window"] or 0)),
+    }
+
+
 def _parse_hf_model_dir(model_dir: Path, all_profiles: list = None) -> dict:
     """Parse a single HF cache model directory (models--owner--name)."""
     stem = model_dir.name
