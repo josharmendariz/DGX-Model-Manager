@@ -1,0 +1,542 @@
+"""Phase 2 (REQ-04) — derived launch spec: attention topology and KV bytes per token.
+
+vLLM is intentionally DOWN on this box (the GB10 is running local Helix training), so every
+check here is a pure-function check: a parsed `config.json` dict goes in, a dict comes out.
+Nothing in this module starts a container, touches a GPU, opens a socket, or reads a model
+config off the filesystem.
+
+Ground truth is the committed snapshot `.planning/phases/02-derived-launch-spec/
+02-MODEL-FIXTURES.json` (17 models, generated and verified 2026-08-03), loaded via the
+`model_fixtures` / `fixture_models` conftest fixtures. Tests must never scan the model cache
+directories: a live read would make the suite depend on which models happen to be on the box,
+and would break the moment one is added or deleted.
+
+Validation rows (02-VALIDATION.md): V1 precedence · V2 topology table · V3 unknown layer type
+is loud · V4 `use_sliding_window` guard · V5 `text_config` nesting · V6 `head_dim` fallback ·
+V7 calibration · V8 purity · V9 degenerate configs. V7-V9 are owned by plan 02-02.
+"""
+
+import json
+
+import pytest
+
+import app as appmod
+from conftest import MODEL_FIXTURES_PATH
+
+
+# Module-level load so the 17-row table test can be parameterized with the model name as the
+# test id (pytest.mark.parametrize is evaluated at collection time and cannot consume a
+# session fixture). Same committed file the conftest fixtures read.
+with MODEL_FIXTURES_PATH.open(encoding="utf-8") as _fh:
+    _SNAPSHOT = json.load(_fh)
+MODEL_ROWS = _SNAPSHOT["models"]
+MODEL_IDS = [row["name"] for row in MODEL_ROWS]
+
+# The 5 models that declare a sliding_window while having use_sliding_window false. Reading
+# the window without the guard reclassifies all of them as fully-sliding and collapses a
+# 17.2 GB dense KV estimate to near zero — a silent wrong answer, not a crash (T-02-02).
+TRAPPED_ROWS = [
+    row for row in MODEL_ROWS
+    if row.get("sliding_window") and row.get("use_sliding_window") is False
+]
+TRAPPED_IDS = [row["name"] for row in TRAPPED_ROWS]
+
+NESTED_ROWS = [row for row in MODEL_ROWS if row.get("nested_text_config")]
+NESTED_IDS = [row["name"] for row in NESTED_ROWS]
+
+# Transformer fields copied verbatim from a fixture row into the rebuilt config.
+_PLAIN_FIELDS = (
+    "num_hidden_layers",
+    "hidden_size",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "max_position_embeddings",
+    "sliding_window",
+    "use_sliding_window",
+)
+
+
+def config_from_fixture(row: dict) -> dict:
+    """Rebuild a plausible parsed `config.json` from one committed fixture row.
+
+    Caveat worth stating out loud: reconstructing `layer_types` from `topology_distribution`
+    is partly self-fulfilling — a test that rebuilds the list from the counts it then asserts
+    proves only that counting works. No snapshot row carries a verbatim `layer_types` list, so
+    the independent signal in the table test is `precedence_field` (asserted as `source_field`):
+    it says which branch of the chain the real config selected, which the reconstruction cannot
+    fake. If a future snapshot regeneration adds verbatim `layer_types`, assert against that
+    list instead of this reconstruction.
+
+    A field absent from the row (JSON `null`) is left out of the rebuilt config entirely,
+    matching real configs — several models simply do not declare `use_sliding_window`, and
+    "absent" and "false" must not be conflated by the fixture builder.
+    """
+    inner: dict = {}
+    for key in _PLAIN_FIELDS:
+        if row.get(key) is not None:
+            inner[key] = row[key]
+
+    # head_dim is only declared by the hybrid Qwen/Nemotron families; the other 13 models
+    # derive it. Only plant it when the snapshot says the real config declared it.
+    if row.get("head_dim_source") == "explicit":
+        inner["head_dim"] = row["head_dim"]
+
+    field = row.get("precedence_field")
+    dist = row.get("topology_distribution") or {}
+    if field == "layer_types":
+        layer_types: list[str] = []
+        for layer_name, count in dist.items():
+            layer_types.extend([layer_name] * count)
+        inner["layer_types"] = layer_types
+    elif field == "hybrid_override_pattern":
+        inner["hybrid_override_pattern"] = "".join(ch * count for ch, count in dist.items())
+    elif field == "full_attention_interval":
+        inner["full_attention_interval"] = row["full_attention_interval"]
+    # "dense" and the "sliding_window" branch add no topology field.
+
+    if row.get("nested_text_config"):
+        # VL / nested-text models carry none of the transformer fields at top level.
+        return {"text_config": inner}
+    return inner
+
+
+# ── V1 precedence order ───────────────────────────────────────────────────────
+
+def test_precedence_fixture_vocabulary_is_closed():
+    """Every snapshot row names a branch the chain actually implements."""
+    known = {
+        "layer_types",
+        "hybrid_override_pattern",
+        "full_attention_interval",
+        "sliding_window",
+        "dense",
+    }
+    seen = {row["precedence_field"] for row in MODEL_ROWS}
+    assert seen <= known, f"snapshot names an unimplemented branch: {seen - known}"
+
+
+def test_precedence_first_hit_wins_as_fields_are_removed():
+    """One config carrying every topology field resolves them in a fixed order.
+
+    Peeling the fields off one at a time is the only way to prove the *order* rather than
+    the individual branches — a refactor that reorders the chain still passes every
+    single-field test.
+    """
+    config = {
+        "num_hidden_layers": 48,
+        "layer_types": ["full_attention"] * 12 + ["linear_attention"] * 36,
+        "hybrid_override_pattern": "*" * 6 + "M" * 42,
+        "full_attention_interval": 4,
+        "sliding_window": 4096,
+        "use_sliding_window": True,
+    }
+    assert appmod._resolve_attention_topology(config)["source_field"] == "layer_types"
+
+    config.pop("layer_types")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "hybrid_override_pattern"
+
+    config.pop("hybrid_override_pattern")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "full_attention_interval"
+
+    config.pop("full_attention_interval")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "sliding_window"
+
+    config.pop("sliding_window")
+    assert appmod._resolve_attention_topology(config)["source_field"] == "dense"
+
+
+def test_precedence_empty_topology_fields_do_not_claim_the_chain():
+    """An empty list or empty string must fall through, not resolve to zero layers."""
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 10, "layer_types": [], "hybrid_override_pattern": ""}
+    )
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 10
+
+
+def test_precedence_full_attention_interval_is_synthetic_only():
+    """V1b: no model on this box selects this branch, so it needs a synthetic config.
+
+    Qwen3.6 and qwen3-next both declare full_attention_interval=4 *and* layer_types, and
+    layer_types wins — the counts coincide (48//4 == 12) purely by arithmetic luck, which is
+    exactly why the handoff's attribution was wrong. Without this test the branch ships
+    untested.
+    """
+    assert not any(row["precedence_field"] == "full_attention_interval" for row in MODEL_ROWS)
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 48, "full_attention_interval": 4}
+    )
+    assert topo["source_field"] == "full_attention_interval"
+    assert topo["full_attention_layers"] == 12
+    assert topo["stateless_layers"] == 36
+    assert topo["bounded_kv_layers"] == 0
+
+
+def test_precedence_interval_larger_than_layer_count_does_not_crash():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 2, "full_attention_interval": 8}
+    )
+    assert topo["full_attention_layers"] == 0
+    assert topo["stateless_layers"] == 2
+
+
+def test_precedence_returns_exactly_the_interface_keys():
+    expected = {
+        "num_hidden_layers",
+        "full_attention_layers",
+        "bounded_kv_layers",
+        "stateless_layers",
+        "sliding_window",
+        "source_field",
+        "warnings",
+    }
+    assert set(appmod._resolve_attention_topology({})) == expected
+
+
+# ── V2 hybrid counts (17-model table) ─────────────────────────────────────────
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_topology_table_fixture_row_is_self_consistent(row):
+    """The snapshot's own layer counts must partition num_hidden_layers."""
+    total = row["full_attention_layers"] + row["bounded_kv_layers"] + row["stateless_layers"]
+    assert total == row["num_hidden_layers"]
+    dist = row.get("topology_distribution") or {}
+    if dist:
+        assert sum(dist.values()) == row["num_hidden_layers"]
+
+
+def test_topology_table_snapshot_has_all_seventeen_models():
+    assert len(MODEL_ROWS) == 17
+    assert len(set(MODEL_IDS)) == 17
+
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_topology_table_reproduces_recorded_counts(row):
+    """Every model on this box resolves to the layer counts the snapshot recorded.
+
+    `source_field` is the independent signal here: the rebuilt config cannot fake which
+    branch the real config selected, so this catches the handoff's wrong attribution
+    (Qwen3.6 and qwen3-next resolve via layer_types, not hybrid_override_pattern /
+    full_attention_interval) as well as any silent reordering of the chain.
+    """
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["source_field"] == row["precedence_field"]
+    assert topo["num_hidden_layers"] == row["num_hidden_layers"]
+    assert topo["full_attention_layers"] == row["full_attention_layers"]
+    assert topo["bounded_kv_layers"] == row["bounded_kv_layers"]
+    assert topo["stateless_layers"] == row["stateless_layers"]
+    assert (topo["full_attention_layers"] + topo["bounded_kv_layers"]
+            + topo["stateless_layers"]) == row["num_hidden_layers"]
+
+
+@pytest.mark.parametrize(
+    "name,expected_full_bytes,expected_bounded_total",
+    [
+        # per_layer = 2 * kv_heads * head_dim; hand-computed from the snapshot rows.
+        ("openai/gpt-oss-120b", 18 * 2 * 8 * 64, 18 * 2 * 8 * 64 * 128),
+        ("qwen3-next-80b-a3b-nvfp4", 12 * 2 * 2 * 256, 0),
+        ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", 64 * 2 * 8 * 128, 0),
+    ],
+)
+def test_topology_table_kv_byte_anchors(name, expected_full_bytes, expected_bounded_total):
+    row = next(r for r in MODEL_ROWS if r["name"] == name)
+    result = appmod._kv_bytes_per_token(config_from_fixture(row), kv_dtype_bytes=1)
+    assert result["full_bytes_per_token"] == expected_full_bytes
+    assert result["bounded_bytes_total"] == expected_bounded_total
+
+
+def test_topology_table_bounded_bytes_are_context_independent():
+    """bounded_bytes_total is already a TOTAL, not a per-token rate.
+
+    gpt-oss's 18 windowed layers cost 128 tokens of KV each no matter how long the context
+    is; only full_bytes_per_token gets multiplied by max_model_len downstream.
+    """
+    config = {
+        "num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 64,
+        "sliding_window": 128,
+        "layer_types": ["full_attention"] * 18 + ["sliding_attention"] * 18,
+    }
+    result = appmod._kv_bytes_per_token(config)
+    assert result["per_layer_bytes"] == 1024
+    assert result["full_bytes_per_token"] == 18432
+    assert result["bounded_bytes_total"] == 2359296
+    assert result["topology"]["source_field"] == "layer_types"
+
+
+def test_topology_table_stateless_layers_contribute_zero_bytes():
+    """Stateless layers cost zero by construction, not by falling through a missed branch."""
+    hybrid = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 48, "num_key_value_heads": 2, "head_dim": 256,
+         "layer_types": ["full_attention"] * 12 + ["linear_attention"] * 36}
+    )
+    dense = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 12, "num_key_value_heads": 2, "head_dim": 256}
+    )
+    assert hybrid["full_bytes_per_token"] == dense["full_bytes_per_token"]
+    assert hybrid["bounded_bytes_total"] == 0
+
+
+def test_topology_table_kv_dtype_bytes_scales_linearly():
+    config = {"num_hidden_layers": 4, "num_key_value_heads": 4, "head_dim": 64}
+    one = appmod._kv_bytes_per_token(config, kv_dtype_bytes=1)
+    two = appmod._kv_bytes_per_token(config, kv_dtype_bytes=2)
+    assert two["per_layer_bytes"] == 2 * one["per_layer_bytes"] == 1024
+    assert two["full_bytes_per_token"] == 2 * one["full_bytes_per_token"]
+
+
+def test_topology_table_returns_exactly_the_interface_keys():
+    expected = {
+        "topology",
+        "num_key_value_heads",
+        "head_dim",
+        "head_dim_source",
+        "per_layer_bytes",
+        "full_bytes_per_token",
+        "bounded_bytes_total",
+    }
+    assert set(appmod._kv_bytes_per_token({})) == expected
+
+
+# ── V3 unknown layer type is loud ─────────────────────────────────────────────
+
+def test_unknown_layer_types_absent_from_snapshot():
+    """Guard the flipside of V3: every layer type on this box is one the code classifies.
+
+    If a snapshot regeneration introduces a new layer type, this fails here rather than
+    silently scoring zero KV somewhere downstream.
+    """
+    known_layer_types = {"full_attention", "sliding_attention", "linear_attention"}
+    known_pattern_chars = {"*", "M", "E"}
+    for row in MODEL_ROWS:
+        dist = row.get("topology_distribution") or {}
+        if row["precedence_field"] == "layer_types":
+            assert set(dist) <= known_layer_types, row["name"]
+        elif row["precedence_field"] == "hybrid_override_pattern":
+            assert set(dist) <= known_pattern_chars, row["name"]
+
+
+def test_unknown_layer_type_counts_as_full_and_warns():
+    """T-02-01: an unrecognized layer type must over-reserve loudly, never score zero.
+
+    The prototype counted `x == "full_attention"` and `"sliding" in x`, so anything else fell
+    through both buckets and silently contributed zero KV. That is accidentally correct for
+    linear_attention today and actively dangerous for any future type that does carry KV: the
+    recommender would confidently under-reserve and OOM at model load.
+    """
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 1, "layer_types": ["quantum_attention"]}
+    )
+    assert topo["full_attention_layers"] == 1
+    assert topo["stateless_layers"] == 0
+    assert topo["bounded_kv_layers"] == 0
+    assert len(topo["warnings"]) == 1
+    assert topo["warnings"][0].startswith("unknown layer type: ")
+    assert "quantum_attention" in topo["warnings"][0]
+
+
+def test_unknown_layer_type_mixed_with_known_types_keeps_the_partition():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 4, "layer_types": ["full_attention", "linear_attention",
+                                                 "quantum_attention", "sliding_attention"]}
+    )
+    assert topo["full_attention_layers"] == 2  # the known full one plus the unknown one
+    assert topo["bounded_kv_layers"] == 1
+    assert topo["stateless_layers"] == 1
+    assert len(topo["warnings"]) == 1
+
+
+def test_unknown_layer_pattern_character_counts_as_full_and_warns():
+    """Same rule for an unrecognized character in a Nemotron-style pattern."""
+    topo = appmod._resolve_attention_topology({"hybrid_override_pattern": "*MEZ"})
+    assert topo["full_attention_layers"] == 2  # '*' plus the unknown 'Z'
+    assert topo["stateless_layers"] == 2
+    # num_hidden_layers falls back to the pattern length when the config omits it, so the
+    # three classes always partition the reported total.
+    assert topo["num_hidden_layers"] == 4
+    assert len(topo["warnings"]) == 1
+    assert topo["warnings"][0].startswith("unknown layer type: ")
+
+
+def test_unknown_layer_types_warn_once_per_distinct_type():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 30, "layer_types": ["quantum_attention"] * 20 + ["warp_attention"] * 10}
+    )
+    assert topo["full_attention_layers"] == 30
+    assert len(topo["warnings"]) == 2
+
+
+def test_unknown_layer_types_absent_means_no_warnings_on_real_models():
+    for row in MODEL_ROWS:
+        topo = appmod._resolve_attention_topology(config_from_fixture(row))
+        assert topo["warnings"] == [], f"{row['name']}: {topo['warnings']}"
+
+
+# ── V4 use_sliding_window guard ───────────────────────────────────────────────
+
+def test_sliding_guard_snapshot_anomalies_are_recorded_dense():
+    """The 5 models declaring sliding_window with use_sliding_window false are dense."""
+    trapped = [
+        row for row in MODEL_ROWS
+        if row.get("sliding_window") and row.get("use_sliding_window") is False
+    ]
+    assert len(trapped) == 5
+    for row in trapped:
+        assert row["precedence_field"] == "dense", row["name"]
+        assert row["full_attention_layers"] == row["num_hidden_layers"], row["name"]
+        assert row["bounded_kv_layers"] == 0, row["name"]
+
+
+def test_sliding_guard_window_without_use_flag_stays_dense():
+    """T-02-02: `sliding_window` alone must not claim the chain."""
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 64, "sliding_window": 131072, "use_sliding_window": False}
+    )
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 64
+    assert topo["bounded_kv_layers"] == 0
+    # The vestigial window is not reported: no layer is bounded, so no window applies.
+    assert topo["sliding_window"] is None
+
+
+def test_sliding_guard_window_with_use_flag_bounds_every_layer():
+    topo = appmod._resolve_attention_topology(
+        {"num_hidden_layers": 32, "sliding_window": 4096, "use_sliding_window": True}
+    )
+    assert topo["source_field"] == "sliding_window"
+    assert topo["bounded_kv_layers"] == 32
+    assert topo["full_attention_layers"] == 0
+    assert topo["sliding_window"] == 4096
+
+
+def test_sliding_guard_missing_use_flag_stays_dense():
+    """Absent is not truthy: a config that never declares the flag is dense, not sliding."""
+    topo = appmod._resolve_attention_topology({"num_hidden_layers": 8, "sliding_window": 512})
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == 8
+
+
+@pytest.mark.parametrize("row", TRAPPED_ROWS, ids=TRAPPED_IDS)
+def test_sliding_guard_real_trapped_model_keeps_full_kv(row):
+    """The 5 real configs carrying the trap resolve dense against the shipped helper."""
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["source_field"] == "dense"
+    assert topo["full_attention_layers"] == row["num_hidden_layers"]
+    assert topo["bounded_kv_layers"] == 0
+
+
+# ── V5 text_config nesting ────────────────────────────────────────────────────
+
+def test_text_config_nesting_and_hybridity_are_independent_axes():
+    """Two rows nest; one is hybrid and one is dense, so the axes need separate cover."""
+    nested = [row for row in MODEL_ROWS if row.get("nested_text_config")]
+    assert len(nested) >= 2
+    fields = {row["precedence_field"] for row in nested}
+    assert "dense" in fields and fields - {"dense"}
+
+
+def test_text_config_nested_resolves_identically_to_flat():
+    """Nesting is a packaging detail; it must not change a single number."""
+    flat = {
+        "num_hidden_layers": 40,
+        "layer_types": ["full_attention"] * 10 + ["linear_attention"] * 30,
+    }
+    nested = {"text_config": dict(flat)}
+    assert appmod._resolve_attention_topology(nested) == appmod._resolve_attention_topology(flat)
+
+
+def test_text_config_nested_fields_are_not_read_as_zero():
+    """A VL-style config with nothing at top level must not resolve to an empty model."""
+    topo = appmod._resolve_attention_topology(
+        {"text_config": {"num_hidden_layers": 40,
+                         "layer_types": ["full_attention"] * 10 + ["linear_attention"] * 30}}
+    )
+    assert topo["num_hidden_layers"] == 40
+    assert topo["full_attention_layers"] == 10
+    assert topo["stateless_layers"] == 30
+
+
+@pytest.mark.parametrize("row", NESTED_ROWS, ids=NESTED_IDS)
+def test_text_config_real_nested_model_resolves(row):
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["num_hidden_layers"] == row["num_hidden_layers"]
+    assert topo["full_attention_layers"] == row["full_attention_layers"]
+
+
+# ── V6 head_dim fallback ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_head_dim_snapshot_source_is_consistent(row):
+    """A derived head_dim must actually equal hidden_size // num_attention_heads."""
+    assert row["head_dim_source"] in ("explicit", "hidden_size//num_attention_heads")
+    if row["head_dim_source"] == "hidden_size//num_attention_heads":
+        assert row["head_dim"] == row["hidden_size"] // row["num_attention_heads"], row["name"]
+
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_head_dim_reproduced_from_rebuilt_config(row):
+    """Each model's KV width and where it came from, reproduced by the shipped helper."""
+    result = appmod._kv_bytes_per_token(config_from_fixture(row))
+    assert result["head_dim"] == row["head_dim"], row["name"]
+    assert result["head_dim_source"] == row["head_dim_source"], row["name"]
+    assert result["num_key_value_heads"] == row["num_key_value_heads"], row["name"]
+
+
+def test_head_dim_explicit_wins_over_the_derived_value():
+    """Qwen3.6 declares head_dim 256 while hidden_size//heads would give 128 — a 2x error."""
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 1, "head_dim": 256, "hidden_size": 2048,
+         "num_attention_heads": 16, "num_key_value_heads": 2}
+    )
+    assert result["head_dim"] == 256
+    assert result["head_dim_source"] == "explicit"
+
+
+def test_head_dim_falls_back_to_hidden_size_over_attention_heads():
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 64, "num_key_value_heads": 8, "hidden_size": 5120,
+         "num_attention_heads": 40}
+    )
+    assert result["head_dim"] == 128
+    assert result["head_dim_source"] == "hidden_size//num_attention_heads"
+    assert result["full_bytes_per_token"] == 131072
+
+
+def test_head_dim_zero_or_missing_attention_heads_does_not_divide():
+    """T-02-04: a malformed snapshot must return zeros, not raise ZeroDivisionError."""
+    for config in ({"num_hidden_layers": 4, "hidden_size": 4096, "num_attention_heads": 0},
+                   {"num_hidden_layers": 4, "hidden_size": 4096},
+                   {}):
+        result = appmod._kv_bytes_per_token(config)
+        assert result["head_dim"] == 0
+        assert result["per_layer_bytes"] == 0
+        assert result["full_bytes_per_token"] == 0
+
+
+def test_head_dim_kv_heads_fall_back_to_attention_heads():
+    """A config without grouped-query attention declares only num_attention_heads."""
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 2, "num_attention_heads": 8, "head_dim": 64}
+    )
+    assert result["num_key_value_heads"] == 8
+    assert result["per_layer_bytes"] == 1024
+
+
+# ── V7 calibration (plan 02-02) ───────────────────────────────────────────────
+
+@pytest.mark.skip(reason="plan 02-02")
+def test_calibration_qwen3_next_matches_hand_measured_util():
+    """qwen3-next-80b derived utilization must land within 0.02 of the measured 0.55."""
+
+
+# ── V8 purity (plan 02-02) ────────────────────────────────────────────────────
+
+@pytest.mark.skip(reason="plan 02-02")
+def test_purity_no_filesystem_or_network_in_helper_bodies():
+    """No filesystem, network or vLLM dependency inside the derived-spec helper bodies."""
+
+
+# ── V9 degenerate configs (plan 02-02) ────────────────────────────────────────
+
+@pytest.mark.skip(reason="plan 02-02")
+def test_degenerate_configs_return_defined_values():
+    """Empty dict, missing num_hidden_layers and zero heads yield zeros, never a traceback."""
