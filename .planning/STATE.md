@@ -9,14 +9,14 @@ See: .planning/PROJECT.md (updated 2026-08-02)
 
 ## Current Position
 
-Phase: 1 of 5 (Unbreak the load path)
-Plan: 3 of 3 in current phase
-Status: Phase 1 implemented — uncommitted, not yet deployed
-Last activity: 2026-08-02 — Phase 1 executed. Suite 59 → 100 tests, all passing.
-Remaining: `systemctl --user restart dgx-model-manager.service` to deploy, and a live
-launch check once vLLM is back up after Helix training.
+Phase: 1.1 of 5 (Launch feedback — INSERTED, unplanned)
+Plan: n/a (reactive work, no PLAN.md)
+Status: Implemented, deployed, live-verified — **uncommitted by decision**
+Last activity: 2026-08-04 — Phase 1.1 executed. Suite 100 → 130 tests, all passing.
+Remaining: Josh decides what happens to a peer session's Site Scanner code in `app.py`
+before anything is committed. Then `/gsd-plan-phase 2`.
 
-Progress: [██░░░░░░░░] 20%
+Progress: [███░░░░░░░] 25%
 
 ## Performance Metrics
 
@@ -33,24 +33,15 @@ Progress: [██░░░░░░░░] 20%
 
 ## Environment Notes
 
-- **vLLM is intentionally down** while the box runs local Helix training. All Phase 1 and
-  Phase 2 work must be verifiable without launching a model: script generation, the HF
-  download worker, and the derived-spec solver are all testable offline.
+- **vLLM is UP.** `vllm_node` serves Qwen3.6-35B-A3B-FP8 at util 0.55 / 262144 via the
+  recipe-backed profile, aliased `vllm-active` for litellm. The earlier "intentionally
+  down for Helix training" note is stale — that blocker is resolved.
+- **Page cache is charged against `--gpu-memory-utilization` on this box.** CUDA reports
+  MemFree, not MemAvailable, so `usable = MemTotal * util - (MemTotal - MemFree)`. Drop
+  caches before a large launch (`POST /api/vllm/reclaim-cache`, or `sync && sudo sh -c
+  'echo 3 > /proc/sys/vm/drop_caches'`). At an unchanged util 0.55, Qwen3.6 got 0.19 GiB
+  of KV with ~25 GB cached and 25.97 GiB after reclaiming.
 - Editing `app.py` does NOT restart the running service — `systemctl --user restart
   dgx-model-manager.service` is required to deploy.
-- The installed systemd unit is a copy, not a symlink to `deploy/`, and carries an
-  `EnvironmentFile` the repo unit lacks. Reinstalling from `deploy/` silently disables
-  Discord alerting.
-
-## Audit Provenance
-
-The roadmap derives from a 2026-08-02 review of the vLLM surface. Findings confirmed
-against the live box, not taken on trust:
-
-| Finding | Verification |
-|---|---|
-| `_HF_XFER` undefined — every download fails | Reproduced: rc=1, `NameError`, after `starting` |
-| Generated non-gpt-oss scripts can't launch | `eugr/spark-vllm:latest` ENTRYPOINT is `nvidia_entrypoint.sh`, CMD null |
-| Unauthenticated shell injection | `api_key` unset + non-loopback host; `$(...)` reaches the generated script verbatim |
-| Hybrid KV overestimated 4–11x | Computed from every model config on the box |
-| Derived formula is sound | Independently produced 0.54 vs the hand-tuned 0.55 for qwen3-next-80b |
+- **~3 concurrent claude sessions run in this repo.** Commit by explicit path; never
+  `git add -A`. `app.py` currently holds two sessions' work at once.
