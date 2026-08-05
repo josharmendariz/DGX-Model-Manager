@@ -16,6 +16,7 @@ is loud · V4 `use_sliding_window` guard · V5 `text_config` nesting · V6 `head
 V7 calibration · V8 purity · V9 degenerate configs. V7-V9 are owned by plan 02-02.
 """
 
+import inspect
 import json
 
 import pytest
@@ -745,22 +746,272 @@ def test_fitting_echoes_its_scalar_inputs_back():
     assert spec["overhead_gb"] == 7.5
 
 
-# ── V7 calibration (plan 02-02) ───────────────────────────────────────────────
+# ── V7 calibration ────────────────────────────────────────────────────────────
 
-@pytest.mark.skip(reason="plan 02-02")
+# The hand-measured recipe this whole phase is calibrated against.
+HAND_MEASURED_UTIL = 0.55
+CALIBRATION_TOLERANCE = 0.02
+CALIBRATION_MODEL = "qwen3-next-80b-a3b-nvfp4"
+
+
+def _row(name: str) -> dict:
+    """Look a fixture row up by name, never by index.
+
+    A snapshot regeneration that reorders the rows must fail loudly here rather than quietly
+    calibrating against a different model.
+    """
+    matches = [r for r in MODEL_ROWS if r["name"] == name]
+    assert len(matches) == 1, f"{name!r} not uniquely present in the snapshot"
+    return matches[0]
+
+
+def _spec_for(row: dict, **kwargs) -> dict:
+    """Derive a launch spec from a fixture row, weights in decimal GB as the prototype used."""
+    kwargs.setdefault("weights_gb", row["weight_bytes"] / 1e9)
+    return appmod._derive_launch_spec(config_from_fixture(row), **kwargs)
+
+
 def test_calibration_qwen3_next_matches_hand_measured_util():
-    """qwen3-next-80b derived utilization must land within 0.02 of the measured 0.55."""
+    """The phase's core evidence: derived arithmetic reproduces a hand-measured number.
+
+    `qwen3-next-80b-a3b-nvfp4` was hand-tuned on this box to
+    `--gpu-memory-utilization 0.55`. The prototype, working only from the parsed config and
+    the weight size, independently derived 0.54. That independent agreement — not any
+    internal consistency check — is the evidence that every other derived number in this
+    project can be trusted.
+
+    If this test fails after a refactor, the formula is wrong. The hand-measured recipe is
+    the fixed point, not the thing to adjust.
+    """
+    row = _row(CALIBRATION_MODEL)
+    util = _spec_for(row)["recommended_util"]
+    assert util == 0.54
+    assert abs(util - HAND_MEASURED_UTIL) <= CALIBRATION_TOLERANCE, (
+        f"derived {util} drifted more than {CALIBRATION_TOLERANCE} from the hand-measured "
+        f"{HAND_MEASURED_UTIL} for {CALIBRATION_MODEL}"
+    )
 
 
-# ── V8 purity (plan 02-02) ────────────────────────────────────────────────────
+def test_calibration_qwen3_next_supporting_anchors():
+    """The intermediate numbers the 0.54 is built from, so a failure localises itself."""
+    spec = _spec_for(_row(CALIBRATION_MODEL))
+    assert spec["full_attention_layers"] == 12
+    assert spec["kv_bytes_per_token"] == 12288
+    assert spec["max_model_len"] == 262144
+    assert round(spec["kv_gb"], 3) == 3.221
 
-@pytest.mark.skip(reason="plan 02-02")
-def test_purity_no_filesystem_or_network_in_helper_bodies():
+
+def test_calibration_naive_dense_count_falls_outside_the_tolerance_band():
+    """Negative control: the calibration must actually discriminate.
+
+    Scored with the naive `num_hidden_layers` count — 48 attention layers instead of 12, the
+    4x KV overestimate this phase exists to remove — the same model derives 0.62, well
+    outside the +/-0.02 band. Without this, the calibration test would still pass if hybrid
+    classification regressed entirely.
+    """
+    row = _row(CALIBRATION_MODEL)
+    naive_config = config_from_fixture(row)
+    naive_config.pop("layer_types")  # fall through to the dense branch: all 48 layers count
+    naive = appmod._derive_launch_spec(naive_config, weights_gb=row["weight_bytes"] / 1e9)
+    assert naive["full_attention_layers"] == 48
+    assert naive["kv_bytes_per_token"] == 4 * 12288
+    assert naive["recommended_util"] == 0.62
+    assert abs(naive["recommended_util"] - HAND_MEASURED_UTIL) > CALIBRATION_TOLERANCE
+
+
+def test_calibration_qwen36_gap_is_left_for_phase_3():
+    """Qwen3.6 derives ~0.42 against a 0.55 recipe — deliberately NOT closed here.
+
+    The recipe reserves headroom the formula does not model. That is exactly why curated
+    recipes must win over derived values, which is Phase 3's precedence work. Do not "fix"
+    the formula to chase 0.55: doing so would break the qwen3-next calibration above, which
+    is the only number here validated against a measurement.
+    """
+    spec = _spec_for(_row("Qwen/Qwen3.6-35B-A3B-FP8"))
+    assert spec["recommended_util"] < HAND_MEASURED_UTIL
+    assert round(spec["recommended_util"], 2) == 0.42
+
+
+# ── V8 purity ─────────────────────────────────────────────────────────────────
+
+# All four derived-spec helpers, not just the two newest. The first two were ported from a
+# prototype whose documented impurity was scanning the model cache directories, so scanning
+# only the new pair would leave "the function is pure" unproven for exactly the code most
+# likely to have inherited a filesystem read.
+DERIVED_SPEC_HELPERS = (
+    appmod._resolve_attention_topology,
+    appmod._kv_bytes_per_token,
+    appmod._kv_budget_gb,
+    appmod._derive_launch_spec,
+)
+HELPER_IDS = [fn.__name__ for fn in DERIVED_SPEC_HELPERS]
+
+# Tokens that would make these helpers unverifiable while vLLM is down (T-02-03, T-02-10).
+# `open(` is forbidden as a source token in its own right, not merely blocked at runtime by
+# the patched-builtin test below.
+FORBIDDEN_SOURCE_TOKENS = (
+    "open(",
+    "glob",
+    "os.listdir",
+    "os.scandir",
+    "os.walk",
+    "os.path",
+    "subprocess",
+    "requests",
+    "httpx",
+    "urllib",
+    "/proc",
+    "expanduser",
+    "Path(",
+    "_get_total_memory_gb",
+    "_get_available_memory_gb",
+    "import vllm",
+    "docker",
+)
+
+
+@pytest.mark.parametrize("fn", DERIVED_SPEC_HELPERS, ids=HELPER_IDS)
+def test_purity_no_filesystem_or_network_in_helper_bodies(fn):
     """No filesystem, network or vLLM dependency inside the derived-spec helper bodies."""
+    source = inspect.getsource(fn)
+    offenders = [token for token in FORBIDDEN_SOURCE_TOKENS if token in source]
+    assert offenders == [], f"{fn.__name__} references {offenders}"
 
 
-# ── V9 degenerate configs (plan 02-02) ────────────────────────────────────────
+@pytest.mark.parametrize("fn", DERIVED_SPEC_HELPERS, ids=HELPER_IDS)
+def test_purity_helpers_take_only_plain_arguments(fn):
+    """A pure helper's inputs are a dict and scalars — never a path or a handle."""
+    params = inspect.signature(fn).parameters
+    assert "path" not in params and "model_dir" not in params
 
-@pytest.mark.skip(reason="plan 02-02")
-def test_degenerate_configs_return_defined_values():
+
+def test_purity_helpers_run_under_a_patched_builtin_open(monkeypatch):
+    """Source inspection alone would miss a read made indirectly through another helper."""
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("the derived-spec helpers must not read the filesystem")
+
+    row = _row(CALIBRATION_MODEL)
+    config = config_from_fixture(row)
+    weights = row["weight_bytes"] / 1e9
+    monkeypatch.setattr("builtins.open", _forbidden)
+
+    assert isinstance(appmod._resolve_attention_topology(config), dict)
+    assert isinstance(appmod._kv_bytes_per_token(config), dict)
+    assert appmod._kv_budget_gb(0.55, 121.0, weights) >= 0.0
+    assert appmod._derive_launch_spec(config, weights_gb=weights)["recommended_util"] == 0.54
+
+
+def test_purity_pool_and_weights_are_parameters_not_lookups():
+    """Changing the pool changes the answer, proving it is not read off the box."""
+    config = config_from_fixture(_row(CALIBRATION_MODEL))
+    small = appmod._derive_launch_spec(config, weights_gb=50.0, pool_gb=80.0)
+    large = appmod._derive_launch_spec(config, weights_gb=50.0, pool_gb=200.0)
+    assert small["recommended_util"] > large["recommended_util"]
+
+
+# ── V9 degenerate configs ─────────────────────────────────────────────────────
+
+SIXTEEN_KEYS = {
+    "topology", "num_hidden_layers", "full_attention_layers", "bounded_kv_layers",
+    "stateless_layers", "source_field", "kv_bytes_per_token", "bounded_bytes_total",
+    "declared_max_context", "max_fitting_context", "max_model_len", "kv_gb",
+    "weights_gb", "overhead_gb", "recommended_util", "warnings",
+}
+
+# Nine ways a vendor config or a Phase 4 caller can be wrong. None may raise.
+DEGENERATE_CASES = (
+    ("empty config", {}, {}),
+    ("negative layer count", {"num_hidden_layers": -5}, {}),
+    ("string layer count", {"num_hidden_layers": "48"}, {}),
+    ("zero attention heads",
+     {"num_hidden_layers": 32, "num_attention_heads": 0, "hidden_size": 4096}, {}),
+    ("absurd layer count",
+     {"num_hidden_layers": 10 ** 9, "num_key_value_heads": 8, "head_dim": 128,
+      "max_position_embeddings": 262144}, {}),
+    ("non-numeric weights", {"num_hidden_layers": 4}, {"weights_gb": "banana"}),
+    ("negative weights", {"num_hidden_layers": 4}, {"weights_gb": -40.0}),
+    ("zero pool", {"num_hidden_layers": 4}, {"pool_gb": 0}),
+    ("absurd overhead", {"num_hidden_layers": 4}, {"overhead_gb": 1e12}),
+)
+DEGENERATE_IDS = [case[0] for case in DEGENERATE_CASES]
+
+
+@pytest.mark.parametrize("label,config,kwargs", DEGENERATE_CASES, ids=DEGENERATE_IDS)
+def test_degenerate_configs_return_defined_values(label, config, kwargs):
     """Empty dict, missing num_hidden_layers and zero heads yield zeros, never a traceback."""
+    spec = appmod._derive_launch_spec(config, **kwargs)
+    assert set(spec) == SIXTEEN_KEYS, label
+    assert 0.10 <= spec["recommended_util"] <= 0.95, label
+    assert spec["max_model_len"] >= 0 and spec["kv_gb"] >= 0.0, label
+    assert isinstance(spec["warnings"], list), label
+
+
+def test_degenerate_absurd_weights_saturate_at_the_cap():
+    """T-02-08: a nonsense config must not request more memory than the box has."""
+    spec = appmod._derive_launch_spec(
+        {"num_hidden_layers": 48, "num_key_value_heads": 2, "head_dim": 256,
+         "max_position_embeddings": 262144},
+        weights_gb=10_000.0,
+    )
+    assert spec["recommended_util"] == 0.95
+    assert spec["max_fitting_context"] == 0
+
+
+def test_degenerate_bad_scalars_are_named_in_the_warnings():
+    """T-02-06: a coerced input must leave a trail, not silently become zero."""
+    spec = appmod._derive_launch_spec({"num_hidden_layers": 4}, weights_gb="banana",
+                                      resident_gb=-3.0)
+    assert any("weights_gb" in w for w in spec["warnings"])
+    assert any("resident_gb" in w for w in spec["warnings"])
+
+
+# ── 17-model derived spec table ───────────────────────────────────────────────
+
+HYBRID_ROWS = [row for row in MODEL_ROWS if row["precedence_field"] != "dense"]
+HYBRID_IDS = [row["name"] for row in HYBRID_ROWS]
+
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_spec_table_every_model_derives_a_launchable_spec(row):
+    """Every config on this box produces numbers a launch could actually use."""
+    spec = _spec_for(row)
+    name = row["name"]
+
+    assert 0.10 <= spec["recommended_util"] <= 0.95, name
+    assert spec["max_model_len"] <= row["max_position_embeddings"], name
+    assert spec["max_model_len"] <= spec["max_fitting_context"], name
+    assert spec["declared_max_context"] == row["max_position_embeddings"], name
+
+    expected_kv = (spec["kv_bytes_per_token"] * spec["max_model_len"]
+                   + spec["bounded_bytes_total"]) / 1e9
+    assert abs(spec["kv_gb"] - expected_kv) < 1e-9, name
+
+    assert (spec["full_attention_layers"] + spec["bounded_kv_layers"]
+            + spec["stateless_layers"]) == spec["num_hidden_layers"] == row["num_hidden_layers"]
+    assert isinstance(spec["warnings"], list), name
+
+    # The independent signal: which branch of the precedence chain the REAL config selected.
+    # The rebuilt fixture config cannot fake this, so it is what makes the table meaningful
+    # rather than self-fulfilling.
+    assert spec["source_field"] == row["precedence_field"], name
+
+    verbatim = row.get("layer_types")
+    if isinstance(verbatim, list) and verbatim:
+        assert verbatim.count("full_attention") == spec["full_attention_layers"], name
+
+
+@pytest.mark.parametrize("row", HYBRID_ROWS, ids=HYBRID_IDS)
+def test_spec_table_hybrid_models_cost_less_than_the_naive_dense_estimate(row):
+    """The 4-11x overestimate this phase exists to remove, asserted per hybrid model."""
+    spec = _spec_for(row)
+    assert spec["full_attention_layers"] < row["num_hidden_layers"], row["name"]
+
+    per_layer = spec["kv_bytes_per_token"] // max(1, spec["full_attention_layers"])
+    naive_kv_gb = per_layer * row["num_hidden_layers"] * spec["max_model_len"] / 1e9
+    assert spec["kv_gb"] < naive_kv_gb, row["name"]
+
+
+def test_spec_table_covers_both_hybrid_and_dense_families():
+    """Guard the table's own coverage: a snapshot of only dense models would prove nothing."""
+    assert len(HYBRID_ROWS) >= 6
+    assert len(MODEL_ROWS) - len(HYBRID_ROWS) >= 6
