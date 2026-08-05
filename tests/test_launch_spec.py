@@ -210,6 +210,93 @@ def test_topology_table_snapshot_has_all_seventeen_models():
     assert len(set(MODEL_IDS)) == 17
 
 
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_topology_table_reproduces_recorded_counts(row):
+    """Every model on this box resolves to the layer counts the snapshot recorded.
+
+    `source_field` is the independent signal here: the rebuilt config cannot fake which
+    branch the real config selected, so this catches the handoff's wrong attribution
+    (Qwen3.6 and qwen3-next resolve via layer_types, not hybrid_override_pattern /
+    full_attention_interval) as well as any silent reordering of the chain.
+    """
+    topo = appmod._resolve_attention_topology(config_from_fixture(row))
+    assert topo["source_field"] == row["precedence_field"]
+    assert topo["num_hidden_layers"] == row["num_hidden_layers"]
+    assert topo["full_attention_layers"] == row["full_attention_layers"]
+    assert topo["bounded_kv_layers"] == row["bounded_kv_layers"]
+    assert topo["stateless_layers"] == row["stateless_layers"]
+    assert (topo["full_attention_layers"] + topo["bounded_kv_layers"]
+            + topo["stateless_layers"]) == row["num_hidden_layers"]
+
+
+@pytest.mark.parametrize(
+    "name,expected_full_bytes,expected_bounded_total",
+    [
+        # per_layer = 2 * kv_heads * head_dim; hand-computed from the snapshot rows.
+        ("openai/gpt-oss-120b", 18 * 2 * 8 * 64, 18 * 2 * 8 * 64 * 128),
+        ("qwen3-next-80b-a3b-nvfp4", 12 * 2 * 2 * 256, 0),
+        ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", 64 * 2 * 8 * 128, 0),
+    ],
+)
+def test_topology_table_kv_byte_anchors(name, expected_full_bytes, expected_bounded_total):
+    row = next(r for r in MODEL_ROWS if r["name"] == name)
+    result = appmod._kv_bytes_per_token(config_from_fixture(row), kv_dtype_bytes=1)
+    assert result["full_bytes_per_token"] == expected_full_bytes
+    assert result["bounded_bytes_total"] == expected_bounded_total
+
+
+def test_topology_table_bounded_bytes_are_context_independent():
+    """bounded_bytes_total is already a TOTAL, not a per-token rate.
+
+    gpt-oss's 18 windowed layers cost 128 tokens of KV each no matter how long the context
+    is; only full_bytes_per_token gets multiplied by max_model_len downstream.
+    """
+    config = {
+        "num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 64,
+        "sliding_window": 128,
+        "layer_types": ["full_attention"] * 18 + ["sliding_attention"] * 18,
+    }
+    result = appmod._kv_bytes_per_token(config)
+    assert result["per_layer_bytes"] == 1024
+    assert result["full_bytes_per_token"] == 18432
+    assert result["bounded_bytes_total"] == 2359296
+    assert result["topology"]["source_field"] == "layer_types"
+
+
+def test_topology_table_stateless_layers_contribute_zero_bytes():
+    """Stateless layers cost zero by construction, not by falling through a missed branch."""
+    hybrid = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 48, "num_key_value_heads": 2, "head_dim": 256,
+         "layer_types": ["full_attention"] * 12 + ["linear_attention"] * 36}
+    )
+    dense = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 12, "num_key_value_heads": 2, "head_dim": 256}
+    )
+    assert hybrid["full_bytes_per_token"] == dense["full_bytes_per_token"]
+    assert hybrid["bounded_bytes_total"] == 0
+
+
+def test_topology_table_kv_dtype_bytes_scales_linearly():
+    config = {"num_hidden_layers": 4, "num_key_value_heads": 4, "head_dim": 64}
+    one = appmod._kv_bytes_per_token(config, kv_dtype_bytes=1)
+    two = appmod._kv_bytes_per_token(config, kv_dtype_bytes=2)
+    assert two["per_layer_bytes"] == 2 * one["per_layer_bytes"] == 1024
+    assert two["full_bytes_per_token"] == 2 * one["full_bytes_per_token"]
+
+
+def test_topology_table_returns_exactly_the_interface_keys():
+    expected = {
+        "topology",
+        "num_key_value_heads",
+        "head_dim",
+        "head_dim_source",
+        "per_layer_bytes",
+        "full_bytes_per_token",
+        "bounded_bytes_total",
+    }
+    assert set(appmod._kv_bytes_per_token({})) == expected
+
+
 # ── V3 unknown layer type is loud ─────────────────────────────────────────────
 
 def test_unknown_layer_types_absent_from_snapshot():
@@ -383,6 +470,55 @@ def test_head_dim_snapshot_source_is_consistent(row):
     assert row["head_dim_source"] in ("explicit", "hidden_size//num_attention_heads")
     if row["head_dim_source"] == "hidden_size//num_attention_heads":
         assert row["head_dim"] == row["hidden_size"] // row["num_attention_heads"], row["name"]
+
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_head_dim_reproduced_from_rebuilt_config(row):
+    """Each model's KV width and where it came from, reproduced by the shipped helper."""
+    result = appmod._kv_bytes_per_token(config_from_fixture(row))
+    assert result["head_dim"] == row["head_dim"], row["name"]
+    assert result["head_dim_source"] == row["head_dim_source"], row["name"]
+    assert result["num_key_value_heads"] == row["num_key_value_heads"], row["name"]
+
+
+def test_head_dim_explicit_wins_over_the_derived_value():
+    """Qwen3.6 declares head_dim 256 while hidden_size//heads would give 128 — a 2x error."""
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 1, "head_dim": 256, "hidden_size": 2048,
+         "num_attention_heads": 16, "num_key_value_heads": 2}
+    )
+    assert result["head_dim"] == 256
+    assert result["head_dim_source"] == "explicit"
+
+
+def test_head_dim_falls_back_to_hidden_size_over_attention_heads():
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 64, "num_key_value_heads": 8, "hidden_size": 5120,
+         "num_attention_heads": 40}
+    )
+    assert result["head_dim"] == 128
+    assert result["head_dim_source"] == "hidden_size//num_attention_heads"
+    assert result["full_bytes_per_token"] == 131072
+
+
+def test_head_dim_zero_or_missing_attention_heads_does_not_divide():
+    """T-02-04: a malformed snapshot must return zeros, not raise ZeroDivisionError."""
+    for config in ({"num_hidden_layers": 4, "hidden_size": 4096, "num_attention_heads": 0},
+                   {"num_hidden_layers": 4, "hidden_size": 4096},
+                   {}):
+        result = appmod._kv_bytes_per_token(config)
+        assert result["head_dim"] == 0
+        assert result["per_layer_bytes"] == 0
+        assert result["full_bytes_per_token"] == 0
+
+
+def test_head_dim_kv_heads_fall_back_to_attention_heads():
+    """A config without grouped-query attention declares only num_attention_heads."""
+    result = appmod._kv_bytes_per_token(
+        {"num_hidden_layers": 2, "num_attention_heads": 8, "head_dim": 64}
+    )
+    assert result["num_key_value_heads"] == 8
+    assert result["per_layer_bytes"] == 1024
 
 
 # ── V7 calibration (plan 02-02) ───────────────────────────────────────────────
