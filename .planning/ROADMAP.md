@@ -18,7 +18,7 @@ into the generator and the UI.
 
 - [x] **Phase 1: Unbreak the load path** - Fix the three confirmed outages and the injection hole
 - [x] **Phase 1.1: Launch feedback** - INSERTED - Repair the Qwen3.6 profile; preflight + live load progress
-- [ ] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
+- [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [ ] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
 - [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label
@@ -90,8 +90,14 @@ with hybrid attention handled properly.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01: Attention-topology + KV-bytes-per-token solver with precedence chain
-- [ ] 02-02: Context/utilization fitting and the calibration test table
+- [x] 02-01: Attention-topology + KV-bytes-per-token solver with precedence chain
+- [x] 02-02: Context/utilization fitting and the calibration test table
+
+**Verified** 2026-08-05 — VERIFICATION.md: 6/6 criteria PASS, verified against the real
+`config.json` files on the box rather than the committed fixtures. Suite 310 passing.
+Carried forward by design: `warnings` is threaded but unconsumed (Phase 4 surfaces it),
+Qwen3.6's derived 0.42 vs hand-measured 0.55 (Phase 3 recipe precedence), and
+`_derive_launch_spec` has no application call site yet (Phase 3 plan 03-01 wires it).
 
 ### Phase 3: Curated recipe overrides
 **Goal**: Hand-measured recipes beat derived defaults, and model-family flags stop being
