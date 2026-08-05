@@ -778,8 +778,9 @@ def _resolve_attention_topology(config: dict) -> dict:
          the seventeen models here declare a window while having the flag false; reading the
          window alone would collapse a 17.2 GB dense KV estimate to near zero.
 
-    Pure: dict in, dict out. No filesystem, network, /proc or vLLM. Pool size and weights are
-    the caller's parameters, not lookups — the whole phase must be verifiable with vLLM down.
+    Pure: dict in, dict out. No filesystem, network, kernel meminfo or vLLM. Pool size and
+    weights are the caller's parameters, not lookups — the whole phase must be verifiable
+    with vLLM down.
 
     Returns {num_hidden_layers, full_attention_layers, bounded_kv_layers, stateless_layers,
     sliding_window, source_field, warnings}. `sliding_window` is the window that applies to
@@ -884,8 +885,8 @@ def _kv_bytes_per_token(config: dict, kv_dtype_bytes: int = 1) -> dict:
     ZeroDivisionError, because these dicts come from vendor-authored files that this codebase
     does not control (T-02-04).
 
-    Pure: dict in, dict out. No filesystem, network, /proc or vLLM — pool size, weight size
-    and context length are the caller's parameters.
+    Pure: dict in, dict out. No filesystem, network, kernel meminfo or vLLM — pool size,
+    weight size and context length are the caller's parameters.
 
     Returns {topology, num_key_value_heads, head_dim, head_dim_source, per_layer_bytes,
     full_bytes_per_token, bounded_bytes_total}.
@@ -919,6 +920,157 @@ def _kv_bytes_per_token(config: dict, kv_dtype_bytes: int = 1) -> dict:
         "full_bytes_per_token": topology["full_attention_layers"] * per_layer_bytes,
         "bounded_bytes_total": (topology["bounded_kv_layers"] * per_layer_bytes
                                 * (topology["sliding_window"] or 0)),
+    }
+
+
+def _kv_budget_gb(util: float, pool_gb: float, weights_gb: float,
+                  overhead_gb: float = 6.0, resident_gb: float = 0.0) -> float:
+    """How many GB of KV cache actually fit at a given --gpu-memory-utilization.
+
+    WHY `resident_gb` exists — do not delete it as padding: on this GB10 the driver reports
+    MemFree, not MemAvailable, so every byte the page cache is holding is charged against
+    `--gpu-memory-utilization` even though the kernel would evict it on demand. This was
+    measured, not assumed: at an unchanged, hand-validated 0.55 on Qwen3.6, the engine had
+    25.97 GiB of KV after dropping caches and only 0.19 GiB with ~25 GB still cached, and it
+    refused to start while blaming max_model_len. A budget that assumes the whole pool share
+    is free will therefore recommend a utilization that works on a freshly-booted box and
+    fails on a working one.
+
+    The result is clamped at 0.0: a budget smaller than the model is "no room", never a
+    negative number a caller might add to something.
+
+    Pure: scalars in, scalar out. Pool size, weight size and resident bytes are the caller's
+    parameters — reading them here would make the whole phase unverifiable with vLLM down.
+    """
+    return max(0.0, pool_gb * util - resident_gb - weights_gb - overhead_gb)
+
+
+def _derive_launch_spec(config: dict, weights_gb: float = 0.0, pool_gb: float = 121.0,
+                        kv_dtype_bytes: int = 1, overhead_gb: float = 6.0,
+                        util_margin: float = 0.04, resident_gb: float = 0.0,
+                        requested_context: Optional[int] = None,
+                        util_floor: float = 0.10, util_cap: float = 0.95) -> dict:
+    """Turn one parsed config.json into the launch numbers vLLM should be started with.
+
+    This is the public entry point of the derived-spec work: layer classification, KV bytes
+    per token, the largest context that fits, and the `--gpu-memory-utilization` to request.
+
+        recommended_util = (weights + KV + overhead + resident) / pool + margin
+
+    calibrated against a number a human already measured by hand: qwen3-next-80b-a3b-nvfp4 was
+    tuned to 0.55 on this box, and this arithmetic independently derives 0.54. That agreement
+    is the evidence the whole approach is sound — if it ever breaks, the formula is wrong, not
+    the hand-measured recipe.
+
+    The margin (default 0.04) covers allocator fragmentation and the fact that the pool is
+    unified with the OS, so the derived need is a floor rather than an exact requirement.
+    The 6 GB default overhead covers CUDA context, captured graphs and activations.
+
+    Every vendor-authored and caller-supplied number is treated as untrusted: non-numeric and
+    negative scalars are coerced to 0.0 and NAMED in `warnings` rather than silently zeroed,
+    and both divisions are guarded, so a malformed config yields a clamped answer with a trail
+    instead of a traceback. `recommended_util` is clamped into [util_floor, util_cap] because
+    its consumer hands it to a real launch: an absurd config must not be able to request more
+    memory than the box has.
+
+    Warnings collected by the topology resolver are propagated rather than dropped — an
+    unrecognized layer type over-reserves memory, and that decision has to stay visible at the
+    only layer a caller sees.
+
+    Pure: a dict and scalars in, a dict out. No filesystem, network, kernel meminfo or vLLM.
+
+    Returns the sixteen keys documented in the phase interface, notably `max_model_len` (never
+    above the model's declared maximum nor above what fits), `kv_gb` at that length, and
+    `recommended_util`.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    sizing = _kv_bytes_per_token(cfg, kv_dtype_bytes)
+    topology = sizing["topology"]
+    warnings: list[str] = list(topology.get("warnings") or [])
+
+    def _scalar(value, field: str) -> float:
+        """Coerce one caller-supplied GB figure, naming a bad value instead of hiding it."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            warnings.append(f"non-numeric {field}: {value!r} — treated as 0.0")
+            return 0.0
+        if number != number or number in (float("inf"), float("-inf")):
+            warnings.append(f"non-finite {field}: {value!r} — treated as 0.0")
+            return 0.0
+        if number < 0:
+            warnings.append(f"negative {field}: {number} — floored at 0.0")
+            return 0.0
+        return number
+
+    weights_gb = _scalar(weights_gb, "weights_gb")
+    pool_gb = _scalar(pool_gb, "pool_gb")
+    overhead_gb = _scalar(overhead_gb, "overhead_gb")
+    resident_gb = _scalar(resident_gb, "resident_gb")
+
+    kv_rate = sizing["full_bytes_per_token"]      # a RATE: multiply by context
+    bounded_total = sizing["bounded_bytes_total"]  # already a TOTAL: do not
+    declared_max_context = _as_int(t.get("max_position_embeddings"))
+
+    # ── Largest context that fits, at the most aggressive utilization allowed ──
+    if pool_gb <= 0:
+        warnings.append(f"invalid pool_gb: {pool_gb} — no budget can be sized")
+        max_fitting_context = 0
+    elif kv_rate <= 0:
+        # Nothing grows with context: an all-stateless (or empty) model is limited by what it
+        # was trained for, not by memory.
+        warnings.append("no full-attention layers; context is not KV-bounded")
+        max_fitting_context = declared_max_context
+    else:
+        budget_bytes = _kv_budget_gb(util_cap, pool_gb, weights_gb, overhead_gb,
+                                     resident_gb) * 1e9
+        max_fitting_context = max(0, int((budget_bytes - bounded_total) // kv_rate))
+
+    max_model_len = min(declared_max_context or max_fitting_context, max_fitting_context)
+
+    if declared_max_context and max_fitting_context < declared_max_context:
+        warnings.append(
+            f"budget-limited context: {max_fitting_context} tokens fit, "
+            f"model declares {declared_max_context}"
+        )
+
+    if requested_context is not None:
+        requested = max(0, _as_int(requested_context))
+        if requested > max_model_len:
+            warnings.append(
+                f"requested context {requested} exceeds the usable {max_model_len}"
+            )
+        elif requested > 0:
+            max_model_len = requested
+
+    kv_gb = (kv_rate * max_model_len + bounded_total) / 1e9
+
+    if pool_gb <= 0:
+        recommended_util = util_cap
+    else:
+        raw = (weights_gb + kv_gb + overhead_gb + resident_gb) / pool_gb + util_margin
+        recommended_util = round(min(util_cap, max(util_floor, round(raw, 2))), 2)
+
+    return {
+        "topology": topology,
+        "num_hidden_layers": topology["num_hidden_layers"],
+        "full_attention_layers": topology["full_attention_layers"],
+        "bounded_kv_layers": topology["bounded_kv_layers"],
+        "stateless_layers": topology["stateless_layers"],
+        "source_field": topology["source_field"],
+        "kv_bytes_per_token": kv_rate,
+        "bounded_bytes_total": bounded_total,
+        "declared_max_context": declared_max_context,
+        "max_fitting_context": max_fitting_context,
+        "max_model_len": max_model_len,
+        "kv_gb": kv_gb,
+        "weights_gb": weights_gb,
+        "overhead_gb": overhead_gb,
+        "recommended_util": recommended_util,
+        "warnings": warnings,
     }
 
 
