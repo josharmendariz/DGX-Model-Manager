@@ -40,8 +40,18 @@
       "log":     {"enabled": false}
     }
   },
+  "sites_discovery": {
+    "_comment": "The Dashboards tab finds running web UIs itself: every non-loopback TCP listener plus every Kubernetes NodePort gets one HTTP GET, and a port earns a card only if it answers with an HTML page. Ports answering JSON/plain text are kept as kind=api behind a toggle. All keys optional.",
+    "enabled": true,
+    "kubernetes": true,
+    "ttl_s": 30,
+    "probe_timeout_s": 2.0,
+    "include_loopback": false,
+    "exclude_ports": [],
+    "include_ports": []
+  },
   "sites": [
-    {"_comment": "Optional — other web UIs on this box, shown as link cards in the Dashboards tab. Give a port (resolved against app.sites_base → app.host → the request host; scheme defaults to http) OR a verbatim url. group is a free-form section heading; desc is a one-liner."},
+    {"_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see — a UI on another host. Ports resolve against app.sites_base → app.host → the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."},
     {"name": "Grafana",   "port": 3000, "group": "Metrics", "desc": "Metrics dashboards"},
     {"name": "Other Box", "url": "https://otherhost.example:8443", "group": "Ops", "desc": "Dashboard on a different host"}
   ]

@@ -129,15 +129,25 @@ HF_CACHE_DIR      = Path(os.path.expanduser(_paths.get("hf_cache", "~/.cache/hug
 #                   "deployment": "litellm"}
 _litellm_k8s = _app_config.get("litellm_k8s", {})
 
-# Dashboards — optional "sites" array in config.json listing other web UIs on
-# this box, rendered as link cards in the Dashboards tab. Each entry:
+# Dashboards — the tab lists every web UI actually running on this box, found
+# by discovery (host TCP listeners + Kubernetes NodePorts, see _discover_sites).
+# The "sites" array in config.json is an *overlay*, not the list: entries with a
+# "port" rename/describe/group a discovered port, and entries with a verbatim
+# "url" pin something discovery cannot see (a UI on another host).
 #   {"name": "...", "desc": "...", "group": "...", "port": 3000}  — resolved
 #   against app.sites_base (falls back to app.host, then the request host), or
 #   {"name": "...", "url": "http://other-host:1234"}              — verbatim.
 # Optional "scheme" (default "http") applies to port-based entries. A missing
-# or empty array simply renders the tab's empty-state — never an error.
+# or empty array is normal — discovery still fills the tab.
 _SITES = _app_config.get("sites") or []
 _SITES_BASE = _app_config.get("app", {}).get("sites_base", "")
+
+# Discovery knobs, all optional (config.json "sites_discovery"):
+#   enabled       turn auto-discovery off and fall back to the "sites" array
+#   kubernetes    probe NodePort services via kubectl (skipped if it fails)
+#   ttl_s         cache lifetime; the tab re-probes ~40 ports per refresh
+#   probe_timeout_s / exclude_ports / include_ports
+_SITES_DISCOVERY = _app_config.get("sites_discovery") or {}
 
 # ─── Engine Registry ─────────────────────────────────────────────────────────
 # Data-driven engine definitions — add a new engine by adding an entry here.
@@ -1590,8 +1600,31 @@ async def get_nodeinfo():
     }
 
 # ── Dashboards ────────────────────────────────────────────────────────────────
-# Read-only listing of other web UIs on this box (config.json "sites" array),
-# consumed by the Dashboards tab. Unauthenticated by design, like /api/status.
+# Live inventory of the web UIs running on this box, consumed by the Dashboards
+# tab. Unauthenticated by design, like /api/status.
+#
+# Discovery is two cheap listings — `ss` for host TCP listeners and `kubectl`
+# for NodePort services — followed by one HTTP GET per candidate. The GET is
+# what does the real filtering: a port earns a card only by answering with an
+# HTML page. That separates dashboards from the many API/metrics ports on this
+# host (vLLM, Ollama, node-exporter, traefik) without maintaining a port list,
+# and the page's <title> supplies a name for anything the config doesn't cover.
+# Ports that answer non-HTML are kept as kind="api" so the UI can offer them
+# behind a toggle rather than hiding a running service outright.
+
+_TITLE_RE = _re.compile(r"<title[^>]*>(.*?)</title>", _re.I | _re.S)
+
+# Listeners that are never a dashboard and would waste a probe. Everything else
+# has to prove itself by responding — this stays short on purpose.
+_DISCOVERY_SKIP_PORTS = {22, 53, 111, 631, 6443, 10250}
+
+# Titles too generic to name a card by — the framework's default, not the app's.
+# When one of these comes back, fall through to the k8s service / process name.
+_GENERIC_TITLES = {"streamlit", "dashboard", "home", "index", "login", "sign in",
+                   "react app", "vite app", "document", "untitled"}
+
+_SITES_CACHE: dict = {"at": 0.0, "payload": None}
+_SITES_LOCK = asyncio.Lock()
 
 
 def _resolve_site_url(site: dict, request_host: str) -> str:
@@ -1603,6 +1636,246 @@ def _resolve_site_url(site: dict, request_host: str) -> str:
     if not host or host == "0.0.0.0":
         host = request_host or "127.0.0.1"
     return f"{site.get('scheme', 'http')}://{host}:{site.get('port')}"
+
+
+def _is_loopback(addr: str) -> bool:
+    a = addr.split("%")[0]
+    return a.startswith("127.") or a == "::1"
+
+
+def _is_wildcard(addr: str) -> bool:
+    return addr in ("0.0.0.0", "::", "*", "")
+
+
+def _parse_ss_listeners(text: str) -> list[dict]:
+    """Parse `ss -tlnpH` rows into {addr, port, proc}. Local address is field 4;
+    IPv6 arrives bracketed ([::]:8123) and wildcard binds as *:9090, both of
+    which normalise to a wildcard addr. Process names are only visible for our
+    own UID — root-owned listeners legitimately come back with proc="".
+    """
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr, _, port = parts[3].rpartition(":")
+        if not port.isdigit():
+            continue
+        addr = addr.strip("[]")
+        m = _re.search(r'\(\("([^"]+)"', line)
+        rows.append({"addr": "0.0.0.0" if _is_wildcard(addr) else addr,
+                     "port": int(port), "proc": m.group(1) if m else ""})
+    return rows
+
+
+def _parse_nodeport_services(payload: dict) -> list[dict]:
+    """Flatten `kubectl get svc -A -o json` down to NodePort exposures."""
+    out = []
+    for item in payload.get("items", []) or []:
+        meta = item.get("metadata", {})
+        for port in item.get("spec", {}).get("ports", []) or []:
+            if port.get("nodePort"):
+                out.append({"port": int(port["nodePort"]),
+                            "svc": meta.get("name", ""),
+                            "namespace": meta.get("namespace", "")})
+    return out
+
+
+async def _discover_listeners() -> dict:
+    r = await _run("ss", "-tlnpH", timeout=5)
+    if r.returncode != 0:
+        return {"ok": False, "rows": [], "error": (r.stderr or r.stdout).strip() or "ss failed"}
+    return {"ok": True, "rows": _parse_ss_listeners(r.stdout), "error": ""}
+
+
+async def _discover_nodeports() -> dict:
+    r = await _run("kubectl", "get", "svc", "-A", "-o", "json", timeout=8)
+    if r.returncode != 0:
+        return {"ok": False, "rows": [], "error": (r.stderr or r.stdout).strip() or "kubectl failed"}
+    try:
+        return {"ok": True, "rows": _parse_nodeport_services(json.loads(r.stdout)), "error": ""}
+    except Exception as e:
+        return {"ok": False, "rows": [], "error": str(e)}
+
+
+def _build_candidates(listeners: list[dict], nodeports: list[dict]) -> dict:
+    """Collapse both discovery sources into one candidate per port.
+
+    probe_host is where *we* reach it (a wildcard bind is probed on loopback);
+    bind_addr is what the browser must use — a service bound only to the tailnet
+    address, like this app itself, is unreachable at 127.0.0.1 and its card has
+    to link to that address rather than to the configured site base.
+    """
+    excluded = _DISCOVERY_SKIP_PORTS | set(_SITES_DISCOVERY.get("exclude_ports") or [])
+    forced = set(_SITES_DISCOVERY.get("include_ports") or [])
+    include_loopback = bool(_SITES_DISCOVERY.get("include_loopback"))
+    cands: dict[int, dict] = {}
+    for row in listeners:
+        port, addr = row["port"], row["addr"]
+        if port in excluded and port not in forced:
+            continue
+        if _is_loopback(addr) and not include_loopback and port not in forced:
+            continue
+        c = cands.setdefault(port, {"port": port, "source": "host", "proc": "",
+                                    "svc": "", "namespace": "", "bind_addr": ""})
+        c["proc"] = c["proc"] or row["proc"]
+        # A wildcard bind is the more permissive one — prefer it over an
+        # address-specific row for the same port.
+        if _is_wildcard(addr):
+            c["bind_addr"] = ""
+        elif not c["bind_addr"]:
+            c["bind_addr"] = addr
+    for row in nodeports:
+        port = row["port"]
+        if port in excluded and port not in forced:
+            continue
+        c = cands.setdefault(port, {"port": port, "source": "k8s", "proc": "",
+                                    "svc": "", "namespace": "", "bind_addr": ""})
+        c["source"] = "k8s"
+        c["svc"], c["namespace"] = row["svc"], row["namespace"]
+    for c in cands.values():
+        c["probe_host"] = c["bind_addr"] or "127.0.0.1"
+    return cands
+
+
+async def _probe_site(url: str, timeout: float) -> dict:
+    """One classified GET. "ui" = answered with HTML, i.e. a page a human can
+    open; "api" = answered with JSON/plain text; "down" = nothing there.
+    Redirects are followed (Grafana lands on /login) and auth walls still count
+    as a UI — Headlamp and Hermes both gate their pages behind one.
+    """
+    if _http is None:
+        return {"kind": "down", "status": 0, "title": "", "url": url}
+    try:
+        r = await _http.get(url, timeout=timeout, follow_redirects=True)
+    except Exception:
+        # A plain-HTTP GET against a TLS port fails at the protocol level; the
+        # one retry is what keeps HTTPS-only UIs from reading as dead.
+        if url.startswith("http://"):
+            try:
+                r = await _http.get("https://" + url[7:], timeout=timeout, follow_redirects=True)
+                url = "https://" + url[7:]
+            except Exception:
+                return {"kind": "down", "status": 0, "title": "", "url": url}
+        else:
+            return {"kind": "down", "status": 0, "title": "", "url": url}
+    if r.status_code >= 400 and r.status_code not in (401, 403):
+        return {"kind": "down", "status": r.status_code, "title": "", "url": url}
+    ctype = r.headers.get("content-type", "").lower()
+    if "html" not in ctype:
+        return {"kind": "api", "status": r.status_code, "title": "", "url": url}
+    title = ""
+    try:
+        m = _TITLE_RE.search(r.text[:8192])
+        if m:
+            title = _re.sub(r"\s+", " ", m.group(1)).strip()[:60]
+    except Exception:
+        pass
+    return {"kind": "ui", "status": r.status_code, "title": title, "url": url}
+
+
+def _discovered_name(cand: dict, title: str) -> str:
+    """Name a card from the best evidence available: the page's own <title>,
+    else the k8s service, else the listening process, else the bare port."""
+    clean = title.strip()
+    if clean and clean.lower() not in _GENERIC_TITLES \
+            and not clean.lower().startswith("directory listing"):
+        return clean
+    if cand.get("svc"):
+        return _re.sub(r"-(svc|service)$", "", cand["svc"])
+    if cand.get("proc"):
+        return cand["proc"]
+    return f"Port {cand['port']}"
+
+
+async def _discover_sites(request_host: str) -> dict:
+    """Full inventory: discovered UIs merged with the config.json overlay.
+
+    Overlay entries matched by port win on name/desc/group (curation beats a
+    <title>); config entries with a verbatim url, or whose port is not listening,
+    are still listed so a known-but-down dashboard stays visible instead of
+    silently vanishing.
+    """
+    overlay = {}
+    pinned = []
+    for s in _SITES:
+        if not isinstance(s, dict) or not s.get("name"):
+            continue
+        if s.get("port"):
+            overlay[int(s["port"])] = s
+        elif s.get("url"):
+            pinned.append(s)
+
+    listeners = {"ok": False, "rows": [], "error": "discovery disabled"}
+    nodeports = {"ok": False, "rows": [], "error": "disabled"}
+    if _SITES_DISCOVERY.get("enabled", True):
+        listeners = await _discover_listeners()
+        if _SITES_DISCOVERY.get("kubernetes", True):
+            nodeports = await _discover_nodeports()
+
+    cands = _build_candidates(listeners["rows"], nodeports["rows"])
+    base_host = _SITES_BASE or APP_HOST
+    if not base_host or base_host == "0.0.0.0":
+        base_host = request_host or "127.0.0.1"
+    timeout = float(_SITES_DISCOVERY.get("probe_timeout_s", 2.0))
+
+    ordered = sorted(cands.values(), key=lambda c: c["port"])
+    probes = await asyncio.gather(*(
+        _probe_site(f"http://{c['probe_host']}:{c['port']}/", timeout) for c in ordered
+    ))
+
+    sites, seen_ports = [], set()
+    for cand, probe in zip(ordered, probes):
+        if probe["kind"] == "down":
+            continue
+        port = cand["port"]
+        seen_ports.add(port)
+        conf = overlay.get(port, {})
+        link_host = cand["bind_addr"] or base_host
+        scheme = "https" if probe["url"].startswith("https://") else conf.get("scheme", "http")
+        detail = (f"{cand['namespace']}/{cand['svc']}" if cand.get("svc")
+                  else (cand.get("proc") or ""))
+        sites.append({
+            "name": conf.get("name") or _discovered_name(cand, probe["title"]),
+            "desc": conf.get("desc", "") or detail,
+            "group": conf.get("group", "") or ("Kubernetes" if cand["source"] == "k8s" else "Host"),
+            "url": conf.get("url") or f"{scheme}://{link_host}:{port}",
+            "reachable": True,
+            "port": port,
+            "kind": probe["kind"],
+            "source": "config" if conf else cand["source"],
+            "detail": detail,
+        })
+
+    # Tallied before the overlay leftovers are appended — these numbers describe
+    # the sweep, and a pinned remote UI was never part of it.
+    counts = {"ui": sum(1 for s in sites if s["kind"] == "ui"),
+              "api": sum(1 for s in sites if s["kind"] == "api")}
+
+    # Configured entries discovery couldn't confirm — a remote pin, or a
+    # dashboard that is currently down. Probed individually so the dot is honest.
+    leftovers = pinned + [s for p, s in overlay.items() if p not in seen_ports]
+    if leftovers:
+        urls = [_resolve_site_url(s, request_host) for s in leftovers]
+        checks = await asyncio.gather(*(_site_reachable(u) for u in urls))
+        for s, url, ok in zip(leftovers, urls, checks):
+            sites.append({
+                "name": s["name"], "desc": s.get("desc", ""),
+                "group": s.get("group", "") or "Other", "url": url,
+                "reachable": ok, "port": s.get("port"), "kind": "ui",
+                "source": "config", "detail": "",
+            })
+
+    return {
+        "sites": sites,
+        "discovery": {
+            "enabled": bool(_SITES_DISCOVERY.get("enabled", True)),
+            "host": {"ok": listeners["ok"], "error": listeners["error"]},
+            "kubernetes": {"ok": nodeports["ok"], "error": nodeports["error"]},
+            "candidates": len(cands),
+            **counts,
+        },
+    }
 
 
 async def _site_reachable(url: str) -> bool:
@@ -1618,23 +1891,19 @@ async def _site_reachable(url: str) -> bool:
 
 
 @app.get("/api/sites")
-async def get_sites(request: Request):
-    resolved = []
-    for s in _SITES:
-        if not isinstance(s, dict) or not s.get("name"):
-            continue
-        if not s.get("url") and not s.get("port"):
-            continue
-        resolved.append({
-            "name": s["name"],
-            "desc": s.get("desc", ""),
-            "group": s.get("group", ""),
-            "url": _resolve_site_url(s, request.url.hostname or ""),
-        })
-    checks = await asyncio.gather(*(_site_reachable(e["url"]) for e in resolved))
-    for entry, ok in zip(resolved, checks):
-        entry["reachable"] = ok
-    return {"sites": resolved}
+async def get_sites(request: Request, refresh: int = 0):
+    """Cached because a full sweep is ~40 HTTP probes; switching tabs shouldn't
+    pay for that. The lock collapses concurrent callers onto one sweep."""
+    ttl = float(_SITES_DISCOVERY.get("ttl_s", 30))
+    async with _SITES_LOCK:
+        age = _time.monotonic() - _SITES_CACHE["at"]
+        if refresh or _SITES_CACHE["payload"] is None or age > ttl:
+            _SITES_CACHE["payload"] = await _discover_sites(request.url.hostname or "")
+            _SITES_CACHE["at"] = _time.monotonic()
+            age = 0.0
+    payload = dict(_SITES_CACHE["payload"])
+    payload["cached_age_s"] = round(age, 1)
+    return payload
 
 
 # ── Recommendations ─────────────────────────────────────────────────────────
@@ -5875,10 +6144,20 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 
     <!-- ─── DASHBOARDS ─── -->
     <div class="tab" id="tab-sites">
-      <div class="page-hdr">
-        <div class="page-title">Dashboards</div>
-        <div class="page-sub">Other web UIs served on this box. Managed via the <code>sites</code> array in <code>config.json</code>.</div>
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Dashboards</div>
+          <div class="page-sub">Web UIs running on this box right now &mdash; discovered from listening ports and Kubernetes NodePorts. Names and groups can be curated via the <code>sites</code> array in <code>config.json</code>.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;white-space:nowrap">
+          <label class="page-sub" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer"
+                 title="Also show ports that answered with JSON or plain text instead of a page (APIs, exporters).">
+            <input type="checkbox" id="sites-show-api" onchange="renderSites()"> APIs
+          </label>
+          <button class="btn btn-sm" onclick="loadSites(true)" title="Re-probe every listening port">&#8635; Rescan</button>
+        </div>
       </div>
+      <div id="sites-meta" class="page-sub" style="margin-bottom:14px"></div>
       <div id="sites-root">
         <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
       </div>
@@ -6116,48 +6395,83 @@ function setPill(id, ok, label) {
 // Dashboards
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function loadSites() {
+let _lastSites = null;
+
+async function loadSites(rescan) {
   const root = document.getElementById('sites-root');
+  const meta = document.getElementById('sites-meta');
+  if (rescan) root.innerHTML = '<div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>';
   try {
-    const d = await apiFetch('/api/sites');
-    const sites = d.sites || [];
-    if (!sites.length) {
-      root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
-        '<div class="empty-text">No dashboards configured &mdash; add a <code>sites</code> array to config.json</div></div>';
-      return;
-    }
-    // Group cards under sec-label headings; ungrouped entries land in "Other".
-    const groups = new Map();
-    sites.forEach(s => {
-      const g = s.group || 'Other';
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(s);
-    });
-    let html = '';
-    for (const [group, entries] of groups) {
-      html += '<div class="sec-label">' + _escHtml(group) + '</div>';
-      html += '<div class="model-grid">' + entries.map(s => {
-        let hostLabel = s.url;
-        try { hostLabel = new URL(s.url).host; } catch(e) {}
-        const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
-        const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
-        const href = _escHtml(s.url).replace(/"/g, '&quot;');
-        return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
-          '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
-          '<div class="model-card-info">' +
-            '<div class="model-card-name">' + _escHtml(s.name) + '</div>' +
-            '<div class="model-card-meta">' + _escHtml(hostLabel) +
-              (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
-          '</div>' +
-          '<div class="model-card-right"><span class="tag tag-amber">open ↗</span></div>' +
-        '</a>';
-      }).join('') + '</div>';
-    }
-    root.innerHTML = html;
+    _lastSites = await apiFetch('/api/sites' + (rescan ? '?refresh=1' : ''));
+    const dd = _lastSites.discovery || {};
+    const bits = [];
+    if (dd.enabled === false) bits.push('discovery disabled &mdash; showing config only');
+    else bits.push(dd.candidates + ' listening ports probed &middot; ' + dd.ui + ' UIs, ' + dd.api + ' APIs');
+    if (dd.host && dd.host.ok === false) bits.push('host scan failed: ' + _escHtml(dd.host.error || ''));
+    if (dd.kubernetes && dd.kubernetes.ok === false) bits.push('kubectl unavailable');
+    if (_lastSites.cached_age_s) bits.push('cached ' + _lastSites.cached_age_s + 's ago');
+    meta.innerHTML = bits.join(' &middot; ');
+    renderSites();
   } catch(e) {
     root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
-      '<div class="empty-text">Could not load dashboards · ' + _escHtml(e.message) + '</div></div>';
+      '<div class="empty-text">Could not load dashboards &middot; ' + _escHtml(e.message) + '</div></div>';
   }
+}
+
+function renderSites() {
+  const root = document.getElementById('sites-root');
+  if (!_lastSites) return;
+  const showApi = document.getElementById('sites-show-api').checked;
+  const sites = (_lastSites.sites || []).filter(s => showApi || s.kind !== 'api');
+  if (!sites.length) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
+      '<div class="empty-text">No web UIs found on this box</div></div>';
+    return;
+  }
+  // Two services can share a <title> ("Node Exporter" on :9100 and :9101) — a
+  // repeated name makes the pair unreadable, so it earns its port back.
+  const nameCount = {};
+  sites.forEach(s => { nameCount[s.name] = (nameCount[s.name] || 0) + 1; });
+  const label = s => nameCount[s.name] > 1 && s.port ? s.name + ' :' + s.port : s.name;
+
+  // Group cards under sec-label headings. Curated groups keep their meaning and
+  // sort first; the auto-assigned buckets fall to the bottom of the page.
+  const TAIL = ['Kubernetes', 'Host', 'Other'];
+  const groups = new Map();
+  sites.forEach(s => {
+    const g = s.group || 'Other';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(s);
+  });
+  const order = [...groups.keys()].sort((a, b) => {
+    const ai = TAIL.indexOf(a), bi = TAIL.indexOf(b);
+    if (ai !== bi) return (ai < 0 ? -1 : ai) - (bi < 0 ? -1 : bi);
+    return a.localeCompare(b);
+  });
+  let html = '';
+  for (const group of order) {
+    html += '<div class="sec-label">' + _escHtml(group) + '</div>';
+    html += '<div class="model-grid">' + groups.get(group).map(s => {
+      let hostLabel = s.url;
+      try { hostLabel = new URL(s.url).host; } catch(e) {}
+      const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
+      const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
+      const href = _escHtml(s.url).replace(/"/g, '&quot;');
+      const tag = s.kind === 'api'
+        ? '<span class="tag">api</span>'
+        : '<span class="tag tag-amber">open ↗</span>';
+      return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
+        '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
+        '<div class="model-card-info">' +
+          '<div class="model-card-name">' + _escHtml(label(s)) + '</div>' +
+          '<div class="model-card-meta">' + _escHtml(hostLabel) +
+            (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
+        '</div>' +
+        '<div class="model-card-right">' + tag + '</div>' +
+      '</a>';
+    }).join('') + '</div>';
+  }
+  root.innerHTML = html;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
