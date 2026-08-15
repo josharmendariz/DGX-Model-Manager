@@ -1913,6 +1913,7 @@ async def get_sites(request: Request, refresh: int = 0):
 # `match` rule; only fired recommendations are returned, ranked by severity.
 
 _RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_MODEL_CAPABILITIES_FILE = _APP_DIR / "model_capabilities.json"
 _REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1922,6 +1923,78 @@ def _load_recommendations() -> dict:
     except Exception as e:
         _logger.warning("Could not load recommendations.json: %s", e)
         return {"meta": {}, "recommendations": []}
+
+
+def _load_model_capabilities() -> dict:
+    try:
+        return json.loads(_MODEL_CAPABILITIES_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load model_capabilities.json: %s", e)
+        return {"meta": {}, "models": []}
+
+
+_PARSER_NAME_RE = _re.compile(r"^[a-z0-9_.-]{1,64}$")
+_PARSER_EMISSION_CONFIDENCE = {
+    "recipe-proven", "template-identical-to-recipe-proven",
+}
+
+
+def _capability_entry(info: dict) -> dict | None:
+    capabilities = _load_model_capabilities()
+    rows = capabilities.get("models", []) if isinstance(capabilities, dict) else []
+    if not isinstance(rows, list):
+        return None
+
+    name = info.get("name")
+    name_key = name.casefold() if isinstance(name, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (name_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == name_key
+                        for match in matches)):
+            return row
+
+    architectures = info.get("architectures", [])
+    architecture = (architectures[0]
+                    if isinstance(architectures, list) and architectures else None)
+    architecture_key = architecture.casefold() if isinstance(architecture, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (architecture_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == architecture_key
+                        for match in matches)):
+            return row
+    return None
+
+
+def _capability_emission_details(
+        entry: dict | None) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if not isinstance(entry, dict):
+        return None, None, ()
+
+    warnings = []
+    values = []
+    for field in ("tool_call_parser", "reasoning_parser"):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str)
+                                  or not _PARSER_NAME_RE.match(value)):
+            warnings.append(
+                f"capability map {field} is invalid; expected "
+                "lowercase letters, digits, dot, underscore or hyphen (max 64)")
+            value = None
+        values.append(value)
+
+    explicit_emit = entry.get("emit")
+    emittable = (explicit_emit if isinstance(explicit_emit, bool)
+                 else entry.get("confidence") in _PARSER_EMISSION_CONFIDENCE)
+    if not emittable:
+        return None, None, tuple(warnings)
+    return values[0], values[1], tuple(warnings)
+
+
+def _capability_emission(entry: dict | None) -> tuple[str | None, str | None]:
+    tool_parser, reasoning_parser, _warnings = _capability_emission_details(entry)
+    return tool_parser, reasoning_parser
 
 
 def _profile_script_text(profile: dict) -> str:
@@ -4135,11 +4208,18 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             raise HTTPException(400, "Invalid vllm.moe_backend: expected lowercase letters, "
                                      "digits and underscores only.")
         arg_lines.append(f"  --moe-backend {_moe_backend} \\")
-    if "qwen" in info["name"].lower():
-        arg_lines += [
-            "  --enable-auto-tool-choice \\",
-            "  --tool-call-parser qwen3_coder \\",
-        ]
+    if not is_gpt_oss:
+        tool_parser, reasoning_parser, capability_warnings = (
+            _capability_emission_details(_capability_entry(info)))
+        info["warnings"].extend(capability_warnings)
+        if tool_parser is not None:
+            arg_lines += [
+                "  --enable-auto-tool-choice \\",
+                f"  --tool-call-parser {shlex.quote(tool_parser)} \\",
+            ]
+        if reasoning_parser is not None:
+            arg_lines.append(
+                f"  --reasoning-parser {shlex.quote(reasoning_parser)} \\")
     arg_lines.append("  --generation-config vllm")
 
     # Whether an explicit `vllm serve` is needed is a property of the IMAGE, not of the
