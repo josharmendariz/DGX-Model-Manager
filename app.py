@@ -3306,7 +3306,7 @@ async def _preflight_smoke(facts: dict, script: str) -> list:
                         f"{runner} does not exist, so the recipe could not be dry-run.")]
         proc = await asyncio.create_subprocess_exec(
             str(runner), facts["recipe"], "--dry-run",
-            cwd=str(recipe_dir),
+            cwd=str(recipe_root),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(),
