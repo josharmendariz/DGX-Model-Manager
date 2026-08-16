@@ -3299,8 +3299,8 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
 async def _preflight_smoke(facts: dict, script: str) -> list:
     """Spend a couple of seconds proving the arguments actually parse."""
     if facts["recipe_backed"]:
-        recipe_dir = Path(os.path.expanduser("~/spark-vllm-docker"))
-        runner = recipe_dir / "run-recipe.sh"
+        _, recipe_root = _recipe_dirs()   # runner dir = parent of the recipe yaml dir
+        runner = recipe_root / "run-recipe.sh"
         if not runner.exists():
             return [_pf("skip", "smoke", "Recipe runner not found",
                         f"{runner} does not exist, so the recipe could not be dry-run.")]
@@ -3388,6 +3388,24 @@ async def vllm_preflight(req: EngineStartRequest):
     }
 
 
+# The one owner of "where the recipe YAMLs and run-recipe.sh live." Generator, Dry-Run
+# smoke, and preflight memory math must all agree on this, or a configured recipe_dir
+# would launch from one place while validating another. Config -> default (no env
+# override: no other vllm block key has one either).
+def _vllm_recipe_dir() -> str:
+    return (_app_config.get("vllm", {}) or {}).get("recipe_dir") or "~/spark-vllm-docker/recipes"
+
+
+def _recipe_dirs() -> tuple[Path, Path]:
+    """(recipe_yaml_dir, runner_dir) from the live config. Pre-flight-only use
+    (_recipe_util, _preflight_smoke): the generator stays a pure function of its
+    vllm_cfg argument. run-recipe.sh sits in the checkout root, sibling of the
+    recipes/ subdir, so the runner dir is the yaml dir's parent — the same
+    assumption the generated wrapper's `cd "$RECIPE_DIR/.."` makes."""
+    ydir = Path(os.path.expanduser(_vllm_recipe_dir()))
+    return ydir, ydir.parent
+
+
 def _read_recipe(recipe_dir, name: str) -> tuple[Optional[dict], list[str]]:
     """Render and normalize one run-recipe YAML; malformed input is no opinion."""
     if not isinstance(name, str) or not _re.fullmatch(r"[\w.-]+", name):
@@ -3449,7 +3467,7 @@ def _read_recipe(recipe_dir, name: str) -> tuple[Optional[dict], list[str]]:
 
 def _recipe_util(recipe: str) -> Optional[float]:
     """Return only a fractional recipe utilization for preflight memory math."""
-    record, _ = _read_recipe(os.path.expanduser("~/spark-vllm-docker/recipes"), recipe)
+    record, _ = _read_recipe(_recipe_dirs()[0], recipe)
     return record.get("gpu_memory_utilization") if record is not None else None
 
 
@@ -4044,8 +4062,8 @@ def _resolve_launch(config: dict, info: dict, vllm_cfg: dict) -> dict:
 
     recipe_name, warnings = _resolve_recipe_model(name, vllm_cfg)
     if recipe_name is not None:
-        recipe_dir = vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
-        record, reader_warnings = _read_recipe(recipe_dir, recipe_name)
+        res_dir = vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        record, reader_warnings = _read_recipe(res_dir, recipe_name)
         warnings.extend(reader_warnings)
         if record is not None:
             if record.get("cluster_only") is True:
@@ -4137,9 +4155,9 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     preamble = _vllm_script_preamble(
         info, launch_dir, recipe_backed=resolved["shape"] == "recipe")
     if resolved["shape"] == "recipe":
-        recipe_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        res_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
         return (script_name, preamble + _recipe_profile_body(
-            recipe_dir, resolved["recipe"]), info)
+            res_dir, resolved["recipe"]), info)
 
     mounts, container_model = _container_model_mount(launch_dir, slug)
     dtype = info["dtype"]

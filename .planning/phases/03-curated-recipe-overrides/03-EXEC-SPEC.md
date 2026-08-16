@@ -28,7 +28,7 @@ Deliver REQ-05 / Roadmap SC1–SC5:
 - OQ-3: Nemotron super_v3 vs nemotron_v3 — carry both in evidence; no side picked;
   touch neither artifact.
 - OQ-4: regenerate 02-MODEL-FIXTURES.json with an `architectures` column (Wave 0).
-- OQ-5: generated wrapper inlines recipe dir + name (no RECIPE= shell vars).
+- OQ-5: generated wrapper is SELF-CONTAINED — inlines recipe dir + name as a top-of-file literal (`RECIPE_DIR=… RECIPE=…`, matching the live hand-written wrapper and what _parse_launch_script/_PF_RECIPE_RE expect); NO external env dependency. (Clarification: the earlier 'no RECIPE= shell vars' was loose wording.)
 
 ## Locked (inherited, non-negotiable)
 
@@ -140,8 +140,7 @@ the existing pattern):
     "recipe_dir": "~/spark-vllm-docker/recipes",
     "recipes": { "Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo", ... }
   }
-env override precedence idiom: config -> env -> default, same shape as alerts
-(DMM_VLLM_RECIPE_DIR / DMM_VLLM_RECIPES_JSON style keyed off existing DMM_* if any).
+precedence: config.json `vllm.recipe_dir` -> default `~/spark-vllm-docker/recipes`. (Correction: no env override — no other `vllm` block key has one, so adding it here would be unexplained surface. The alerts env idiom named here does not apply to the vllm block.)
 MATCHING: fnmatch.fnmatchcase(model_name.lower(), pattern.lower()); most-specific wins
 (fewer wildcards, then longer literal, then lexicographic) + WARNING when >1 pattern
 matches. Shipped config.example.json maps ONLY Qwen3.6 (gpt-oss NOT mapped — SC3).
@@ -229,7 +228,7 @@ W0 fixtures (before any coverage test):
       recipe-vs-profile conflict), qwen3.6-35b-a3b-fp8-dflash.yaml ({{brace}}
       escape), step-3.7-flash-fp8.yaml (GB trap), deepseek-v4-flash.yaml
       (cluster_only=true example). Copy via `cp`, verify with md5sum; the reader
-      must take recipe_dir as a PARAMETER with a default so tests point at fixtures.
+      must take recipe_dir as a PARAMETER so tests point at fixtures (a required arg; a hidden default would just relocate the magic path).
   F2. tests/fixtures/recipes/DRIFT test: if ~/spark-vllm-docker/recipes exists,
       assert each committed fixture md5sums equal its live counterpart, else skip.
   F3. REGENERATE .planning/phases/02-derived-launch-spec/02-MODEL-FIXTURES.json:

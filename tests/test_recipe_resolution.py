@@ -167,3 +167,35 @@ def test_resolver_preserves_usable_positive_derivations():
         config, {"name": "Acme/Usable", "size_gb": 37.0}, {})
     assert resolved["max_model_len"] > 0
     assert resolved["util"] > 0.10
+
+
+def test_recipe_dir_is_one_truth_for_generator_and_preflight(tmp_path, monkeypatch):
+    """Regression: W1 exposed vllm.recipe_dir to the generator only, while the
+    preflight readers (_recipe_util, _preflight_smoke) still hardcoded
+    ~/spark-vllm-docker. With a non-default recipe_dir the wrapper would launch
+    one recipe while Dry Run validated another. Both must resolve the same dir."""
+    custom = tmp_path / "custom-recipes"
+    custom.mkdir()
+    # place the real recipe so the wrapper actually forms (an empty dir would
+    # correctly fall back to docker, which is not what this invariant tests).
+    (custom / "qwen3.6-35b-a3b-fp8-solo.yaml").write_bytes(
+        (RECIPES / "qwen3.6-35b-a3b-fp8-solo.yaml").read_bytes())
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(custom),
+        "recipes": {"Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"},
+    })
+    ydir, runner_parent = appmod._recipe_dirs()
+    # The preflight readers derive from the live config...
+    assert ydir == Path(str(custom))
+    assert runner_parent == (tmp_path / "custom-recipes").parent
+
+    model_dir = tmp_path / "m"; model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(
+        {"model_type": "qwen3", "torch_dtype": "bfloat16"}))
+    (model_dir / "model.safetensors").write_bytes(b"x")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
+    # ...and the generated wrapper inlines that same resolved dir (not a hardcode).
+    rec_dir_line = [l for l in script.splitlines() if l.startswith("RECIPE_DIR=")][0]
+    embedded = rec_dir_line.split("=", 1)[1].strip().strip("'\"")
+    assert embedded == str(Path(str(custom)).expanduser())
+    assert "~/spark-vllm-docker" not in script
