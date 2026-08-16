@@ -19,7 +19,11 @@
     "_comment_serve": "serve_command is normally omitted — it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
     "image":         "vllm/vllm-openai:v0.20.0",
     "image_gpt_oss": "eugr/spark-vllm:latest",
-    "moe_backend":   "marlin"
+    "moe_backend":   "marlin",
+    "recipe_dir": "~/spark-vllm-docker/recipes",
+    "recipes": {
+      "Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"
+    }
   },
   "paths": {
     "litellm_config": "~/litellm/litellm_config.yaml",

@@ -1,5 +1,5 @@
 {
-  "generated": "2026-08-03",
+  "generated": "2026-08-15",
   "pool_gb": 121.0,
   "models": [
     {
@@ -21,7 +21,10 @@
       "hidden_size": 896,
       "max_position_embeddings": 32768,
       "weight_bytes": 11488523,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen2ForCausalLM"
+      ]
     },
     {
       "name": "Qwen/Qwen2.5-Coder-14B-Instruct",
@@ -42,7 +45,10 @@
       "hidden_size": 5120,
       "max_position_embeddings": 32768,
       "weight_bytes": 11488285,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen2ForCausalLM"
+      ]
     },
     {
       "name": "Qwen/Qwen3-1.7B",
@@ -63,7 +69,10 @@
       "hidden_size": 2048,
       "max_position_embeddings": 40960,
       "weight_bytes": 4063515592,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ]
     },
     {
       "name": "Qwen/Qwen3-14B",
@@ -84,7 +93,10 @@
       "hidden_size": 5120,
       "max_position_embeddings": 40960,
       "weight_bytes": 29536665640,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ]
     },
     {
       "name": "Qwen/Qwen3-8B",
@@ -105,7 +117,10 @@
       "hidden_size": 4096,
       "max_position_embeddings": 40960,
       "weight_bytes": 16381516776,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen3ForCausalLM"
+      ]
     },
     {
       "name": "Qwen/Qwen3.6-35B-A3B-FP8",
@@ -129,7 +144,10 @@
       "topology_distribution": {
         "linear_attention": 30,
         "full_attention": 10
-      }
+      },
+      "architectures": [
+        "Qwen3_5MoeForConditionalGeneration"
+      ]
     },
     {
       "name": "lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4",
@@ -153,7 +171,10 @@
       "topology_distribution": {
         "linear_attention": 30,
         "full_attention": 10
-      }
+      },
+      "architectures": [
+        "Qwen3_5MoeForConditionalGeneration"
+      ]
     },
     {
       "name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
@@ -178,7 +199,10 @@
         "M": 23,
         "E": 23,
         "*": 6
-      }
+      },
+      "architectures": [
+        "NemotronHForCausalLM"
+      ]
     },
     {
       "name": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
@@ -203,7 +227,10 @@
         "M": 40,
         "E": 40,
         "*": 8
-      }
+      },
+      "architectures": [
+        "NemotronHForCausalLM"
+      ]
     },
     {
       "name": "openai/gpt-oss-120b",
@@ -227,7 +254,10 @@
       "topology_distribution": {
         "sliding_attention": 18,
         "full_attention": 18
-      }
+      },
+      "architectures": [
+        "GptOssForCausalLM"
+      ]
     },
     {
       "name": "qwen2.5-14b-instruct-gptq-int8",
@@ -248,7 +278,10 @@
       "hidden_size": 5120,
       "max_position_embeddings": 32768,
       "weight_bytes": 16646398568,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen2ForCausalLM"
+      ]
     },
     {
       "name": "qwen3-coder-next-nvfp4",
@@ -272,7 +305,10 @@
       "topology_distribution": {
         "linear_attention": 36,
         "full_attention": 12
-      }
+      },
+      "architectures": [
+        "Qwen3NextForCausalLM"
+      ]
     },
     {
       "name": "qwen3-next-80b-a3b-nvfp4",
@@ -296,7 +332,10 @@
       "topology_distribution": {
         "linear_attention": 36,
         "full_attention": 12
-      }
+      },
+      "architectures": [
+        "Qwen3NextForCausalLM"
+      ]
     },
     {
       "name": "qwen3-vl-4b-fp8",
@@ -317,7 +356,10 @@
       "hidden_size": 2560,
       "max_position_embeddings": 262144,
       "weight_bytes": 6021235456,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen3VLForConditionalGeneration"
+      ]
     },
     {
       "name": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
@@ -338,7 +380,10 @@
       "hidden_size": 8192,
       "max_position_embeddings": 131072,
       "weight_bytes": 9088611,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "LlamaForCausalLM"
+      ]
     },
     {
       "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
@@ -359,7 +404,10 @@
       "hidden_size": 5120,
       "max_position_embeddings": 131072,
       "weight_bytes": 29540133872,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen2ForCausalLM"
+      ]
     },
     {
       "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
@@ -380,7 +428,10 @@
       "hidden_size": 5120,
       "max_position_embeddings": 131072,
       "weight_bytes": 65527841532,
-      "topology_distribution": {}
+      "topology_distribution": {},
+      "architectures": [
+        "Qwen2ForCausalLM"
+      ]
     }
   ],
   "anomalies": [

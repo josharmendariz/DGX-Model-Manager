@@ -7,6 +7,7 @@ Run via systemd: model-manager.service
 
 import asyncio
 import difflib
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -1912,6 +1913,7 @@ async def get_sites(request: Request, refresh: int = 0):
 # `match` rule; only fired recommendations are returned, ranked by severity.
 
 _RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_MODEL_CAPABILITIES_FILE = _APP_DIR / "model_capabilities.json"
 _REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1921,6 +1923,78 @@ def _load_recommendations() -> dict:
     except Exception as e:
         _logger.warning("Could not load recommendations.json: %s", e)
         return {"meta": {}, "recommendations": []}
+
+
+def _load_model_capabilities() -> dict:
+    try:
+        return json.loads(_MODEL_CAPABILITIES_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load model_capabilities.json: %s", e)
+        return {"meta": {}, "models": []}
+
+
+_PARSER_NAME_RE = _re.compile(r"^[a-z0-9_.-]{1,64}$")
+_PARSER_EMISSION_CONFIDENCE = {
+    "recipe-proven", "template-identical-to-recipe-proven",
+}
+
+
+def _capability_entry(info: dict) -> dict | None:
+    capabilities = _load_model_capabilities()
+    rows = capabilities.get("models", []) if isinstance(capabilities, dict) else []
+    if not isinstance(rows, list):
+        return None
+
+    name = info.get("name")
+    name_key = name.casefold() if isinstance(name, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (name_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == name_key
+                        for match in matches)):
+            return row
+
+    architectures = info.get("architectures", [])
+    architecture = (architectures[0]
+                    if isinstance(architectures, list) and architectures else None)
+    architecture_key = architecture.casefold() if isinstance(architecture, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (architecture_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == architecture_key
+                        for match in matches)):
+            return row
+    return None
+
+
+def _capability_emission_details(
+        entry: dict | None) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if not isinstance(entry, dict):
+        return None, None, ()
+
+    warnings = []
+    values = []
+    for field in ("tool_call_parser", "reasoning_parser"):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str)
+                                  or not _PARSER_NAME_RE.match(value)):
+            warnings.append(
+                f"capability map {field} is invalid; expected "
+                "lowercase letters, digits, dot, underscore or hyphen (max 64)")
+            value = None
+        values.append(value)
+
+    explicit_emit = entry.get("emit")
+    emittable = (explicit_emit if isinstance(explicit_emit, bool)
+                 else entry.get("confidence") in _PARSER_EMISSION_CONFIDENCE)
+    if not emittable:
+        return None, None, tuple(warnings)
+    return values[0], values[1], tuple(warnings)
+
+
+def _capability_emission(entry: dict | None) -> tuple[str | None, str | None]:
+    tool_parser, reasoning_parser, _warnings = _capability_emission_details(entry)
+    return tool_parser, reasoning_parser
 
 
 def _profile_script_text(profile: dict) -> str:
@@ -3225,14 +3299,14 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
 async def _preflight_smoke(facts: dict, script: str) -> list:
     """Spend a couple of seconds proving the arguments actually parse."""
     if facts["recipe_backed"]:
-        recipe_dir = Path(os.path.expanduser("~/spark-vllm-docker"))
-        runner = recipe_dir / "run-recipe.sh"
+        _, recipe_root = _recipe_dirs()   # runner dir = parent of the recipe yaml dir
+        runner = recipe_root / "run-recipe.sh"
         if not runner.exists():
             return [_pf("skip", "smoke", "Recipe runner not found",
                         f"{runner} does not exist, so the recipe could not be dry-run.")]
         proc = await asyncio.create_subprocess_exec(
             str(runner), facts["recipe"], "--dry-run",
-            cwd=str(recipe_dir),
+            cwd=str(recipe_root),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(),
@@ -3314,16 +3388,87 @@ async def vllm_preflight(req: EngineStartRequest):
     }
 
 
-def _recipe_util(recipe: str) -> Optional[float]:
-    """gpu_memory_utilization from a run-recipe YAML, without a YAML dependency."""
-    if not recipe or not _re.fullmatch(r"[\w.-]+", recipe):
-        return None
-    path = Path(os.path.expanduser("~/spark-vllm-docker/recipes")) / f"{recipe}.yaml"
+# The one owner of "where the recipe YAMLs and run-recipe.sh live." Generator, Dry-Run
+# smoke, and preflight memory math must all agree on this, or a configured recipe_dir
+# would launch from one place while validating another. Config -> default (no env
+# override: no other vllm block key has one either).
+def _vllm_recipe_dir() -> str:
+    return (_app_config.get("vllm", {}) or {}).get("recipe_dir") or "~/spark-vllm-docker/recipes"
+
+
+def _recipe_dirs() -> tuple[Path, Path]:
+    """(recipe_yaml_dir, runner_dir) from the live config. Pre-flight-only use
+    (_recipe_util, _preflight_smoke): the generator stays a pure function of its
+    vllm_cfg argument. run-recipe.sh sits in the checkout root, sibling of the
+    recipes/ subdir, so the runner dir is the yaml dir's parent — the same
+    assumption the generated wrapper's `cd "$RECIPE_DIR/.."` makes."""
+    ydir = Path(os.path.expanduser(_vllm_recipe_dir()))
+    return ydir, ydir.parent
+
+
+def _read_recipe(recipe_dir, name: str) -> tuple[Optional[dict], list[str]]:
+    """Render and normalize one run-recipe YAML; malformed input is no opinion."""
+    if not isinstance(name, str) or not _re.fullmatch(r"[\w.-]+", name):
+        return None, [f"invalid recipe name {name!r}"]
+
     try:
-        m = _re.search(r"^\s*gpu_memory_utilization:\s*([0-9.]+)", path.read_text(), _re.M)
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
+        path = Path(os.path.expanduser(os.fspath(recipe_dir))) / f"{name}.yaml"
+        recipe = yaml.safe_load(path.read_text())
+        if not isinstance(recipe, dict):
+            return None, [f"recipe {name!r} is not a YAML mapping"]
+        if "command" not in recipe:
+            return None, [f"recipe {name!r} has no command"]
+        defaults = recipe.get("defaults", {})
+        params = {**defaults, **{}}
+        try:
+            rendered = recipe["command"].format(**params)
+        except (KeyError, IndexError, ValueError) as exc:
+            return None, [f"recipe {name!r} command placeholder error: {exc}"]
+        tokens = shlex.split(rendered)
+
+        flags = {}
+        wanted = {
+            "--gpu-memory-utilization", "--gpu-memory-utilization-gb",
+            "--max-model-len", "--kv-cache-dtype", "--tool-call-parser",
+            "--reasoning-parser", "--port",
+        }
+        for index, token in enumerate(tokens):
+            flag, separator, inline = token.partition("=")
+            if flag not in wanted:
+                continue
+            if separator:
+                flags[flag] = inline
+            elif index + 1 < len(tokens):
+                flags[flag] = tokens[index + 1]
+
+        def _number(flag: str, cast):
+            value = flags.get(flag)
+            return cast(value) if value is not None else None
+
+        return {
+            "name": recipe.get("name") or None,
+            "description": recipe.get("description") or None,
+            "model": recipe.get("model") or None,
+            "gpu_memory_utilization": _number("--gpu-memory-utilization", float),
+            "gpu_memory_utilization_gb": _number("--gpu-memory-utilization-gb", float),
+            "max_model_len": _number("--max-model-len", int),
+            "kv_cache_dtype": flags.get("--kv-cache-dtype") or None,
+            "tool_call_parser": flags.get("--tool-call-parser") or None,
+            "reasoning_parser": flags.get("--reasoning-parser") or None,
+            "port": _number("--port", int),
+            "solo_only": recipe.get("solo_only") if "solo_only" in recipe else None,
+            "cluster_only": recipe.get("cluster_only") if "cluster_only" in recipe else None,
+            "mods": recipe.get("mods") if "mods" in recipe else None,
+        }, []
+    except Exception as exc:
+        location = str(path) if "path" in locals() else repr(recipe_dir)
+        return None, [f"could not read recipe {name!r} from {location}: {exc}"]
+
+
+def _recipe_util(recipe: str) -> Optional[float]:
+    """Return only a fractional recipe utilization for preflight memory math."""
+    record, _ = _read_recipe(_recipe_dirs()[0], recipe)
+    return record.get("gpu_memory_utilization") if record is not None else None
 
 
 @app.post("/api/vllm/reclaim-cache", dependencies=[Depends(verify_auth)])
@@ -3758,6 +3903,8 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
         "task_label": task_label,
         "size_gb": size_gb,
         "vram_gb": vram_gb,
+        "architectures": (config.get("architectures", [])
+                          if isinstance(config.get("architectures", []), list) else []),
     }
 
 
@@ -3847,6 +3994,143 @@ def _vllm_serve_command(image: str, cfg: dict) -> str:
     return "" if "vllm-openai" in ref else "vllm serve"
 
 
+def _resolve_recipe_model(model_name: str, vllm_cfg: dict) -> tuple[Optional[str], list[str]]:
+    """Choose the deterministic most-specific configured recipe glob."""
+    recipes = vllm_cfg.get("recipes") if isinstance(vllm_cfg, dict) else None
+    if not isinstance(recipes, dict) or not recipes:
+        return None, []
+    folded_name = str(model_name).casefold()
+    matches = []
+    for pattern, recipe_name in recipes.items():
+        if not isinstance(pattern, str):
+            continue
+        if fnmatch.fnmatchcase(folded_name, pattern.casefold()):
+            matches.append((pattern, recipe_name))
+    if not matches:
+        return None, []
+
+    def _specificity(item):
+        pattern = item[0]
+        wildcard_count = sum(pattern.count(char) for char in "*?[")
+        literal_length = sum(char not in "*?[]" for char in pattern)
+        return wildcard_count, -literal_length, pattern.casefold(), pattern
+
+    pattern, recipe_name = min(matches, key=_specificity)
+    warnings = []
+    if len(matches) > 1:
+        warnings.append(
+            f"multiple recipe patterns match {model_name!r}; chose {pattern!r}")
+    if not isinstance(recipe_name, str) or not _re.fullmatch(r"[\w.-]+", recipe_name):
+        warnings.append(f"invalid recipe name {recipe_name!r} for pattern {pattern!r}")
+        return None, warnings
+    return recipe_name, warnings
+
+
+def _kv_dtype_from_config(config: dict) -> Optional[str]:
+    """Return fp8 only for an explicit model-owned floating 8-bit KV declaration."""
+    if not isinstance(config, dict):
+        return None
+    candidates = [config]
+    if isinstance(config.get("text_config"), dict):
+        candidates.append(config["text_config"])
+    for candidate in candidates:
+        quant = candidate.get("quantization_config")
+        if not isinstance(quant, dict):
+            continue
+        if str(quant.get("kv_cache_dtype", "")).casefold() == "fp8":
+            return "fp8"
+        scheme = quant.get("kv_cache_scheme")
+        if not isinstance(scheme, dict):
+            continue
+        try:
+            eight_bit = int(scheme.get("num_bits")) == 8
+        except (TypeError, ValueError):
+            eight_bit = False
+        kind = " ".join(str(scheme.get(key, "")).casefold()
+                        for key in ("type", "dtype"))
+        if eight_bit and ("float" in kind or "fp8" in kind):
+            return "fp8"
+    return None
+
+
+def _resolve_launch(config: dict, info: dict, vllm_cfg: dict) -> dict:
+    """Resolve recipe delegation or derived Docker flags for one model."""
+    name = str(info.get("name", ""))
+    is_gpt_oss = "gpt-oss" in name.lower() or "gpt_oss" in name.lower()
+    if is_gpt_oss:
+        return {"shape": "docker", "gpt_oss": True}
+
+    recipe_name, warnings = _resolve_recipe_model(name, vllm_cfg)
+    if recipe_name is not None:
+        res_dir = vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        record, reader_warnings = _read_recipe(res_dir, recipe_name)
+        warnings.extend(reader_warnings)
+        if record is not None:
+            if record.get("cluster_only") is True:
+                warnings.append(f"recipe {recipe_name!r} is cluster_only")
+            if record.get("port") is not None and record["port"] != 8000:
+                warnings.append(
+                    f"recipe {recipe_name!r} uses port {record['port']}, not 8000")
+            return {
+                "shape": "recipe", "recipe": recipe_name,
+                "record": record, "warnings": warnings,
+            }
+
+    kv_dtype = _kv_dtype_from_config(config)
+    spec = _derive_launch_spec(
+        config, weights_gb=info.get("size_gb", 0.0), pool_gb=121.0,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2)
+    warnings.extend(spec.get("warnings") or [])
+    max_model_len = spec.get("max_model_len")
+    if not isinstance(max_model_len, (int, float)) or max_model_len <= 0:
+        max_model_len = None
+    else:
+        max_model_len = int(max_model_len)
+    util = spec.get("recommended_util")
+    if not isinstance(util, (int, float)) or util <= 0.10:
+        util = None
+    else:
+        util = float(util)
+    return {
+        "shape": "docker", "kv_dtype": kv_dtype, "util": util,
+        "max_model_len": max_model_len, "warnings": warnings,
+    }
+
+
+def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool) -> str:
+    """The single shared owner of generated profile metadata and collision cleanup."""
+    if recipe_backed:
+        rationale = (
+            "# Recipe-backed: the YAML remains the source of truth for measured flags and\n"
+            "# in-container mods that a generated docker command cannot reproduce.\n")
+    else:
+        rationale = ""
+    return f"""#!/bin/bash
+# Name: HF {_one_line(info['name'])}
+# Description: Local HF snapshot via vLLM ({_one_line(info['dtype'])}, {info['size_gb']:.1f} GB on disk)
+# VRAM: {info['vram_gb']}
+#
+# Auto-generated by DGX Model Manager from:
+# {_one_line(launch_dir)}
+{rationale}set -euo pipefail
+
+docker rm -f vllm_node 2>/dev/null || true
+
+"""
+
+
+def _recipe_profile_body(recipe_dir, recipe_name: str) -> str:
+    recipe_path = Path(os.path.expanduser(os.fspath(recipe_dir)))
+    return f"""RECIPE_DIR={shlex.quote(str(recipe_path))}
+RECIPE={shlex.quote(recipe_name)}
+
+# recipe_dir owns the YAMLs; run-recipe.sh is its sibling in the checkout root.
+cd "$RECIPE_DIR/.."
+# Detached mode lets DMM read progress uniformly from docker logs.
+exec ./run-recipe.sh "$RECIPE" -d
+"""
+
+
 def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) -> tuple[str, str, dict]:
     info = _profile_model_info(launch_dir, model_name)
     if info["fmt"] not in ("safetensors", "pytorch"):
@@ -3860,6 +4144,21 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     slug = _safe_profile_slug(info["name"])
     script_name = f"start_hf_{slug}.sh"
     _vllm_cfg = _app_config.get("vllm", {}) or {}
+    try:
+        config = json.loads((launch_dir / "config.json").read_text())
+        if not isinstance(config, dict):
+            config = {}
+    except Exception:
+        config = {}
+    resolved = _resolve_launch(config, info, _vllm_cfg)
+    info["warnings"] = list(resolved.get("warnings") or [])
+    preamble = _vllm_script_preamble(
+        info, launch_dir, recipe_backed=resolved["shape"] == "recipe")
+    if resolved["shape"] == "recipe":
+        res_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        return (script_name, preamble + _recipe_profile_body(
+            res_dir, resolved["recipe"]), info)
+
     mounts, container_model = _container_model_mount(launch_dir, slug)
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
@@ -3901,7 +4200,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         f'  --served-model-name {shlex.quote(info["name"])} {shlex.quote(info["served"])} vllm-active \\',
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
-        "  --gpu-memory-utilization 0.75 \\",
+        f"  --gpu-memory-utilization {resolved['util'] if resolved.get('util') is not None else 0.75} \\",
     ]
     if is_gpt_oss:
         # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
@@ -3912,9 +4211,12 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         ]
     else:
         arg_lines += [
-            "  --max-model-len 32768 --max-num-seqs 2 \\",
-            "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+            f"  --max-model-len {resolved['max_model_len'] if resolved.get('max_model_len') is not None else 32768} --max-num-seqs 2 \\",
         ]
+        if resolved.get("kv_dtype") == "fp8":
+            arg_lines.append("  --kv-cache-dtype fp8 --enable-chunked-prefill \\")
+        else:
+            arg_lines.append("  --enable-chunked-prefill \\")
     # On GB10 (sm_121) Marlin MoE miscomputes for some architectures; setting
     # vllm.moe_backend to "" in config.json omits the flag and lets vLLM autoselect.
     _moe_backend = _vllm_cfg.get("moe_backend", "marlin")
@@ -3924,11 +4226,18 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             raise HTTPException(400, "Invalid vllm.moe_backend: expected lowercase letters, "
                                      "digits and underscores only.")
         arg_lines.append(f"  --moe-backend {_moe_backend} \\")
-    if "qwen" in info["name"].lower():
-        arg_lines += [
-            "  --enable-auto-tool-choice \\",
-            "  --tool-call-parser qwen3_coder \\",
-        ]
+    if not is_gpt_oss:
+        tool_parser, reasoning_parser, capability_warnings = (
+            _capability_emission_details(_capability_entry(info)))
+        info["warnings"].extend(capability_warnings)
+        if tool_parser is not None:
+            arg_lines += [
+                "  --enable-auto-tool-choice \\",
+                f"  --tool-call-parser {shlex.quote(tool_parser)} \\",
+            ]
+        if reasoning_parser is not None:
+            arg_lines.append(
+                f"  --reasoning-parser {shlex.quote(reasoning_parser)} \\")
     arg_lines.append("  --generation-config vllm")
 
     # Whether an explicit `vllm serve` is needed is a property of the IMAGE, not of the
@@ -3943,26 +4252,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         arg_lines.insert(0, f"  {_serve_cmd} \\")
     image = shlex.quote(str(image))
 
-    # Headers are parsed back by _parse_script_meta one line at a time, so flatten anything
-    # that could introduce a newline and forge an extra header.
-    script = f"""#!/bin/bash
-# Name: HF {_one_line(info['name'])}
-# Description: Local HF snapshot via vLLM ({_one_line(dtype)}, {info['size_gb']:.1f} GB on disk)
-# VRAM: {info['vram_gb']}
-#
-# Auto-generated by DGX Model Manager from:
-# {_one_line(launch_dir)}
-set -euo pipefail
-
-docker rm -f vllm_node 2>/dev/null || true
-
-# No --restart policy, deliberately. DMM is a manual switcher; vllm-default-model.service
-# owns what comes back after a reboot. A generated profile that carried
-# `--restart unless-stopped` resurrected itself at boot on 2026-08-04, and because it was
-# crash-looping under the name `vllm_node`, run-recipe.sh saw "already running", skipped
-# its launch, and the box's default model never came up. A restart policy on a container
-# whose launch may be wrong converts a bad script into a persistent outage.
-exec docker run --name vllm_node --gpus all -p 8000:8000 \\
+    script = preamble + f"""exec docker run --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
   {image} \\
@@ -7275,6 +7565,30 @@ async function stopEngine(eng) {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
+  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
+  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
+  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
+  // able to block the only GPU. Runs before any button state is touched, so declining leaves
+  // the UI exactly as it was.
+  let forceFromGate = false;
+  if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
+    try {
+      const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+      if (r && r.verdict === 'fail') {
+        const blocking = (r.checks || []).filter(c => c.level === 'fail')
+          .map(c => c.title + (c.detail ? ': ' + c.detail : '')).join('; ');
+        if (!confirm('Preflight found blocking problems:\n\n' + blocking +
+                     '\n\nRun Dry Run to see the details. Force start anyway?')) {
+          toast('Start blocked by preflight: ' + blocking, 'err');
+          return;
+        }
+        forceFromGate = true;
+      }
+    } catch (e) {
+      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+    }
+  }
   const btn  = document.getElementById(eng.ids.start);
   const prog = document.getElementById(eng.ids.prog);
   const log  = document.getElementById(eng.ids.log);
@@ -7297,8 +7611,9 @@ async function startEngine(eng) {
   const startWith = (force) =>
     apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
 
+
   try {
-    beginPoll(await startWith(false));
+    beginPoll(await startWith(forceFromGate));
   } catch(e) {
     if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
@@ -7413,10 +7728,12 @@ async function dryRunProfile(eng) {
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Checking…';
   out.textContent = '';
+  eng._preflightVerdict = null;
   try {
     const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
     renderPreflight(out, r);
     const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    eng._preflightVerdict = r.verdict;
     toast(t, r.verdict === 'fail' ? 'err' : 'ok');
   } catch (e) {
     toast('Dry run failed: ' + e.message, 'err');

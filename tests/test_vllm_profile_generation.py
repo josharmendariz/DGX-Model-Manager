@@ -6,8 +6,12 @@ file dangling inside the container.
 """
 
 import json
+from pathlib import Path
 
 import app as appmod
+
+
+RECIPES = Path(__file__).parent / "fixtures" / "recipes"
 
 
 def _write_model_config(path, *, moe=False):
@@ -283,3 +287,41 @@ def test_regenerated_deepseek_profiles_mount_repo_root():
         mount = [l for l in text.splitlines() if l.strip().startswith("-v ")][0]
         assert "/snapshots/" not in mount, f"{p.name} still mounts a snapshot dir"
         assert "vllm serve" in text
+
+
+def test_recipe_mapping_generates_preflight_compatible_wrapper(tmp_path, monkeypatch):
+    model_dir = _plain_model(tmp_path, "recipe-model")
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(RECIPES),
+        "recipes": {"Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"},
+    })
+
+    _, script, info = appmod._build_vllm_profile_script(
+        model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
+
+    assert "qwen3.6-35b-a3b-fp8-solo" in script
+    assert "run-recipe.sh" in script
+    assert "docker rm -f vllm_node" in script
+    for forbidden in ("--restart", "--model", "--max-model-len",
+                      "--gpu-memory-utilization"):
+        assert forbidden not in appmod._script_code(script)
+    facts = appmod._parse_launch_script(script)
+    assert facts["recipe_backed"] is True
+    assert facts["recipe"] == "qwen3.6-35b-a3b-fp8-solo"
+    assert _bash_syntax_ok(tmp_path, script)
+    levels = {check["level"] for check in appmod._preflight_static(
+        script, appmod._app_config["vllm"])}
+    assert "fail" not in levels
+    assert info["warnings"] == []
+
+
+def test_missing_mapped_recipe_falls_back_to_docker_with_warning(tmp_path, monkeypatch):
+    model_dir = _plain_model(tmp_path, "missing-recipe")
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(tmp_path / "absent"),
+        "recipes": {"Acme/*": "missing"},
+    })
+    _, script, info = appmod._build_vllm_profile_script(model_dir, "Acme/Model")
+    assert "exec docker run" in script
+    assert info["warnings"]
+    assert _bash_syntax_ok(tmp_path, script)

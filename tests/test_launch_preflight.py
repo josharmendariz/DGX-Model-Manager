@@ -312,3 +312,54 @@ def test_env_expansion_is_allowlisted(monkeypatch):
     monkeypatch.setenv("SECRET_TOKEN", "hunter2")
     # Not on the allowlist, so it is never echoed into an HTTP response.
     assert appmod._expand_script_vars("$SECRET_TOKEN", "") == "$SECRET_TOKEN"
+
+
+# ── Recipe smoke (subprocess branch) ──────────────────────────────────────────
+# The recipe-backed smoke path spawns run-recipe.sh --dry-run. It deliberately
+# uses a fake runner in a tmp checkout: a regression here (e.g. a renamed local
+# reused in subprocess cwd) crashes only when the runner *exists* on the
+# resolved dir — the case no pure-function test could ever hit, and the case
+# production is always in.
+
+def test_recipe_smoke_dry_runs_the_resolved_runner(tmp_path, monkeypatch):
+    root = tmp_path / "spark-vllm-docker"
+    (root / "recipes").mkdir(parents=True)
+    runner = root / "run-recipe.sh"
+    runner.write_text("#!/bin/bash\necho DRYRUN_OK $1\n")
+    runner.chmod(0o755)
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(root / "recipes")})
+    import asyncio
+    checks = asyncio.run(appmod._preflight_smoke(
+        appmod._parse_launch_script(
+            RECIPE_WRAPPER.replace("__XDIRE__", str(root / "recipes"))), "ignored"))
+    assert checks and checks[0]["check"] == "smoke"
+    assert checks[0]["level"] == "ok"
+    assert "DRYRUN_OK" in checks[0]["detail"]
+    # executed in the checkout root with the recipe as first arg
+    assert "cwd" not in checks[0]  # no leak of internal state
+
+
+RECIPE_WRAPPER = """#!/bin/bash
+# Name: HF Qwen/Qwen3.6-35B-A3B-FP8
+set -euo pipefail
+docker rm -f vllm_node 2>/dev/null || true
+RECIPE_DIR=__XDIRE__
+RECIPE="qwen3.6-35b-a3b-fp8-solo"
+cd "$RECIPE_DIR/.."
+exec ./run-recipe.sh "$RECIPE" -d
+"""
+
+
+def test_recipe_smoke_missing_runner_is_skip_not_error(tmp_path, monkeypatch):
+    (tmp_path / "recipes").mkdir()
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(tmp_path / "recipes")})
+    import asyncio
+    script = RECIPE_WRAPPER.replace("__XDIRE__", str(tmp_path / "recipes"))
+    checks = asyncio.run(appmod._preflight_smoke(
+        appmod._parse_launch_script(script), "ignored"))
+    assert checks[0]["check"] == "smoke"
+    assert checks[0]["level"] == "skip"
+
+

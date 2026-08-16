@@ -1,0 +1,55 @@
+# Recipe: Qwen/Qwen3.6-35B-A3B-FP8 (single-node GB10)
+#
+# Local variant of qwen3.6-35b-a3b-fp8.yaml. Differences from upstream:
+#   - tensor_parallel 1 / no Ray: this is a solo Spark, no second node.
+#   - --served-model-name includes "vllm-active", the alias LiteLLM forwards
+#     (litellm-config sends model=vllm-active to http://192.168.68.67:8000/v1),
+#     so this recipe is directly routable without editing the ConfigMap.
+
+recipe_version: "1"
+name: Qwen36-35B-A3B-solo
+description: vLLM serving Qwen3.6-35B-A3B-FP8 (solo, LiteLLM vllm-active)
+
+model: Qwen/Qwen3.6-35B-A3B-FP8
+
+solo_only: true
+
+container: vllm-node
+
+mods:
+  - mods/fix-qwen3.6-chat-template
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # 0.55, NOT higher. util is a fraction of ALL 121G unified memory and is a hard
+  # reservation — lowering max_model_len frees nothing, this is the only lever.
+  # 0.8 measured 92.3G alloc / 52.5G KV (19.9x concurrency @ 256k) and left the
+  # host at 4G available with swap engaged; k3s schedules spark-3d burst limits
+  # against memory it can't see this container holding. 0.55 keeps full 256k ctx
+  # and ~10x concurrency (327 concurrent 8k conversations) while returning ~25G.
+  gpu_memory_utilization: 0.55
+  max_model_len: 262144
+  max_num_batched_tokens: 16384
+
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 1
+
+command: |
+  vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+    --served-model-name Qwen/Qwen3.6-35B-A3B-FP8 Qwen--Qwen3.6-35B-A3B-FP8 vllm-active \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --kv-cache-dtype fp8 \
+    --load-format fastsafetensors \
+    --attention-backend flashinfer \
+    --enable-prefix-caching \
+    --chat-template fixed_chat_template.jinja \
+    -tp {tensor_parallel}
