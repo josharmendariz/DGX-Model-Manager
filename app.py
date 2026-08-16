@@ -7547,6 +7547,30 @@ async function stopEngine(eng) {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
+  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
+  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
+  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
+  // able to block the only GPU. Runs before any button state is touched, so declining leaves
+  // the UI exactly as it was.
+  let forceFromGate = false;
+  if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
+    try {
+      const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+      if (r && r.verdict === 'fail') {
+        const blocking = (r.checks || []).filter(c => c.level === 'fail')
+          .map(c => c.title + (c.detail ? ': ' + c.detail : '')).join('; ');
+        if (!confirm('Preflight found blocking problems:\n\n' + blocking +
+                     '\n\nRun Dry Run to see the details. Force start anyway?')) {
+          toast('Start blocked by preflight: ' + blocking, 'err');
+          return;
+        }
+        forceFromGate = true;
+      }
+    } catch (e) {
+      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+    }
+  }
   const btn  = document.getElementById(eng.ids.start);
   const prog = document.getElementById(eng.ids.prog);
   const log  = document.getElementById(eng.ids.log);
@@ -7569,8 +7593,9 @@ async function startEngine(eng) {
   const startWith = (force) =>
     apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
 
+
   try {
-    beginPoll(await startWith(false));
+    beginPoll(await startWith(forceFromGate));
   } catch(e) {
     if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
@@ -7685,10 +7710,12 @@ async function dryRunProfile(eng) {
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Checking…';
   out.textContent = '';
+  eng._preflightVerdict = null;
   try {
     const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
     renderPreflight(out, r);
     const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    eng._preflightVerdict = r.verdict;
     toast(t, r.verdict === 'fail' ? 'err' : 'ok');
   } catch (e) {
     toast('Dry run failed: ' + e.message, 'err');
