@@ -28,7 +28,15 @@ review changed, including what was rejected and why")
   runner tests now exist and were mutated to fail on the exact `NameError` before
   being kept. **This is the strongest argument in the portfolio for making
   "run the new code against the real profile in-process" a standing pre-PR step
-  for preflight-touching changes, not an optional live check.**
+  for preflight-touching changes, not an optional live check.
+  Dry-rehearsal in `/tmp/opencode/deploy-rehearsal` confirmed the deploy shape: load
+  app.py + model_capabilities.json + the **production-shaped** `vllm.recipes` map, then
+  (a) Qwen3.6 resolves to the recipe wrapper, (b) the LIVE wrapper profile runs the full
+  preflight chain -> verdict **warn** (page-cache + existing-container only; smoke ok,
+  i.e. the real `run-recipe.sh --dry-run` fired), (c) an unmapped model still derives plain
+  docker (opt-in holds). `pyflakes` on the whole file: **zero undefined names** — the bug
+  class behind the `NameError` is closed file-wide, not just at that one spot. (The two
+  pyflakes style hints, unused import + f-string, also exist at base 5214fb7 — pre-existing,**
 
 ## RISK item, settled on this box (parked for the fleet)
 
