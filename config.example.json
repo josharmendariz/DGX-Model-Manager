@@ -1,82 +1,62 @@
 {
- "app": {
-  "host": "0.0.0.0",
-  "port": 8090,
-  "display_name": "DGX Spark",
-  "grafana_url": ""
- },
- "services": {
-  "ollama_base": "http://127.0.0.1:11434",
-  "litellm_base": "http://127.0.0.1:4000",
-  "sglang_base": "http://127.0.0.1:30000",
-  "vllm_base": "http://127.0.0.1:8000",
-  "llamacpp_base": "http://127.0.0.1:8080",
-  "localai_base": "http://127.0.0.1:9090",
-  "comfyui_base": "http://127.0.0.1:8188"
- },
- "vllm": {
-  "_comment": "Optional \u2014 defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
-  "_comment_serve": "serve_command is normally omitted \u2014 it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
-  "image": "vllm/vllm-openai:v0.20.0",
-  "image_gpt_oss": "eugr/spark-vllm:latest",
-  "moe_backend": "marlin",
-  "recipe_dir": "~/spark-vllm-docker/recipes",
-  "recipes": {
-   "Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"
-  }
- },
- "paths": {
-  "litellm_config": "~/litellm/litellm_config.yaml",
-  "hf_cache": "~/.cache/huggingface/hub"
- },
- "alerts": {
-  "_comment": "All keys optional \u2014 omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
-  "enabled": true,
-  "interval_s": 300,
-  "cooldown_s": 1800,
-  "thresholds": {
-   "memory_percent": 90,
-   "endpoint_failures": 2
+  "app": {
+    "host": "0.0.0.0",
+    "port": 8090,
+    "display_name": "DGX Spark",
+    "grafana_url": ""
   },
-  "endpoints": [
-   "vllm",
-   "litellm"
-  ],
-  "channels": {
-   "discord": {
+  "services": {
+    "ollama_base":   "http://127.0.0.1:11434",
+    "litellm_base":  "http://127.0.0.1:4000",
+    "sglang_base":   "http://127.0.0.1:30000",
+    "vllm_base":     "http://127.0.0.1:8000",
+    "llamacpp_base": "http://127.0.0.1:8080",
+    "localai_base":  "http://127.0.0.1:9090",
+    "comfyui_base":  "http://127.0.0.1:8188"
+  },
+  "vllm": {
+    "_comment": "Optional — defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
+    "_comment_serve": "serve_command is normally omitted — it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
+    "image":         "vllm/vllm-openai:v0.20.0",
+    "image_gpt_oss": "eugr/spark-vllm:latest",
+    "moe_backend":   "marlin",
+    "recipe_dir": "~/spark-vllm-docker/recipes",
+    "recipes": {
+      "Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"
+    }
+  },
+  "paths": {
+    "litellm_config": "~/litellm/litellm_config.yaml",
+    "hf_cache":       "~/.cache/huggingface/hub"
+  },
+  "alerts": {
+    "_comment": "All keys optional — omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
     "enabled": true,
-    "webhook_url": ""
-   },
-   "log": {
-    "enabled": false
-   }
-  }
- },
- "sites_discovery": {
-  "_comment": "The Dashboards tab finds running web UIs itself: every non-loopback TCP listener plus every Kubernetes NodePort gets one HTTP GET, and a port earns a card only if it answers with an HTML page. Ports answering JSON/plain text are kept as kind=api behind a toggle. All keys optional.",
-  "enabled": true,
-  "kubernetes": true,
-  "ttl_s": 30,
-  "probe_timeout_s": 2.0,
-  "include_loopback": false,
-  "exclude_ports": [],
-  "include_ports": []
- },
- "sites": [
-  {
-   "_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see \u2014 a UI on another host. Ports resolve against app.sites_base \u2192 app.host \u2192 the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."
+    "interval_s": 300,
+    "cooldown_s": 1800,
+    "thresholds": {
+      "memory_percent": 90,
+      "endpoint_failures": 2
+    },
+    "endpoints": ["vllm", "litellm"],
+    "channels": {
+      "discord": {"enabled": true, "webhook_url": ""},
+      "log":     {"enabled": false}
+    }
   },
-  {
-   "name": "Grafana",
-   "port": 3000,
-   "group": "Metrics",
-   "desc": "Metrics dashboards"
+  "sites_discovery": {
+    "_comment": "The Dashboards tab finds running web UIs itself: every non-loopback TCP listener plus every Kubernetes NodePort gets one HTTP GET, and a port earns a card only if it answers with an HTML page. Ports answering JSON/plain text are kept as kind=api behind a toggle. All keys optional.",
+    "enabled": true,
+    "kubernetes": true,
+    "ttl_s": 30,
+    "probe_timeout_s": 2.0,
+    "include_loopback": false,
+    "exclude_ports": [],
+    "include_ports": []
   },
-  {
-   "name": "Other Box",
-   "url": "https://otherhost.example:8443",
-   "group": "Ops",
-   "desc": "Dashboard on a different host"
-  }
- ]
+  "sites": [
+    {"_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see — a UI on another host. Ports resolve against app.sites_base → app.host → the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."},
+    {"name": "Grafana",   "port": 3000, "group": "Metrics", "desc": "Metrics dashboards"},
+    {"name": "Other Box", "url": "https://otherhost.example:8443", "group": "Ops", "desc": "Dashboard on a different host"}
+  ]
 }
