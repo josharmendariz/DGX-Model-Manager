@@ -8,7 +8,9 @@ that contradict the box's measured recipes. This milestone unbreaks that path, t
 replaces the one-size-fits-all launch defaults with settings derived from each model's own
 config — hybrid-attention-aware — with hand-measured recipes taking precedence. Phases 1
 and 2 are independent and testable without a running vLLM; phases 3–5 build the recommender
-into the generator and the UI.
+into the generator and the UI. Phase 6 hardens the other half of the recommender — the
+research job that feeds its knowledge base — so a finding cannot cite a number no source
+printed, and so synthesis runs on this box rather than an external service.
 
 ## Phases
 
@@ -22,6 +24,7 @@ into the generator and the UI.
 - [ ] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
 - [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label
+- [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
 
 ## Phase Details
 
@@ -158,6 +161,59 @@ Plans:
 - [ ] 05-01: Executor-budget metadata + unit-consistent admission math
 - [ ] 05-02: Label-based reclaim identification, launch lock, and failure surfacing
 
+### Phase 6: Verifiable research capture
+**Goal**: A research run produces findings that cannot assert a number no source actually
+printed, runs on this box's own stack rather than an external Codex call, and never writes
+the recommendation rules a human tuned by hand.
+**Depends on**: Nothing (independent of Phases 3–5; touches `research_refresh.py` and the
+KB, not the launch path)
+**Requirements**: REQ-08, REQ-09
+**Success Criteria** (what must be TRUE):
+  1. A source that 404s, times out, or returns an empty body aborts the run naming the dead
+     URL. `_fetch`'s `[fetch failed: ...]` string can no longer reach the synthesis prompt,
+     so a run against five dead pages produces zero findings instead of confident ones.
+  2. Every finding carries a verbatim `quote`; a finding whose `quote` is not a substring of
+     the fetched text for its own `source_url` is rejected before it is written, and the
+     rejection is reported with the offending claim. Fabricated figures fail mechanically,
+     with no reviewer judgment involved.
+  3. Every finding's `source_url` is one of the URLs in `research_sources.json`. A URL the
+     engine invented is rejected by the same gate.
+  4. `RESEARCH_ENGINE=litellm` against the local router (`:30400`, `vllm-active`) completes a
+     full run and its output passes the same gates as the Codex path — verified by running
+     both engines over one identical fetched-source set and diffing accept/reject counts.
+     The local path is schema-constrained via the router's structured-output mode, not
+     regex-scraped out of prose.
+  5. Local evidence is a first-class source: a benchmark run on this box is captured as a
+     finding of kind `local` whose `quote` is its own recorded output, and a `local` finding
+     outranks a `web` finding making a competing claim.
+  6. Findings are append-only and dated at capture. A re-run can add a finding or supersede
+     one by id; it cannot silently rewrite or delete one, so re-running research is
+     non-destructive and therefore cheap to do often.
+  7. The research job has no write path to `recommendations.json`. Rules reference finding
+     ids; `apply()`'s `{**prior, **entry}` clobber of hand-edited `title` / `summary` /
+     `action` / `severity` is gone.
+  8. `GET /api/recommendations` reports the formalization backlog — how many KB rules are
+     inert (`match.type == "manual"`, which `_eval_profile_match` can never fire) and how
+     many rules rest only on superseded findings.
+  9. `pytest` passes with regression tests for each gate, including a fabricated-quote
+     fixture and a dead-source fixture.
+**Plans**: 4 plans
+
+Plans:
+- [ ] 06-01: Fail-loud fetch with content-hash caching; a fetched-source manifest carrying
+      retrieval dates that the verification gates read
+- [ ] 06-02: Findings store — schema, quote + source-URL verification, append-only writes
+      and supersede semantics
+- [ ] 06-03: Local synthesis engine — schema-constrained `litellm` path against `:30400`,
+      engine-parity test, `local`-kind findings from bench output
+- [ ] 06-04: Rule/finding separation — rules reference finding ids, research loses KB write
+      access, stale-and-inert reporting on the recommendations API
+
+**Not covered here, deliberately**: `_eval_profile_match` still greps raw script text, so a
+commented-out flag can fire a rule and `model_absent` is suppressed by an incidental mention
+in a profile id. Matching should resolve through `_derive_launch_spec`'s parsed values
+instead — that lands after Phase 4 parameterizes the scripts, and is scoped as its own phase.
+
 ## Requirements Traceability
 
 | Requirement | Phase | Source |
@@ -169,3 +225,5 @@ Plans:
 | REQ-05 recipes win | 3 | Generated defaults contradict measured recipes |
 | REQ-06 UI options | 4 | User request: context options + recommended settings |
 | REQ-07 admission truth | 5 | Audit C1, H1, H5 |
+| REQ-08 findings are verifiable | 6 | Research review 2026-08-17 — a discarded proposal asserted `33.53 tok/s`, `862.84 aggregate`, `115–120 GB` and source dates, none checkable against the fetched text |
+| REQ-09 research runs locally | 6 | User request: synthesize on the box's own stack, not an external Codex call |
