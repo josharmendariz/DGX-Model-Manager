@@ -229,11 +229,23 @@ def test_exploit_string_never_reaches_script_text(tmp_path):
 
 
 def test_legitimate_name_is_accepted_unchanged(tmp_path):
+    # Deliberately a name that matches NO configured recipe: a recipe-backed
+    # model delegates to run-recipe.sh and never emits --served-model-name, which
+    # would mask the passthrough this test exists to guard (REQ-03).
     model_dir = _plain_model(tmp_path, "legit")
+    _, script, info = appmod._build_vllm_profile_script(
+        model_dir, "Acme/Legit-Model-7B")
+    assert info["name"] == "Acme/Legit-Model-7B"
+    assert "--served-model-name Acme/Legit-Model-7B" in script
+    assert _bash_syntax_ok(tmp_path, script)
+
+
+def test_recipe_backed_name_is_accepted_unchanged(tmp_path):
+    """The recipe branch must pass a legitimate name through just as safely."""
+    model_dir = _plain_model(tmp_path, "legit-recipe")
     _, script, info = appmod._build_vllm_profile_script(
         model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
     assert info["name"] == "Qwen/Qwen3.6-35B-A3B-FP8"
-    assert "--served-model-name Qwen/Qwen3.6-35B-A3B-FP8" in script
     assert _bash_syntax_ok(tmp_path, script)
 
 
@@ -283,3 +295,30 @@ def test_regenerated_deepseek_profiles_mount_repo_root():
         mount = [l for l in text.splitlines() if l.strip().startswith("-v ")][0]
         assert "/snapshots/" not in mount, f"{p.name} still mounts a snapshot dir"
         assert "vllm serve" in text
+
+
+def test_recipe_dir_precedence_is_config_env_default(monkeypatch):
+    """`vllm.recipe_dir` follows the `alerts` idiom: config -> env -> default.
+
+    Config must win over the environment (an operator's committed choice is not
+    overridden by an inherited env var), and the default only applies when
+    neither is set.
+    """
+    monkeypatch.setattr(appmod, "_app_config",
+                        {"vllm": {"recipe_dir": "/from/config"}}, raising=False)
+    monkeypatch.setenv("MODEL_MANAGER_VLLM_RECIPE_DIR", "/from/env")
+    assert appmod._vllm_recipe_dir() == "/from/config"
+
+    monkeypatch.setattr(appmod, "_app_config", {"vllm": {}}, raising=False)
+    assert appmod._vllm_recipe_dir() == "/from/env"
+
+    monkeypatch.delenv("MODEL_MANAGER_VLLM_RECIPE_DIR")
+    assert appmod._vllm_recipe_dir() == "~/spark-vllm-docker/recipes"
+
+
+def test_recipe_dir_env_override_reaches_the_generator(monkeypatch):
+    """The env layer must reach `_build_vllm_profile_script`'s vllm_cfg too —
+    otherwise the generator and the preflight helpers resolve different dirs."""
+    monkeypatch.setattr(appmod, "_app_config", {"vllm": {}}, raising=False)
+    monkeypatch.setenv("MODEL_MANAGER_VLLM_RECIPE_DIR", "/from/env")
+    assert appmod._live_vllm_cfg().get("recipe_dir") == "/from/env"
