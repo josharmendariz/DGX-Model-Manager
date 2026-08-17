@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: phase_complete
-last_updated: "2026-08-05T00:39:18.436Z"
-last_activity: 2026-08-05 -- Phase 02 verified complete (6/6 criteria)
+last_updated: "2026-08-17T00:00:00.000Z"
+last_activity: 2026-08-17 -- Phase 03 closed out (5/5 criteria); Phase 06 added to roadmap
 progress:
   total_phases: 7
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 5
-  completed_plans: 2
-  percent: 43
+  completed_plans: 4
+  percent: 57
 ---
 
 # Project State
@@ -20,18 +20,19 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-02)
 
 **Core value:** Switching the active vLLM model must be safe and correct.
-**Current focus:** Phase 03 — curated recipe overrides (next)
+**Current focus:** Phase 04 — parameterized scripts + UI settings (next)
 
 ## Current Position
 
-Phase: 02 (derived-launch-spec) — COMPLETE, verified 6/6
-Plan: 2 of 2 done
-Status: Phase 02 closed out. Next: `/gsd-plan-phase 3`.
-Last activity: 2026-08-05 -- Phase 02 verified complete (6/6 criteria)
-Remaining: Phase 3 wires `_derive_launch_spec` into the profile generator and adds the
-recipe table that beats derived values (closes the Qwen3.6 0.42-vs-0.55 gap).
+Phase: 03 (curated-recipe-overrides) — COMPLETE, 5/5 criteria
+Plan: executed without PLAN.md files; committed as 716ca98
+Status: Phase 03 closed out. Next: `/gsd-plan-phase 4`.
+Last activity: 2026-08-17 -- Phase 03 closed out (5/5 criteria); Phase 06 added to roadmap
+Remaining: Phase 4 parameterizes generated scripts and surfaces the derived/recommended
+values (and the so-far-unconsumed `warnings`) in the UI. Phase 6 (verifiable research
+capture) is independent and can be planned at any point.
 
-Progress: [█████░░░░░] 50%
+Progress: [██████░░░░] 57%
 
 ## Performance Metrics
 
