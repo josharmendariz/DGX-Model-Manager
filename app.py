@@ -7,6 +7,7 @@ Run via systemd: model-manager.service
 
 import asyncio
 import difflib
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -629,6 +630,37 @@ def _check_script_xref(model_name: str, all_profiles: list) -> tuple[bool, Optio
         if name_lower in content or search_term in content:
             return True, engine_label
     return False, None
+
+
+def _script_model_dir(script_path: str, model_dirs: list[Path]) -> Optional[Path]:
+    """Inverse of _check_script_xref: which model directory does this script launch?
+
+    Matches on the cache directory name (models--owner--name) and on the bare
+    owner/name, since hand-written profiles reference a resolved snapshot path
+    rather than a repo id. Returns the longest match: `Qwen3-8B` is a substring
+    of `Qwen3-8B-FP8`, and the shorter name would otherwise win arbitrarily.
+    """
+    try:
+        content = _script_content_cache.get(script_path)
+        if content is None:
+            content = Path(script_path).read_text().lower()
+            _script_content_cache[script_path] = content
+    except Exception:
+        return None
+
+    best: Optional[Path] = None
+    for d in model_dirs:
+        stem = d.name
+        # A short name is not evidence: generic path components match everything.
+        if len(stem) < 8:
+            continue
+        needles = [stem.lower()]
+        if stem.startswith("models--"):
+            needles.append(stem[8:].replace("--", "/").lower())
+        if any(n in content for n in needles):
+            if best is None or len(d.name) > len(best.name):
+                best = d
+    return best
 
 
 _DTYPE_MAP = {"float32": "FP32", "float16": "FP16", "bfloat16": "BF16",
@@ -1912,6 +1944,7 @@ async def get_sites(request: Request, refresh: int = 0):
 # `match` rule; only fired recommendations are returned, ranked by severity.
 
 _RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_MODEL_CAPABILITIES_FILE = _APP_DIR / "model_capabilities.json"
 _REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1921,6 +1954,78 @@ def _load_recommendations() -> dict:
     except Exception as e:
         _logger.warning("Could not load recommendations.json: %s", e)
         return {"meta": {}, "recommendations": []}
+
+
+def _load_model_capabilities() -> dict:
+    try:
+        return json.loads(_MODEL_CAPABILITIES_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load model_capabilities.json: %s", e)
+        return {"meta": {}, "models": []}
+
+
+_PARSER_NAME_RE = _re.compile(r"^[a-z0-9_.-]{1,64}$")
+_PARSER_EMISSION_CONFIDENCE = {
+    "recipe-proven", "template-identical-to-recipe-proven",
+}
+
+
+def _capability_entry(info: dict) -> dict | None:
+    capabilities = _load_model_capabilities()
+    rows = capabilities.get("models", []) if isinstance(capabilities, dict) else []
+    if not isinstance(rows, list):
+        return None
+
+    name = info.get("name")
+    name_key = name.casefold() if isinstance(name, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (name_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == name_key
+                        for match in matches)):
+            return row
+
+    architectures = info.get("architectures", [])
+    architecture = (architectures[0]
+                    if isinstance(architectures, list) and architectures else None)
+    architecture_key = architecture.casefold() if isinstance(architecture, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (architecture_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == architecture_key
+                        for match in matches)):
+            return row
+    return None
+
+
+def _capability_emission_details(
+        entry: dict | None) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if not isinstance(entry, dict):
+        return None, None, ()
+
+    warnings = []
+    values = []
+    for field in ("tool_call_parser", "reasoning_parser"):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str)
+                                  or not _PARSER_NAME_RE.match(value)):
+            warnings.append(
+                f"capability map {field} is invalid; expected "
+                "lowercase letters, digits, dot, underscore or hyphen (max 64)")
+            value = None
+        values.append(value)
+
+    explicit_emit = entry.get("emit")
+    emittable = (explicit_emit if isinstance(explicit_emit, bool)
+                 else entry.get("confidence") in _PARSER_EMISSION_CONFIDENCE)
+    if not emittable:
+        return None, None, tuple(warnings)
+    return values[0], values[1], tuple(warnings)
+
+
+def _capability_emission(entry: dict | None) -> tuple[str | None, str | None]:
+    tool_parser, reasoning_parser, _warnings = _capability_emission_details(entry)
+    return tool_parser, reasoning_parser
 
 
 def _profile_script_text(profile: dict) -> str:
@@ -2479,11 +2584,24 @@ async def restart_litellm():
 
 # ── Shared engine helpers ─────────────────────────────────────────────────────
 
-async def _find_container_by_port(port: int) -> Optional[str]:
-    """Return the container ID listening on the given host port, or None."""
+async def _find_container_by_port(port: int, docker_filter: str | None = None) -> Optional[str]:
+    """Return the container ID listening on the given host port, or None.
+
+    `--filter publish=` only matches *published* port mappings, so a container
+    run with `--network host` (which is how vLLM runs on the GB10) is invisible
+    to it despite genuinely owning the port. Fall back to a name filter.
+    """
     result = await _run("docker", "ps", "--filter", f"publish={port}", "--format", "{{.ID}}", timeout=5)
     lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
-    return lines[0].strip() if lines else None
+    if lines:
+        return lines[0].strip()
+    if docker_filter:
+        result = await _run("docker", "ps", "--filter", f"name={docker_filter}",
+                            "--format", "{{.ID}}", timeout=5)
+        lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
+        if lines:
+            return lines[0].strip()
+    return None
 
 
 async def _docker_stop(container_id: str) -> tuple[bool, str]:
@@ -2603,13 +2721,13 @@ def _extract_port(url: str) -> int:
     raise ValueError(f"Cannot extract port from URL: {url}")
 
 
-async def _engine_stop(base_url: str, engine_name: str) -> dict:
+async def _engine_stop(base_url: str, engine_name: str, docker_filter: str | None = None) -> dict:
     """Stop the Docker container for an engine by its configured port."""
     try:
         port = _extract_port(base_url)
     except ValueError:
         raise HTTPException(400, f"Invalid {engine_name} URL — cannot determine port from '{base_url}'")
-    cid = await _find_container_by_port(port)
+    cid = await _find_container_by_port(port, docker_filter)
     if not cid:
         raise HTTPException(404, f"No container found listening on {engine_name} port — already stopped?")
     ok, output = await _docker_stop(cid)
@@ -3225,14 +3343,14 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
 async def _preflight_smoke(facts: dict, script: str) -> list:
     """Spend a couple of seconds proving the arguments actually parse."""
     if facts["recipe_backed"]:
-        recipe_dir = Path(os.path.expanduser("~/spark-vllm-docker"))
-        runner = recipe_dir / "run-recipe.sh"
+        _, recipe_root = _recipe_dirs()   # runner dir = parent of the recipe yaml dir
+        runner = recipe_root / "run-recipe.sh"
         if not runner.exists():
             return [_pf("skip", "smoke", "Recipe runner not found",
                         f"{runner} does not exist, so the recipe could not be dry-run.")]
         proc = await asyncio.create_subprocess_exec(
             str(runner), facts["recipe"], "--dry-run",
-            cwd=str(recipe_dir),
+            cwd=str(recipe_root),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(),
@@ -3314,16 +3432,103 @@ async def vllm_preflight(req: EngineStartRequest):
     }
 
 
-def _recipe_util(recipe: str) -> Optional[float]:
-    """gpu_memory_utilization from a run-recipe YAML, without a YAML dependency."""
-    if not recipe or not _re.fullmatch(r"[\w.-]+", recipe):
-        return None
-    path = Path(os.path.expanduser("~/spark-vllm-docker/recipes")) / f"{recipe}.yaml"
+# The one owner of "where the recipe YAMLs and run-recipe.sh live." Generator, Dry-Run
+# smoke, and preflight memory math must all agree on this, or a configured recipe_dir
+# would launch from one place while validating another. Config -> default (no env
+# override: no other vllm block key has one either).
+def _live_vllm_cfg() -> dict:
+    """The `vllm` config block with env overrides applied — config -> env -> default,
+    the same precedence the `alerts` block uses.
+
+    The env layer lands HERE rather than inside the generator because
+    `_build_vllm_profile_script` is deliberately a pure function of the `vllm_cfg`
+    it is handed. Resolving the override at the single point where the live block
+    is read keeps the generator and the preflight helpers (`_recipe_dirs`,
+    `_recipe_util`) from disagreeing about which recipe directory is in force.
+    """
+    cfg = dict(_app_config.get("vllm", {}) or {})
+    if env_dir := os.environ.get("MODEL_MANAGER_VLLM_RECIPE_DIR"):
+        cfg["recipe_dir"] = cfg.get("recipe_dir") or env_dir
+    return cfg
+
+
+def _vllm_recipe_dir() -> str:
+    return _live_vllm_cfg().get("recipe_dir") or "~/spark-vllm-docker/recipes"
+
+
+def _recipe_dirs() -> tuple[Path, Path]:
+    """(recipe_yaml_dir, runner_dir) from the live config. Pre-flight-only use
+    (_recipe_util, _preflight_smoke): the generator stays a pure function of its
+    vllm_cfg argument. run-recipe.sh sits in the checkout root, sibling of the
+    recipes/ subdir, so the runner dir is the yaml dir's parent — the same
+    assumption the generated wrapper's `cd "$RECIPE_DIR/.."` makes."""
+    ydir = Path(os.path.expanduser(_vllm_recipe_dir()))
+    return ydir, ydir.parent
+
+
+def _read_recipe(recipe_dir, name: str) -> tuple[Optional[dict], list[str]]:
+    """Render and normalize one run-recipe YAML; malformed input is no opinion."""
+    if not isinstance(name, str) or not _re.fullmatch(r"[\w.-]+", name):
+        return None, [f"invalid recipe name {name!r}"]
+
     try:
-        m = _re.search(r"^\s*gpu_memory_utilization:\s*([0-9.]+)", path.read_text(), _re.M)
-        return float(m.group(1)) if m else None
-    except Exception:
-        return None
+        path = Path(os.path.expanduser(os.fspath(recipe_dir))) / f"{name}.yaml"
+        recipe = yaml.safe_load(path.read_text())
+        if not isinstance(recipe, dict):
+            return None, [f"recipe {name!r} is not a YAML mapping"]
+        if "command" not in recipe:
+            return None, [f"recipe {name!r} has no command"]
+        defaults = recipe.get("defaults", {})
+        params = {**defaults, **{}}
+        try:
+            rendered = recipe["command"].format(**params)
+        except (KeyError, IndexError, ValueError) as exc:
+            return None, [f"recipe {name!r} command placeholder error: {exc}"]
+        tokens = shlex.split(rendered)
+
+        flags = {}
+        wanted = {
+            "--gpu-memory-utilization", "--gpu-memory-utilization-gb",
+            "--max-model-len", "--kv-cache-dtype", "--tool-call-parser",
+            "--reasoning-parser", "--port",
+        }
+        for index, token in enumerate(tokens):
+            flag, separator, inline = token.partition("=")
+            if flag not in wanted:
+                continue
+            if separator:
+                flags[flag] = inline
+            elif index + 1 < len(tokens):
+                flags[flag] = tokens[index + 1]
+
+        def _number(flag: str, cast):
+            value = flags.get(flag)
+            return cast(value) if value is not None else None
+
+        return {
+            "name": recipe.get("name") or None,
+            "description": recipe.get("description") or None,
+            "model": recipe.get("model") or None,
+            "gpu_memory_utilization": _number("--gpu-memory-utilization", float),
+            "gpu_memory_utilization_gb": _number("--gpu-memory-utilization-gb", float),
+            "max_model_len": _number("--max-model-len", int),
+            "kv_cache_dtype": flags.get("--kv-cache-dtype") or None,
+            "tool_call_parser": flags.get("--tool-call-parser") or None,
+            "reasoning_parser": flags.get("--reasoning-parser") or None,
+            "port": _number("--port", int),
+            "solo_only": recipe.get("solo_only") if "solo_only" in recipe else None,
+            "cluster_only": recipe.get("cluster_only") if "cluster_only" in recipe else None,
+            "mods": recipe.get("mods") if "mods" in recipe else None,
+        }, []
+    except Exception as exc:
+        location = str(path) if "path" in locals() else repr(recipe_dir)
+        return None, [f"could not read recipe {name!r} from {location}: {exc}"]
+
+
+def _recipe_util(recipe: str) -> Optional[float]:
+    """Return only a fractional recipe utilization for preflight memory math."""
+    record, _ = _read_recipe(_recipe_dirs()[0], recipe)
+    return record.get("gpu_memory_utilization") if record is not None else None
 
 
 @app.post("/api/vllm/reclaim-cache", dependencies=[Depends(verify_auth)])
@@ -3536,7 +3741,13 @@ for _ek, _ev in _ENGINES.items():
     def _make_engine_routes(key: str, eng: dict):
         @app.get(f"/api/{key}/profiles", name=f"{key}_profiles")
         async def profiles(k=key):
-            return _scan_profiles(k)
+            return _profiles_with_models(k)
+
+        @app.delete(f"/api/{key}/profiles/{{profile_id}}", name=f"{key}_profile_delete",
+                    dependencies=[Depends(verify_auth)])
+        async def delete_profile(profile_id: str, k=key):
+            """Delete a profile's start script. Leaves model weights untouched."""
+            return _delete_profile_script(k, profile_id)
 
         @app.get(f"/api/{key}/status", name=f"{key}_status")
         async def status(k=key, e=eng):
@@ -3547,7 +3758,8 @@ for _ek, _ev in _ENGINES.items():
         @app.post(f"/api/{key}/stop", name=f"{key}_stop",
                   dependencies=[Depends(verify_auth)])
         async def stop(k=key, e=eng):
-            return await _engine_stop(_engine_bases[k], e["name"])
+            return await _engine_stop(_engine_bases[k], e["name"],
+                                      e.get("docker_filter", k))
 
         @app.post(f"/api/{key}/start", name=f"{key}_start",
                   dependencies=[Depends(verify_auth)])
@@ -3696,6 +3908,82 @@ def _allowed_model_roots() -> list[Path]:
     return roots
 
 
+def _looks_like_model_dir(d: Path) -> bool:
+    """True only for a directory that is itself one model.
+
+    Deliberately strict. `/opt/models/hub` is a 282 GB *cache root* full of
+    models--* entries; it is a directory under an allowed root, and the token
+    'hub' appears in every HF path, so a laxer test made it a delete candidate
+    for a profile whose real model directory had been removed.
+    """
+    if d.name.startswith(".") or d.name in ("hub", "blobs", "snapshots", "refs"):
+        return False
+    if (d / "config.json").exists():
+        return True
+    if (d / "snapshots").is_dir() and not any(
+            c.name.startswith("models--") for c in d.iterdir() if c.is_dir()):
+        return True
+    return False
+
+
+def _candidate_model_dirs() -> list[Path]:
+    """Every top-level model directory under the allowed roots."""
+    dirs = []
+    for root in _allowed_model_roots():
+        try:
+            dirs += [d for d in root.iterdir() if d.is_dir() and _looks_like_model_dir(d)]
+        except Exception:
+            continue
+    return dirs
+
+
+def _profiles_with_models(engine_key: str) -> list:
+    """Profiles for an engine, annotated with the model dir each one launches.
+
+    The UI needs `model_dir` to offer a weights delete next to a profile delete;
+    `model_size_gb` so the confirm can state what is actually being freed.
+    """
+    model_dirs = _candidate_model_dirs()
+    out = []
+    for p in _scan_profiles(engine_key):
+        d = _script_model_dir(p["script"], model_dirs)
+        p["model_dir"] = str(d) if d else None
+        p["model_missing"] = bool(d is None)
+        if d:
+            blobs = d / "blobs"
+            src = blobs if blobs.exists() else d
+            try:
+                p["model_size_gb"] = round(
+                    sum(f.stat().st_size for f in src.rglob("*") if f.is_file()) / 1e9, 1)
+            except Exception:
+                p["model_size_gb"] = None
+        else:
+            p["model_size_gb"] = None
+        out.append(p)
+    return out
+
+
+def _delete_profile_script(engine_key: str, profile_id: str) -> dict:
+    """Remove a start_*.sh for an engine, by profile id (the script stem)."""
+    d = _engine_dirs.get(engine_key)
+    if not d:
+        raise HTTPException(404, "Unknown engine")
+    # Reject traversal: the id is a stem, never a path.
+    if "/" in profile_id or "\\" in profile_id or profile_id.startswith("."):
+        raise HTTPException(400, "Invalid profile id")
+    script = (d / f"{profile_id}.sh").resolve()
+    try:
+        script.relative_to(d.resolve())
+    except ValueError:
+        raise HTTPException(400, "Profile is outside the engine directory")
+    if not script.exists():
+        raise HTTPException(404, "Profile not found")
+    script.unlink()
+    _script_content_cache.pop(str(script), None)
+    _logger.info("Deleted %s profile script %s", engine_key, script.name)
+    return {"ok": True, "deleted": str(script)}
+
+
 def _find_launch_dir(path: Path) -> Path:
     """Accept an HF model dir, snapshot dir, or flat model dir and return the launch dir."""
     if (path / "config.json").exists():
@@ -3758,6 +4046,8 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
         "task_label": task_label,
         "size_gb": size_gb,
         "vram_gb": vram_gb,
+        "architectures": (config.get("architectures", [])
+                          if isinstance(config.get("architectures", []), list) else []),
     }
 
 
@@ -3847,6 +4137,143 @@ def _vllm_serve_command(image: str, cfg: dict) -> str:
     return "" if "vllm-openai" in ref else "vllm serve"
 
 
+def _resolve_recipe_model(model_name: str, vllm_cfg: dict) -> tuple[Optional[str], list[str]]:
+    """Choose the deterministic most-specific configured recipe glob."""
+    recipes = vllm_cfg.get("recipes") if isinstance(vllm_cfg, dict) else None
+    if not isinstance(recipes, dict) or not recipes:
+        return None, []
+    folded_name = str(model_name).casefold()
+    matches = []
+    for pattern, recipe_name in recipes.items():
+        if not isinstance(pattern, str):
+            continue
+        if fnmatch.fnmatchcase(folded_name, pattern.casefold()):
+            matches.append((pattern, recipe_name))
+    if not matches:
+        return None, []
+
+    def _specificity(item):
+        pattern = item[0]
+        wildcard_count = sum(pattern.count(char) for char in "*?[")
+        literal_length = sum(char not in "*?[]" for char in pattern)
+        return wildcard_count, -literal_length, pattern.casefold(), pattern
+
+    pattern, recipe_name = min(matches, key=_specificity)
+    warnings = []
+    if len(matches) > 1:
+        warnings.append(
+            f"multiple recipe patterns match {model_name!r}; chose {pattern!r}")
+    if not isinstance(recipe_name, str) or not _re.fullmatch(r"[\w.-]+", recipe_name):
+        warnings.append(f"invalid recipe name {recipe_name!r} for pattern {pattern!r}")
+        return None, warnings
+    return recipe_name, warnings
+
+
+def _kv_dtype_from_config(config: dict) -> Optional[str]:
+    """Return fp8 only for an explicit model-owned floating 8-bit KV declaration."""
+    if not isinstance(config, dict):
+        return None
+    candidates = [config]
+    if isinstance(config.get("text_config"), dict):
+        candidates.append(config["text_config"])
+    for candidate in candidates:
+        quant = candidate.get("quantization_config")
+        if not isinstance(quant, dict):
+            continue
+        if str(quant.get("kv_cache_dtype", "")).casefold() == "fp8":
+            return "fp8"
+        scheme = quant.get("kv_cache_scheme")
+        if not isinstance(scheme, dict):
+            continue
+        try:
+            eight_bit = int(scheme.get("num_bits")) == 8
+        except (TypeError, ValueError):
+            eight_bit = False
+        kind = " ".join(str(scheme.get(key, "")).casefold()
+                        for key in ("type", "dtype"))
+        if eight_bit and ("float" in kind or "fp8" in kind):
+            return "fp8"
+    return None
+
+
+def _resolve_launch(config: dict, info: dict, vllm_cfg: dict) -> dict:
+    """Resolve recipe delegation or derived Docker flags for one model."""
+    name = str(info.get("name", ""))
+    is_gpt_oss = "gpt-oss" in name.lower() or "gpt_oss" in name.lower()
+    if is_gpt_oss:
+        return {"shape": "docker", "gpt_oss": True}
+
+    recipe_name, warnings = _resolve_recipe_model(name, vllm_cfg)
+    if recipe_name is not None:
+        res_dir = vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        record, reader_warnings = _read_recipe(res_dir, recipe_name)
+        warnings.extend(reader_warnings)
+        if record is not None:
+            if record.get("cluster_only") is True:
+                warnings.append(f"recipe {recipe_name!r} is cluster_only")
+            if record.get("port") is not None and record["port"] != 8000:
+                warnings.append(
+                    f"recipe {recipe_name!r} uses port {record['port']}, not 8000")
+            return {
+                "shape": "recipe", "recipe": recipe_name,
+                "record": record, "warnings": warnings,
+            }
+
+    kv_dtype = _kv_dtype_from_config(config)
+    spec = _derive_launch_spec(
+        config, weights_gb=info.get("size_gb", 0.0), pool_gb=121.0,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2)
+    warnings.extend(spec.get("warnings") or [])
+    max_model_len = spec.get("max_model_len")
+    if not isinstance(max_model_len, (int, float)) or max_model_len <= 0:
+        max_model_len = None
+    else:
+        max_model_len = int(max_model_len)
+    util = spec.get("recommended_util")
+    if not isinstance(util, (int, float)) or util <= 0.10:
+        util = None
+    else:
+        util = float(util)
+    return {
+        "shape": "docker", "kv_dtype": kv_dtype, "util": util,
+        "max_model_len": max_model_len, "warnings": warnings,
+    }
+
+
+def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool) -> str:
+    """The single shared owner of generated profile metadata and collision cleanup."""
+    if recipe_backed:
+        rationale = (
+            "# Recipe-backed: the YAML remains the source of truth for measured flags and\n"
+            "# in-container mods that a generated docker command cannot reproduce.\n")
+    else:
+        rationale = ""
+    return f"""#!/bin/bash
+# Name: HF {_one_line(info['name'])}
+# Description: Local HF snapshot via vLLM ({_one_line(info['dtype'])}, {info['size_gb']:.1f} GB on disk)
+# VRAM: {info['vram_gb']}
+#
+# Auto-generated by DGX Model Manager from:
+# {_one_line(launch_dir)}
+{rationale}set -euo pipefail
+
+docker rm -f vllm_node 2>/dev/null || true
+
+"""
+
+
+def _recipe_profile_body(recipe_dir, recipe_name: str) -> str:
+    recipe_path = Path(os.path.expanduser(os.fspath(recipe_dir)))
+    return f"""RECIPE_DIR={shlex.quote(str(recipe_path))}
+RECIPE={shlex.quote(recipe_name)}
+
+# recipe_dir owns the YAMLs; run-recipe.sh is its sibling in the checkout root.
+cd "$RECIPE_DIR/.."
+# Detached mode lets DMM read progress uniformly from docker logs.
+exec ./run-recipe.sh "$RECIPE" -d
+"""
+
+
 def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) -> tuple[str, str, dict]:
     info = _profile_model_info(launch_dir, model_name)
     if info["fmt"] not in ("safetensors", "pytorch"):
@@ -3859,7 +4286,22 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     _validate_served_name(info["served"])
     slug = _safe_profile_slug(info["name"])
     script_name = f"start_hf_{slug}.sh"
-    _vllm_cfg = _app_config.get("vllm", {}) or {}
+    _vllm_cfg = _live_vllm_cfg()
+    try:
+        config = json.loads((launch_dir / "config.json").read_text())
+        if not isinstance(config, dict):
+            config = {}
+    except Exception:
+        config = {}
+    resolved = _resolve_launch(config, info, _vllm_cfg)
+    info["warnings"] = list(resolved.get("warnings") or [])
+    preamble = _vllm_script_preamble(
+        info, launch_dir, recipe_backed=resolved["shape"] == "recipe")
+    if resolved["shape"] == "recipe":
+        res_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        return (script_name, preamble + _recipe_profile_body(
+            res_dir, resolved["recipe"]), info)
+
     mounts, container_model = _container_model_mount(launch_dir, slug)
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
@@ -3901,7 +4343,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         f'  --served-model-name {shlex.quote(info["name"])} {shlex.quote(info["served"])} vllm-active \\',
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
-        "  --gpu-memory-utilization 0.75 \\",
+        f"  --gpu-memory-utilization {resolved['util'] if resolved.get('util') is not None else 0.75} \\",
     ]
     if is_gpt_oss:
         # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
@@ -3912,9 +4354,12 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         ]
     else:
         arg_lines += [
-            "  --max-model-len 32768 --max-num-seqs 2 \\",
-            "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+            f"  --max-model-len {resolved['max_model_len'] if resolved.get('max_model_len') is not None else 32768} --max-num-seqs 2 \\",
         ]
+        if resolved.get("kv_dtype") == "fp8":
+            arg_lines.append("  --kv-cache-dtype fp8 --enable-chunked-prefill \\")
+        else:
+            arg_lines.append("  --enable-chunked-prefill \\")
     # On GB10 (sm_121) Marlin MoE miscomputes for some architectures; setting
     # vllm.moe_backend to "" in config.json omits the flag and lets vLLM autoselect.
     _moe_backend = _vllm_cfg.get("moe_backend", "marlin")
@@ -3924,11 +4369,18 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             raise HTTPException(400, "Invalid vllm.moe_backend: expected lowercase letters, "
                                      "digits and underscores only.")
         arg_lines.append(f"  --moe-backend {_moe_backend} \\")
-    if "qwen" in info["name"].lower():
-        arg_lines += [
-            "  --enable-auto-tool-choice \\",
-            "  --tool-call-parser qwen3_coder \\",
-        ]
+    if not is_gpt_oss:
+        tool_parser, reasoning_parser, capability_warnings = (
+            _capability_emission_details(_capability_entry(info)))
+        info["warnings"].extend(capability_warnings)
+        if tool_parser is not None:
+            arg_lines += [
+                "  --enable-auto-tool-choice \\",
+                f"  --tool-call-parser {shlex.quote(tool_parser)} \\",
+            ]
+        if reasoning_parser is not None:
+            arg_lines.append(
+                f"  --reasoning-parser {shlex.quote(reasoning_parser)} \\")
     arg_lines.append("  --generation-config vllm")
 
     # Whether an explicit `vllm serve` is needed is a property of the IMAGE, not of the
@@ -3943,26 +4395,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         arg_lines.insert(0, f"  {_serve_cmd} \\")
     image = shlex.quote(str(image))
 
-    # Headers are parsed back by _parse_script_meta one line at a time, so flatten anything
-    # that could introduce a newline and forge an extra header.
-    script = f"""#!/bin/bash
-# Name: HF {_one_line(info['name'])}
-# Description: Local HF snapshot via vLLM ({_one_line(dtype)}, {info['size_gb']:.1f} GB on disk)
-# VRAM: {info['vram_gb']}
-#
-# Auto-generated by DGX Model Manager from:
-# {_one_line(launch_dir)}
-set -euo pipefail
-
-docker rm -f vllm_node 2>/dev/null || true
-
-# No --restart policy, deliberately. DMM is a manual switcher; vllm-default-model.service
-# owns what comes back after a reboot. A generated profile that carried
-# `--restart unless-stopped` resurrected itself at boot on 2026-08-04, and because it was
-# crash-looping under the name `vllm_node`, run-recipe.sh saw "already running", skipped
-# its launch, and the box's default model never came up. A restart policy on a container
-# whose launch may be wrong converts a bad script into a persistent outage.
-exec docker run --name vllm_node --gpus all -p 8000:8000 \\
+    script = preamble + f"""exec docker run --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
   {image} \\
@@ -4143,14 +4576,20 @@ async def hf_download(req: HFDownloadRequest):
     )
 
 
+def _all_profiles() -> list:
+    """(profile, engine_name) pairs across every engine, for script cross-refs."""
+    _script_content_cache.clear()
+    pairs = []
+    for ek, ev in _ENGINES.items():
+        pairs += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    return pairs
+
+
 @app.get("/api/hf/inventory")
 async def hf_inventory():
     """Scan HF cache + custom dirs and return model inventory."""
     # Build profile list once for all models (avoids re-scanning per model)
-    _script_content_cache.clear()
-    all_profiles = []
-    for ek, ev in _ENGINES.items():
-        all_profiles += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    all_profiles = _all_profiles()
 
     custom_dirs = _load_custom_dirs()
     directories = []
@@ -4171,10 +4610,7 @@ async def hf_inventory():
 @app.get("/api/inventory")
 async def unified_inventory(include_ollama: bool = True):
     """Unified inventory: HF cache + custom dirs + optionally Ollama models."""
-    _script_content_cache.clear()
-    all_profiles = []
-    for ek, ev in _ENGINES.items():
-        all_profiles += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    all_profiles = _all_profiles()
 
     custom_dirs = _load_custom_dirs()
     directories = []
@@ -4280,6 +4716,50 @@ async def remove_inventory_dir(path: str):
 
 class DeleteModelRequest(BaseModel):
     path: str
+    force: bool = False
+
+
+async def _model_dir_in_use(target: Path) -> Optional[str]:
+    """Return the name of a running container serving files under `target`, or None.
+
+    A delete can pull weights out from under a live engine: it keeps serving from
+    page cache and then fails at the next load with an error pointing nowhere near
+    this endpoint.
+
+    Docker metadata alone is not a reliable signal. The GB10 vLLM container runs
+    `sleep infinity` with the whole HF cache bind-mounted and the model launched
+    inside it, so neither Cmd nor Mounts names the model. Ask each engine what it
+    is actually serving.
+    """
+    # models--owner--name → "owner/name"
+    stem = target.name
+    if stem.startswith("models--"):
+        parts = stem[8:].split("--", 1)
+        served_candidates = {"/".join(parts).lower(), parts[-1].lower()}
+    else:
+        served_candidates = {stem.lower()}
+
+    for key, eng in _ENGINES.items():
+        models_path = eng.get("models_path")
+        if not models_path:
+            continue
+        try:
+            r = await _http.get(_engine_bases[key] + models_path, timeout=3.0)
+            ids = [d.get("id", "") for d in r.json().get("data", [])]
+        except Exception:
+            continue
+        for mid in ids:
+            if mid.lower() in served_candidates or mid.lower().endswith("/" + stem.lower()):
+                return f"{eng['name']} (serving {mid})"
+
+    # Secondary: an explicit path in a container's argv (non-`sleep` launches).
+    result = await _run("docker", "ps", "--format", "{{.Names}}", timeout=5)
+    for name in [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]:
+        insp = await _run("docker", "inspect", name,
+                          "--format", "{{json .Config.Cmd}}", timeout=5)
+        if insp.returncode == 0 and target.name in insp.stdout:
+            return name
+    return None
 
 
 @app.post("/api/hf/inventory/delete", dependencies=[Depends(verify_auth)])
@@ -4291,6 +4771,12 @@ async def delete_inventory_model(req: DeleteModelRequest):
     allowed_roots = [HF_CACHE_DIR.resolve()]
     for d in _load_custom_dirs():
         allowed_roots.append(Path(os.path.expanduser(d)).resolve())
+    # A root is not a model. `relative_to(root)` succeeds for root itself, so
+    # without this an allowed root passes every check below and rmtree takes the
+    # entire cache — 282 GB in the case of /opt/models/hub.
+    if target in allowed_roots:
+        raise HTTPException(400, "Refusing to delete a model root directory")
+
     allowed = False
     for root in allowed_roots:
         try:
@@ -4301,16 +4787,51 @@ async def delete_inventory_model(req: DeleteModelRequest):
             continue
     if not allowed:
         raise HTTPException(400, "Path is not under a known model directory")
+    if not _looks_like_model_dir(target):
+        raise HTTPException(400, f"'{target.name}' is not a single model directory")
     if not target.exists():
         raise HTTPException(404, "Directory not found")
     if not target.is_dir():
         raise HTTPException(400, "Path is not a directory")
 
+    # Never delete weights a running engine is serving, even with force.
+    in_use = await _model_dir_in_use(target)
+    if in_use:
+        raise HTTPException(
+            409, f"Model is in use by running container '{in_use}' — stop it first")
+
+    # A profile script pointing at deleted weights fails only at next launch, so
+    # surface the cross-reference here and require an explicit override.
+    if not req.force:
+        stem = target.name
+        if stem.startswith("models--"):
+            stem = stem[8:].split("--", 1)[-1]
+        has_script, engine = _check_script_xref(stem, _all_profiles())
+        if has_script:
+            raise HTTPException(
+                409, f"A {engine} profile script references this model — "
+                     f"delete the profile first, or re-send with force")
+
     try:
         shutil.rmtree(target)
         return {"ok": True, "deleted": str(target)}
+    except PermissionError:
+        pass
     except Exception as e:
         raise HTTPException(500, f"Failed to delete: {e}")
+
+    # Models pulled by a root-run downloader land root-owned (everything under
+    # /opt/models is), and the service runs as the login user. Every safety check
+    # above has already passed by this point; `_run` takes argv, so no shell.
+    r = await _run("sudo", "-n", "rm", "-rf", "--", str(target), timeout=300)
+    if r.returncode != 0:
+        raise HTTPException(
+            500, f"'{target.name}' is owned by another user and passwordless sudo "
+                 f"is unavailable: {(r.stdout + r.stderr).strip()[:200]}")
+    if target.exists():
+        raise HTTPException(500, f"Delete reported success but {target} still exists")
+    _logger.info("Deleted model dir %s (via sudo)", target)
+    return {"ok": True, "deleted": str(target), "sudo": True}
 
 # ── HF Metadata & Search ────────────────────────────────────────────────────
 
@@ -5173,6 +5694,18 @@ a.model-card:hover{border-color:var(--amber)}
 .p-name{font-size:13px;font-weight:600}
 .p-desc{font-size:11px;color:var(--muted);margin-top:2px}
 .p-vram{font-family:var(--mono);font-size:11px;color:var(--amber);flex-shrink:0}
+/* Hidden until row hover: destructive controls should not sit under the cursor
+   on a list whose primary action is selecting a profile to launch. */
+.subtabs{display:flex;align-items:center;gap:4px;margin:0 0 10px;border-bottom:1px solid var(--border)}
+.subtab{
+  background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);
+  font-family:inherit;font-size:12px;font-weight:600;padding:7px 12px;cursor:pointer;
+}
+.subtab:hover{color:var(--fg)}
+.subtab.active{color:var(--amber);border-bottom-color:var(--amber)}
+.subtab-note{margin-left:auto;font-size:11px;color:var(--dim);font-family:var(--mono)}
+.p-actions{display:flex;gap:4px;flex-shrink:0;margin-left:8px;opacity:0;transition:opacity .12s}
+.profile-item:hover .p-actions,.profile-item.selected .p-actions{opacity:1}
 
 /* ── Config block ── */
 .config-block{
@@ -5861,7 +6394,11 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
         Name, description, and VRAM are read from optional header comments in the script:<br>
         <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;\u00b7&nbsp; # Description: ... &nbsp;\u00b7&nbsp; # VRAM: 119</code>
       </div>
-      <div class="sec-label">Profiles</div>
+      <div class="subtabs" id="{k}-subtabs">
+        <button class="subtab active" id="{k}-subtab-models" onclick="setProfileView('{k}','models')">Models</button>
+        <button class="subtab" id="{k}-subtab-profiles" onclick="setProfileView('{k}','profiles')">Profiles</button>
+        <span class="subtab-note" id="{k}-subtab-note"></span>
+      </div>
       <div class="profile-list" id="{k}-profile-list">
         <div class="empty"><div class="spin-icon" style="margin:0 auto"></div></div>
       </div>
@@ -7229,25 +7766,105 @@ async function loadEngineStatus(eng) {
 async function loadEngineProfiles(eng) {
   const el = document.getElementById(eng.ids.profiles);
   try {
-    const profiles = await apiFetch(eng.api + '/profiles');
-    if (!profiles.length) {
-      el.innerHTML = '<div class="empty"><div class="empty-text">No profiles defined</div></div>';
-      return;
-    }
-    if (!eng.selectedProfile) eng.selectedProfile = profiles[0].id;
+    eng.profiles = await apiFetch(eng.api + '/profiles');
+    renderEngineProfiles(eng);
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+  }
+}
+
+// Two views over the same list, so the launch list stays uncluttered:
+//   models   — profiles whose weights are on disk; the things you can start.
+//   profiles — every start_*.sh, including ones whose weights are gone. This is
+//              the housekeeping view, and the only place orphans are visible.
+function setProfileView(key, view) {
+  const eng = engines[key];
+  eng.profileView = view;
+  ['models','profiles'].forEach(v => {
+    const b = document.getElementById(key + '-subtab-' + v);
+    if (b) b.classList.toggle('active', v === view);
+  });
+  renderEngineProfiles(eng);
+}
+
+function renderEngineProfiles(eng) {
+  const el = document.getElementById(eng.ids.profiles);
+  const all = eng.profiles || [];
+  const view = eng.profileView || 'models';
+  const profiles = view === 'models' ? all.filter(p => !p.model_missing) : all;
+
+  const note = document.getElementById(eng.key + '-subtab-note');
+  if (note) {
+    const onDisk = {};
+    all.forEach(p => { if (p.model_dir) onDisk[p.model_dir] = p.model_size_gb || 0; });
+    const gb = Object.values(onDisk).reduce((s,v) => s+v, 0);
+    const orphans = all.filter(p => p.model_missing).length;
+    note.textContent = all.length + ' profiles · ' + gb.toFixed(1) + ' GB on disk'
+      + (orphans ? ' · ' + orphans + ' orphaned' : '');
+  }
+
+  if (!all.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles defined</div></div>';
+    return;
+  }
+  if (!profiles.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles with weights on disk</div></div>';
+    return;
+  }
+  // Selection must stay on a visible row, or Start launches something unseen.
+  if (!eng.selectedProfile || !profiles.some(p => p.id === eng.selectedProfile)) {
+    eng.selectedProfile = profiles[0].id;
+  }
+  {
+    const q = s => String(s == null ? '' : s).replace(/'/g, "\\'");
     el.innerHTML = profiles.map(p => `
       <div class="profile-item ${eng.selectedProfile === p.id ? 'selected' : ''}"
            onclick="selectEngineProfile('${eng.key}', '${p.id}', this)">
         <div class="p-radio"></div>
         <div class="p-info">
-          <div class="p-name">${p.name}</div>
+          <div class="p-name">${p.name}${p.model_missing
+            ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
           <div class="p-desc">${p.description}</div>
         </div>
         <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
+        <div class="p-actions" onclick="event.stopPropagation()">
+          ${p.model_dir
+            ? `<button class="btn-icon-del" title="Delete model weights from disk${
+                 p.model_size_gb ? ' (' + p.model_size_gb + ' GB)' : ''}"
+                 onclick="deleteProfileWeights('${eng.key}','${q(p.model_dir)}','${q(p.name)}',${p.model_size_gb || 0})">&#9679;</button>`
+            : ''}
+          <button class="btn-icon-del" title="Delete this profile script"
+                  onclick="deleteEngineProfile('${eng.key}','${q(p.id)}','${q(p.name)}')">&#10005;</button>
+        </div>
       </div>
     `).join('');
+  }
+}
+
+async function deleteEngineProfile(key, id, name) {
+  if (!confirm('Delete the profile "' + name + '"?\n\nThis removes the start script only. Model weights on disk are untouched.')) return;
+  try {
+    await apiFetch(engines[key].api + '/profiles/' + encodeURIComponent(id), 'DELETE');
+    toast('Profile deleted: ' + name, 'ok');
+    if (engines[key].selectedProfile === id) engines[key].selectedProfile = null;
+    await loadEngineProfiles(engines[key]);
   } catch(e) {
-    el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+// Weights deletion goes through the guarded inventory endpoint, so the in-use
+// and profile-cross-reference checks apply here too. The cross-reference will
+// always fire from this page — this profile references the model by definition.
+async function deleteProfileWeights(key, dirPath, name, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete the model weights for "' + name + '"' + size + '?\n\nPermanently removes:\n' + dirPath + '\n\nThe profile is kept and will fail to launch until the weights are re-downloaded.')) return;
+  try {
+    await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+    toast('Weights deleted: ' + name + size, 'ok');
+    await loadEngineProfiles(engines[key]);
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
   }
 }
 
@@ -7275,6 +7892,30 @@ async function stopEngine(eng) {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
+  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
+  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
+  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
+  // able to block the only GPU. Runs before any button state is touched, so declining leaves
+  // the UI exactly as it was.
+  let forceFromGate = false;
+  if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
+    try {
+      const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+      if (r && r.verdict === 'fail') {
+        const blocking = (r.checks || []).filter(c => c.level === 'fail')
+          .map(c => c.title + (c.detail ? ': ' + c.detail : '')).join('; ');
+        if (!confirm('Preflight found blocking problems:\n\n' + blocking +
+                     '\n\nRun Dry Run to see the details. Force start anyway?')) {
+          toast('Start blocked by preflight: ' + blocking, 'err');
+          return;
+        }
+        forceFromGate = true;
+      }
+    } catch (e) {
+      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+    }
+  }
   const btn  = document.getElementById(eng.ids.start);
   const prog = document.getElementById(eng.ids.prog);
   const log  = document.getElementById(eng.ids.log);
@@ -7297,8 +7938,9 @@ async function startEngine(eng) {
   const startWith = (force) =>
     apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
 
+
   try {
-    beginPoll(await startWith(false));
+    beginPoll(await startWith(forceFromGate));
   } catch(e) {
     if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
@@ -7413,10 +8055,12 @@ async function dryRunProfile(eng) {
   btn.disabled = true;
   btn.innerHTML = '<div class="spin-icon"></div> Checking…';
   out.textContent = '';
+  eng._preflightVerdict = null;
   try {
     const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
     renderPreflight(out, r);
     const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    eng._preflightVerdict = r.verdict;
     toast(t, r.verdict === 'fail' ? 'err' : 'ok');
   } catch (e) {
     toast('Dry run failed: ' + e.message, 'err');
@@ -7686,7 +8330,7 @@ function renderInventoryTable(models) {
     }
     const delBtn = m.source === 'ollama'
       ? ''
-      : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + '\')">&#10005;</button>';
+      : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + "'," + (m.size_gb || 0) + ')">&#10005;</button>';
     const canCreateVllm = m.source !== 'ollama' && !m.has_script
       && (m.format === 'safetensors' || m.format === 'pytorch')
       && (m.task_label === 'Text Gen' || m.task_label === 'Vision LLM');
@@ -7797,13 +8441,26 @@ async function createVLLMProfileFromInventory(dirPath, modelName) {
   }
 }
 
-async function deleteInventoryModel(dirPath, modelName) {
-  if (!confirm('Delete "' + modelName + '" from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
+async function deleteInventoryModel(dirPath, modelName, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete "' + modelName + '"' + size + ' from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
   try {
     await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath});
-    toast('Deleted: ' + modelName, 'ok');
+    toast('Deleted: ' + modelName + size, 'ok');
     await loadUnifiedInventory();
   } catch(e) {
+    // A profile cross-reference is overridable; an in-use container is not.
+    if (/profile script references/.test(e.message)) {
+      if (!confirm(modelName + ' is referenced by a profile script.\n\nDeleting the weights will make that profile fail at next launch.\n\nDelete anyway?')) return;
+      try {
+        await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+        toast('Deleted: ' + modelName + size, 'ok');
+        await loadUnifiedInventory();
+      } catch(e2) {
+        toast('Delete failed: ' + e2.message, 'err');
+      }
+      return;
+    }
     toast('Delete failed: ' + e.message, 'err');
   }
 }

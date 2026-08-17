@@ -37,6 +37,14 @@
 #     path on sm_121 (native TRTLLM/CUTLASS gate on capability-family 100; sm_121
 #     is 120). atomic-add avoids a Marlin split-K race on SM121. Kept to match the
 #     known-good eugr/muninn config.
+#     BENCHMARKED 2026-07-22 on 0.23.1: dropping the flag lets vLLM auto-select, and
+#     mxfp4.py:514 auto-resolves to MARLIN anyway — identical decode (34.8 vs 34.7
+#     tok/s) and both correctness gates pass. No faster native sm_121 kernel exists
+#     to unlock. Flag kept as a defensive PIN against a future image whose auto path
+#     picks a broken native kernel (the exact #37030 failure class we hit before).
+#   - VLLM_USE_FLASHINFER_MOE_FP4 removed: 0.23.1 no longer recognizes it (logs
+#     "Unknown vLLM environment variable"). The flashinfer FP4 MoE path is gated off
+#     for sm_121 regardless, so the env was a dead no-op.
 #   - --max-model-len 65536: full-precision KV, ~324K token KV capacity, no OOM.
 #   - No --kv-cache-dtype fp8 (not needed; memory is fine on the 128 GB pool).
 #
@@ -55,7 +63,6 @@ exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:800
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
   -e TIKTOKEN_ENCODINGS_BASE=/root/.cache/huggingface/harmony-encodings \
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
-  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
   -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
   eugr/spark-vllm:latest \
   vllm serve \
