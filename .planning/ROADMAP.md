@@ -21,7 +21,7 @@ printed, and so synthesis runs on this box rather than an external service.
 - [x] **Phase 1: Unbreak the load path** - Fix the three confirmed outages and the injection hole
 - [x] **Phase 1.1: Launch feedback** - INSERTED - Repair the Qwen3.6 profile; preflight + live load progress
 - [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
-- [ ] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
+- [x] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
 - [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label
 - [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
@@ -118,8 +118,30 @@ guessed from substrings.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 03-01: Recipe table, precedence resolution, and merge into the generator
-- [ ] 03-02: Explicit tool-parser/capability map replacing substring guessing
+- [x] 03-01: Recipe table, precedence resolution, and merge into the generator
+- [x] 03-02: Explicit tool-parser/capability map replacing substring guessing
+
+**Executed without PLAN.md files** — planning paused before `gsd-planner` (2b6723d) and the
+work was implemented directly against 03-CONTEXT.md and 03-RESEARCH.md, then committed as
+716ca98. The plan bullets above record what was built, not a plan that was followed.
+
+**Verified** 2026-08-17 — criteria checked against the implementation, not a VERIFICATION.md
+run: 5/5 PASS. Suite 331 passing.
+  1. `vllm.recipes` resolves via `_resolve_recipe_model`; `recipe_dir` follows the `alerts`
+     config→env→default idiom. The env layer was the one real gap found at close-out and was
+     added in `_live_vllm_cfg` — applied where the live block is read, so the generator stays
+     a pure function of its `vllm_cfg` and cannot disagree with `_recipe_dirs`/`_recipe_util`.
+  2. Qwen3.6 matches `Qwen/Qwen3.6-*` → `qwen3.6-35b-a3b-fp8-solo`, whose recipe carries
+     0.55 / 262144; `qwen3_xml` + `qwen3` come from the capability map (was `qwen3_coder`).
+  3. `_resolve_launch` short-circuits gpt-oss to its own template: 65536, no `--kv-cache-dtype`.
+  4. `model_capabilities.json` gates emission on confidence (`recipe-proven` /
+     `template-identical-to-recipe-proven`). Ambiguous architectures — `Qwen2ForCausalLM`,
+     `Qwen3NextForCausalLM`, `NemotronHForCausalLM` — are deliberately not match keys, so an
+     unknown model of that family gets no tool flags rather than a first-row guess.
+  5. `_kv_dtype_from_config` returns fp8 only on a model-owned 8-bit floating KV declaration.
+
+Carried forward by design: `warnings` is threaded through `_resolve_launch` but still
+unconsumed (Phase 4 surfaces it).
 
 ### Phase 4: Parameterized scripts + UI settings
 **Goal**: Launch settings are adjustable per-launch from the UI without rewriting or
