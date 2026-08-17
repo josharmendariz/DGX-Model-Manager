@@ -1,107 +1,46 @@
 {
   "version": "1.0",
-  "timestamp": "2026-08-04T04:40:00.000Z",
-  "phase": "1.1",
-  "phase_name": "Launch feedback (INSERTED)",
-  "phase_dir": ".planning/phases/01.1-launch-feedback",
+  "timestamp": "2026-08-17T05:30:00.000Z",
+  "phase": "3",
+  "phase_name": "Curated recipe overrides",
+  "phase_dir": ".planning/phases/03-curated-recipe-overrides",
   "plan": 0,
   "task": 0,
   "total_tasks": 0,
-  "status": "implemented_uncommitted",
+  "status": "phase_complete",
+  "next_action": "/gsd-plan-phase 4 — MUST be run from a session rooted at /home/josh/DGX-Model-Manager",
   "completed_tasks": [
-    {"id": 1, "name": "Phase 1 plan 01-01 — fix HF download worker + terminal-event guarantee", "status": "done", "commit": "ebee651"},
+    {"id": 1, "name": "Phase 1 plan 01-01 — fix HF download worker (_HF_XFER); one terminal event per stream", "status": "done", "commit": "ebee651"},
     {"id": 2, "name": "Phase 1 plan 01-02 — serve subcommand as image property; regenerate DeepSeek profiles", "status": "done", "commit": "ebee651"},
     {"id": 3, "name": "Phase 1 plan 01-03 — shell-quote dynamic atoms; verify_auth fails closed", "status": "done", "commit": "ebee651"},
-    {"id": 4, "name": "Phase 1.1 — repair the Qwen3.6 profile as recipe-backed; drop --restart from generated scripts", "status": "done", "commit": null},
-    {"id": 5, "name": "Phase 1.1 — launch preflight (static lint + runtime checks + smoke test) and /api/vllm/reclaim-cache", "status": "done", "commit": null},
-    {"id": 6, "name": "Phase 1.1 — SSE load-progress stream with one terminal event; UI determinate bar replacing the 20s poll", "status": "done", "commit": null}
+    {"id": 4, "name": "Phase 1.1 — repair Qwen3.6 profile as recipe-backed; drop --restart from generated scripts", "status": "done", "commit": null},
+    {"id": 5, "name": "Phase 1.1 — launch preflight and /api/vllm/reclaim-cache", "status": "done", "commit": null},
+    {"id": 6, "name": "Phase 1.1 — SSE load-progress stream; UI determinate bar", "status": "done", "commit": null},
+    {"id": 7, "name": "Phase 2 — _derive_launch_spec hybrid-aware KV/context/util solver", "status": "done", "commit": "eed74ed", "note": "Verified 6/6 on 2026-08-05"},
+    {"id": 8, "name": "Phase 3 — curated recipe overrides + tool-parser capability map", "status": "done", "commit": "716ca98", "note": "Closed out 5/5 on 2026-08-17 (b4ca157). Executed WITHOUT PLAN.md files: planning paused before gsd-planner at 2b6723d and the work was implemented directly against 03-CONTEXT.md / 03-RESEARCH.md. Suite 331 passing."}
   ],
   "remaining_tasks": [
-    {"id": 7, "name": "Phase 2: plan and implement _derive_launch_spec (hybrid-aware KV/context/util solver)", "status": "not_started"},
-    {"id": 8, "name": "Phase 3: curated recipe overrides + tool-parser capability map; generalize the recipe-backed profile type", "status": "not_started"},
-    {"id": 9, "name": "Phase 4: parameterized scripts + UI context/utilization controls", "status": "not_started"},
-    {"id": 10, "name": "Phase 5: admission truth (executor budget, docker-label reclaim, launch lock) — also fixes preflight's negative-headroom verdict", "status": "not_started"}
+    {"id": 9, "name": "Phase 4: parameterized scripts + UI context/utilization controls", "status": "not_started", "note": "Also the consumer for the `warnings` list that _resolve_launch threads but nothing reads yet — carried forward from Phases 2 and 3."},
+    {"id": 10, "name": "Phase 5: admission truth (executor budget, docker-label reclaim, launch lock)", "status": "not_started"},
+    {"id": 11, "name": "Phase 6: verifiable research capture — findings must cite a quote that exists; local synthesis engine; rules stay human-owned", "status": "not_started", "note": "Added to ROADMAP 2026-08-17 (96c2103). Independent of Phases 4-5; touches research_refresh.py and the KB, not the launch path. No RESEARCH.md yet."}
   ],
   "blockers": [],
-  "resolved_blockers": [
-    {
-      "description": "vLLM was intentionally DOWN for Helix training, so Phase 1 was never validated by a live load.",
-      "resolution": "Resolved 2026-08-04. vLLM is up and Phase 1's entrypoint fix is now proven end to end by a real 178s cold start of Qwen3.6-35B-A3B-FP8. Do not carry this blocker forward."
-    }
-  ],
   "human_actions_pending": [
     {
-      "action": "Commit Phase 1.1 (app.py is now Phase 1.1 work only)",
-      "context": "RESOLVED 2026-08-04: Josh did not recognize the Site Scanner and directed it be discarded. The block was fully self-contained (app.py lines 1298-1611, 314 lines, zero external references, no route wired, no tests) and was deleted; a copy is at /tmp/site-scanner-discarded-2026-08-04.py and a pre-removal app.py at /tmp/app.py.before-scanner-removal. Diff went 1262 -> 948 insertions, matching the ~940-line Phase 1.1 estimate. Suite still 130 passing; service restarted and verified 200 on the tailnet bind. app.py is now safe to commit by path.",
+      "action": "Decide the fate of profiles/vLLM/start_hf_unsloth_qwen3.8-27b.sh",
+      "context": "Untracked as of 2026-08-17. Left uncommitted during Phase 3 close-out because it is not clear whether it is a deliberate profile or leftover generator output. Everything else in the working tree was committed.",
       "blocking": false
     },
     {
       "action": "Decide whether to set app.api_key in config.json",
-      "context": "verify_auth fails closed on a non-loopback bind, but the installed unit sets MODEL_MANAGER_ALLOW_UNAUTH=1, so the service runs in acknowledged-open mode. /api/vllm/reclaim-cache shells out through sudo -n, which raises the stakes slightly — though it grants no privilege the profile scripts did not already have.",
-      "blocking": false
-    },
-    {
-      "action": "Reconcile VLLM_USE_FLASHINFER_MOE_FP4 between the generator and the gpt-oss profile",
-      "context": "_build_vllm_profile_script still emits -e VLLM_USE_FLASHINFER_MOE_FP4=0 for gpt-oss and FP4 models. A peer's uncommitted edit to start_hf_openai_gpt-oss-120b.sh removed it, noting vLLM 0.23.1 logs 'Unknown vLLM environment variable'. They now disagree.",
+      "context": "verify_auth fails closed on a non-loopback bind, but the installed unit sets MODEL_MANAGER_ALLOW_UNAUTH=1, so the service runs in acknowledged-open mode. /api/vllm/reclaim-cache shells out through sudo -n.",
       "blocking": false
     }
   ],
-  "decisions": [
-    {
-      "decision": "Bootstrapped .planning/ by hand instead of running /gsd-new-project",
-      "rationale": "The repo had no .planning. /gsd-new-project spawns four research agents to derive context that an 18-minute Codex xhigh audit plus live verification had just established.",
-      "phase": "1"
-    },
-    {
-      "decision": "Keep nvidia_entrypoint.sh and pass `vllm serve` as the container command, rather than `docker run --entrypoint vllm`",
-      "rationale": "Bypassing the entrypoint discards the image's CUDA environment setup. Now confirmed correct by a live load rather than by inspection alone.",
-      "phase": "1"
-    },
-    {
-      "decision": "verify_auth fails closed at the request layer (503), not at startup",
-      "rationale": "The installed unit already carries MODEL_MANAGER_ALLOW_UNAUTH=1, so the live service keeps running while an unconfigured deployment refuses mutations.",
-      "phase": "1"
-    },
-    {
-      "decision": "Grammar validation AND shlex.quote, not either alone",
-      "rationale": "Grammar makes the injection unreachable; quoting is defence-in-depth. The $HOME cache mount is deliberately exempt because it relies on launch-time shell expansion.",
-      "phase": "1"
-    },
-    {
-      "decision": "Generated profiles emit no --restart policy at all",
-      "rationale": "Josh's call, 2026-08-04. A restart policy on a container whose launch may be wrong converts a bad script into a persistent outage: the broken Qwen3.6 container crash-looped through a reboot holding the name vllm_node, so run-recipe.sh reported 'already running', skipped its launch, and vllm-default-model.service failed. DMM is a manual switcher; the boot unit owns recovery.",
-      "phase": "1.1"
-    },
-    {
-      "decision": "The Qwen3.6 profile delegates to run-recipe.sh instead of replicating its flags",
-      "rationale": "Josh's call, 2026-08-04. The recipe applies mods/fix-qwen3.6-chat-template inside the container and passes flags the generator does not emit (--load-format fastsafetensors, --attention-backend flashinfer, --reasoning-parser qwen3, --enable-prefix-caching). Inlining them would fork the source of truth and silently drift. Generalize into a recipe-backed profile type in Phase 3.",
-      "phase": "1.1"
-    },
-    {
-      "decision": "Preflight is static-first, with a container smoke test, and every uncertain check degrades to `skip` rather than `fail`",
-      "rationale": "Josh's call, 2026-08-04. Every real launch failure so far was knowable before committing ~100 GB and 3 minutes of weight load. But a preflight that reports false failures — an unresolvable $(...) path, a GPU-less probe that cannot build vLLM's DeviceConfig — trains the reader to ignore it, which is worse than having none.",
-      "phase": "1.1"
-    },
-    {
-      "decision": "Load progress is streamed from `docker logs -f`, not from the /tmp launch log",
-      "rationale": "The /tmp log only captures the first foreground attempt: it is near-empty for detached and recipe-backed launches and is wiped by a reboot. That is precisely why the original symptom looked like 'nothing happened'. docker logs is the one source that works for every profile shape and survives a manager restart.",
-      "phase": "1.1"
-    },
-    {
-      "decision": "Derived settings must be hybrid-attention-aware before anything else in Phase 2",
-      "rationale": "Measured on this box: a naive num_hidden_layers KV estimate overestimates by 4-11x on every hybrid model here.",
-      "phase": "2"
-    }
-  ],
-  "uncommitted_files": [
-    {"path": "app.py", "owner": "mixed", "note": "~940 lines Phase 1.1; ~320 lines are a peer session's unwired Site Scanner. Do not commit without asking Josh."},
-    {"path": "profiles/vLLM/start_hf_qwen_qwen3.6-35b-a3b-fp8.sh", "owner": "phase-1.1", "note": "Rewritten as a recipe-backed wrapper."},
-    {"path": "tests/test_launch_preflight.py", "owner": "phase-1.1", "note": "Untracked. 26 tests; suite total 130."},
-    {"path": "profiles/vLLM/start_hf_openai_gpt-oss-120b.sh", "owner": "peer", "note": "Benchmark notes + VLLM_USE_FLASHINFER_MOE_FP4 removal. Predates this session."},
-    {"path": "profiles/vLLM/start_hf_qwen_qwen3-8b.sh", "owner": "pre-existing", "note": "Untracked before this session."},
-    {"path": "profiles/vLLM/start_hf_qwen_qwen3-14b.sh", "owner": "pre-existing", "note": "Untracked before this session."},
-    {"path": ".planning/phases/02-derived-launch-spec/", "owner": "pre-existing", "note": "Phase 2 research artifacts, untracked before this session."}
-  ],
-  "next_action": "Run /gsd-plan-phase 2 to plan the derived launch spec. The solver's shape is already validated by the prototype at .planning/phases/02-derived-launch-spec/kvcalc-prototype.py, which produced 0.54 for qwen3-next-80b against a hand-measured 0.55 — reproduce that as the calibration test. Phase 1.1 now gives Phase 2 a live vLLM to validate against.",
-  "context_notes": "Phase 1.1 was reactive and unplanned: Josh reported that loading Qwen3.6 from the UI did nothing. Three independent defects were found — a stale profile missing `vllm serve`, a --restart policy that turned that failure into an hour-long outage across a reboot, and page cache being charged against --gpu-memory-utilization. The third is the durable one and is now its own memory (gb10-page-cache-eats-vllm-budget): CUDA reports MemFree rather than MemAvailable, so cached pages are billed against the launch budget. At an unchanged, previously hand-measured util of 0.55, Qwen3.6 got 0.19 GiB of KV cache with ~25 GB cached and 25.97 GiB after drop_caches. This also means MemAvailable-based admission (_vram_admission_check) can pass while the launch still dies in engine init. Phase 2's utilization solver must account for what is already resident, not only what the model needs."
+  "environment_notes": [
+    "GSD tooling resolves the project from cwd and emits RELATIVE paths (.planning/ROADMAP.md). Run GSD skills only from a session rooted at /home/josh/DGX-Model-Manager. A session rooted elsewhere — notably /home/josh/bus-fever, which is also mid-phase-03 with its own ROADMAP and STATE — will silently plan the wrong project rather than error.",
+    "Editing app.py does NOT restart the running service: systemctl --user restart dgx-model-manager.service is required to deploy.",
+    "~3 concurrent claude sessions run in this repo. Commit by explicit path; never git add -A.",
+    "Research state was deliberately reset on 2026-08-17: recommendations.proposed.json and the .research_* scratch files were deleted (gitignored, so no commit). recommendations.json (12 curated entries) was left intact. Phase 6 redesigns the capture pipeline before it is run again."
+  ]
 }
