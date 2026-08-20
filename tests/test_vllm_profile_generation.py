@@ -400,3 +400,133 @@ def test_generator_emits_detached_docker_run(tmp_path):
 
     assert "docker run -d --name vllm_node" in script
     assert "exec docker run" not in script
+
+
+# ─── 04-02: machine-readable header comments ──────────────────────────────────
+
+_META_KEYS = ("# Derived:", "# Recommended:", "# Warnings:", "# Generated:")
+
+
+def _header_values(script: str) -> dict:
+    """Return {header-prefix: raw text after the colon} for the four meta headers."""
+    out = {}
+    for line in script.splitlines():
+        for key in _META_KEYS:
+            if line.startswith(key):
+                out[key] = line[len(key):].strip()
+    return out
+
+
+def _real_config(model_dir, **extra):
+    import json as _json
+    config = {
+        "model_type": "qwen3", "torch_dtype": "bfloat16",
+        "max_position_embeddings": 40960, "num_hidden_layers": 36,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "hidden_size": 4096,
+    }
+    config.update(extra)
+    (model_dir / "config.json").write_text(_json.dumps(config))
+    return config
+
+
+def test_meta_headers_are_valid_json(tmp_path):
+    """Option A makes the header a data format; every value must round-trip."""
+    import json as _json
+
+    model_dir = _plain_model(tmp_path, "meta-json")
+    _real_config(model_dir)
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/MetaJson-7B")
+
+    values = _header_values(script)
+    for key in ("# Derived:", "# Recommended:", "# Warnings:"):
+        assert key in values, f"{key} missing from script"
+        _json.loads(values[key])  # raises if the contract is broken
+    assert values["# Generated:"].endswith("Z")
+
+
+def test_meta_headers_land_within_the_first_20_lines(tmp_path):
+    """`_parse_script_meta` only scans 20 lines — a header past that is invisible."""
+    model_dir = _plain_model(tmp_path, "meta-window")
+    _real_config(model_dir)
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/MetaWindow-7B")
+
+    head = script.splitlines()[:20]
+    for key in _META_KEYS:
+        assert any(line.startswith(key) for line in head), f"{key} outside first 20 lines"
+
+
+def test_derived_max_model_len_equals_the_emitted_placeholder(tmp_path):
+    """One source of truth, two renderings: header and argv cannot disagree."""
+    import json as _json
+    import re as _re
+
+    model_dir = _plain_model(tmp_path, "meta-agree")
+    _real_config(model_dir)
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/MetaAgree-7B")
+
+    derived = _json.loads(_header_values(script)["# Derived:"])
+    emitted = _re.search(r"\$\{VLLM_MAX_MODEL_LEN:-(\d+)\}", script)
+    assert emitted, script
+    assert derived["max_model_len"] == int(emitted.group(1))
+    assert derived["v"] == appmod._SCRIPT_META_VERSION
+
+    util = _re.search(r"\$\{VLLM_GPU_MEMORY_UTILIZATION:-([0-9.]+)\}", script)
+    assert util and float(util.group(1)) == derived["util"]
+    seqs = _re.search(r"\$\{VLLM_MAX_NUM_SEQS:-(\d+)\}", script)
+    assert seqs and int(seqs.group(1)) == derived["max_num_seqs"]
+
+
+def test_warnings_round_trip_without_a_literal_newline(tmp_path):
+    """Warning strings embed {value!r} of vendor config fields; a raw newline in one
+    would split the header line and silently truncate the contract."""
+    import json as _json
+
+    model_dir = _plain_model(tmp_path, "meta-warn")
+    _real_config(model_dir, layer_types=["full_attention"] * 35 + ["we\nird_type"])
+    _, script, info = appmod._build_vllm_profile_script(model_dir, "Acme/MetaWarn-7B")
+
+    raw = _header_values(script)["# Warnings:"]
+    assert "\n" not in raw
+    warnings = _json.loads(raw)
+    assert warnings, "fixture was expected to produce at least one warning"
+    assert any("unknown layer type" in w for w in warnings)
+    assert len(warnings) == len(info["warnings"])
+
+
+def test_recipe_backed_header_declares_itself_non_editable(tmp_path):
+    import json as _json
+
+    model_dir = _plain_model(tmp_path, "meta-recipe")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
+
+    derived = _json.loads(_header_values(script)["# Derived:"])
+    assert derived["editable"] is False
+    assert derived["reason"]
+
+
+def test_recommended_header_carries_the_spec_values(tmp_path):
+    import json as _json
+
+    model_dir = _plain_model(tmp_path, "meta-rec")
+    config = _real_config(model_dir)
+    _, script, info = appmod._build_vllm_profile_script(model_dir, "Acme/MetaRec-7B")
+
+    kv_dtype = appmod._kv_dtype_from_config(config)
+    spec = appmod._derive_launch_spec(
+        config, weights_gb=info.get("size_gb", 0.0), pool_gb=121.0,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2)
+
+    rec = _json.loads(_header_values(script)["# Recommended:"])
+    assert rec["gpu_memory_utilization"] == spec["recommended_util"]
+    assert rec["max_model_len"] == spec["max_model_len"]
+
+    derived = _json.loads(_header_values(script)["# Derived:"])
+    assert derived["declared_max_context"] == spec["declared_max_context"]
+    assert derived["max_fitting_context"] == spec["max_fitting_context"]
+
+
+def test_headers_do_not_break_bash_syntax(tmp_path):
+    model_dir = _plain_model(tmp_path, "meta-bash")
+    _real_config(model_dir, layer_types=["full_attention"] * 35 + ["od'd\"type"])
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/MetaBash-7B")
+    assert _bash_syntax_ok(tmp_path, script)
