@@ -1014,3 +1014,17 @@ def test_spec_table_covers_both_hybrid_and_dense_families():
     """Guard the table's own coverage: a snapshot of only dense models would prove nothing."""
     assert len(HYBRID_ROWS) >= 6
     assert len(MODEL_ROWS) - len(HYBRID_ROWS) >= 6
+
+
+# ── 04-02: explicit fixture-bounds gate ───────────────────────────────────────
+
+@pytest.mark.parametrize("row", MODEL_ROWS, ids=MODEL_IDS)
+def test_fixture_bounds_hold_for_every_committed_model(row):
+    """The card renders these numbers, so the bounds are now a UI contract too.
+
+    Ground truth is the committed tests/fixtures/model-fixtures.json snapshot; no test
+    may glob a model-cache directory (tests/conftest.py fixture rule).
+    """
+    spec = _spec_for(row)
+    assert 0.10 <= spec["recommended_util"] <= 0.95, row["name"]
+    assert spec["max_model_len"] <= spec["declared_max_context"], row["name"]

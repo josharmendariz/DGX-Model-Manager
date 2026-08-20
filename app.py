@@ -443,6 +443,21 @@ def _parse_script_meta(script_path: Path) -> dict:
     """
     name = description = None
     vram_gb = None
+    derived = recommended = generated_at = None
+    warnings: list = []
+    meta_error = None
+
+    def _json_header(prefix: str, raw: str):
+        """Parse one JSON header. An unparseable header is a DEFECT, not a fallback
+        (04-CONTEXT.md locked decision) — it must be visible, never swallowed."""
+        nonlocal meta_error
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            if meta_error is None:
+                meta_error = f"{prefix} header is not valid JSON: {exc}"
+            return None
+
     try:
         for line in script_path.read_text().splitlines()[:20]:
             line = line.strip()
@@ -455,6 +470,22 @@ def _parse_script_meta(script_path: Path) -> dict:
                     vram_gb = int(line[7:].strip().upper().rstrip("GB").strip())
                 except Exception:
                     pass
+            elif line.startswith("# Derived:"):
+                parsed = _json_header("# Derived:", line[10:].strip())
+                derived = parsed if isinstance(parsed, dict) else derived
+                if parsed is not None and not isinstance(parsed, dict) and meta_error is None:
+                    meta_error = "# Derived: header is not a JSON object"
+            elif line.startswith("# Recommended:"):
+                parsed = _json_header("# Recommended:", line[14:].strip())
+                recommended = parsed if isinstance(parsed, dict) else recommended
+            elif line.startswith("# Warnings:"):
+                parsed = _json_header("# Warnings:", line[11:].strip())
+                if isinstance(parsed, list):
+                    warnings = [str(w) for w in parsed]
+                elif parsed is not None and meta_error is None:
+                    meta_error = "# Warnings: header is not a JSON array"
+            elif line.startswith("# Generated:"):
+                generated_at = line[12:].strip() or None
     except Exception:
         pass
 
@@ -470,6 +501,14 @@ def _parse_script_meta(script_path: Path) -> dict:
         "script":      str(script_path),
         "description": description or f"Script: {script_path.name}",
         "vram_gb":     vram_gb,
+        # 04-02 (Option A): everything the profile card needs comes from the script
+        # text itself. Deliberately NO filesystem or config.json read here — this
+        # function sits on `_scan_profiles`, the hot list path (threat T-04-08).
+        "derived":       derived,
+        "recommended":   recommended,
+        "warnings":      warnings,
+        "generated_at":  generated_at,
+        "meta_error":    meta_error,
     }
 
 
