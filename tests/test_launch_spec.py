@@ -5,8 +5,7 @@ check here is a pure-function check: a parsed `config.json` dict goes in, a dict
 Nothing in this module starts a container, touches a GPU, opens a socket, or reads a model
 config off the filesystem.
 
-Ground truth is the committed snapshot `.planning/phases/02-derived-launch-spec/
-02-MODEL-FIXTURES.json` (17 models, generated and verified 2026-08-03), loaded via the
+Ground truth is the committed snapshot `tests/fixtures/model-fixtures.json` (17 models, generated and verified 2026-08-03), loaded via the
 `model_fixtures` / `fixture_models` conftest fixtures. Tests must never scan the model cache
 directories: a live read would make the suite depend on which models happen to be on the box,
 and would break the moment one is added or deleted.
