@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: phase_complete
-last_updated: "2026-08-20T04:40:00.000Z"
-last_activity: 2026-08-20 -- off-roadmap engine work committed (7 commits); next action is /gsd-pr-branch
+status: planned
+last_updated: "2026-08-20T05:00:00.000Z"
+last_activity: 2026-08-20 -- PR #4 opened from rec-approve-actions-pr; Phase 04 planned (3 plans, checker PASS)
 progress:
   total_phases: 7
   completed_phases: 4
@@ -20,15 +20,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-02)
 
 **Core value:** Switching the active vLLM model must be safe and correct.
-**Current focus:** cut the PR branch (/gsd-pr-branch), then Phase 04 — parameterized scripts + UI settings
+**Current focus:** Phase 04 — parameterized scripts + UI settings (planned; next: /gsd-execute-phase 4)
 
 ## Current Position
 
-Phase: 03 (curated-recipe-overrides) — COMPLETE, 5/5 criteria
-Plan: executed without PLAN.md files; committed as 716ca98
-Status: Phase 03 closed out. Seven off-roadmap commits landed 2026-08-20 (llama.cpp
-engine, containerization, cgroup detach, Qwen3.6 util reclaim, litellm guards).
-Next: `/gsd-pr-branch`, then `/gsd-plan-phase 4`.
+Phase: 04 (parameterized-scripts-ui-settings) — PLANNED, 3 plans, waves 1-3 (serial;
+all three modify app.py). Plan-checker PASS on the second pass.
+Status: PR #4 open from `rec-approve-actions-pr` (34 commits, .planning/ filtered, 337
+tests green). Phase 03 closed 5/5. Research falsified the assumption that the
+systemd-run --scope change broke Phase 4's criterion 2 — `--user --scope` inherits
+Popen(env=), verified on the box; one transport, criterion unchanged.
+Next: `/gsd-execute-phase 4`.
 Last activity: 2026-08-20 -- off-roadmap engine work committed; next action is /gsd-pr-branch
 
 See .planning/HANDOFF.json for the full situation: live engine/litellm state, the PR
