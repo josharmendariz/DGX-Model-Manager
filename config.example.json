@@ -23,9 +23,10 @@
   },
   "llamacpp": {
     "_comment": "Optional — the GGUF quant ladder. One profile script covers a whole repo's quants, so the quant/ctx/spec choice is data the UI enumerates and passes as RECIPE, not a script per combination. vram_gb is what admission checks, so keep it honest.",
-    "_comment_spec": "spec: embedded = the NextN/MTP head baked into the target GGUF, works on a stock build. fastmtp = a separate sidecar GGUF, which needs fastmtp_binary — a patched build in its own worktree, never a rewind of the main checkout other profiles depend on.",
-    "binary":         "~/llama.cpp/build-cuda/bin/llama-server",
-    "fastmtp_binary": "~/llama.cpp-fastmtp/build/bin/llama-server",
+    "_comment_spec": "spec: embedded = the NextN/MTP head baked into the target GGUF, works on a stock build. fastmtp = a separate sidecar GGUF, which needs fastmtp_image — an image built from the release patch. Verified 2026-08-20: the stock upstream image rejects the sidecar (expected 5120, 248320, got 5120, 32768), so the patched build is genuinely required.",
+    "image":          "ghcr.io/ggml-org/llama.cpp:server-cuda",
+    "fastmtp_image":  "127.0.0.1:5000/llama.cpp-fastmtp:latest",
+    "container_name": "llamacpp_node",
     "default_recipe": "balanced",
     "recipes": {
       "balanced": {"quant": "Q6_K_P", "ctx": 65536, "spec": "embedded", "vision": true,  "vram_gb": 31, "desc": "Default. Near-Q8 quality, holds up on tool-calling."},
