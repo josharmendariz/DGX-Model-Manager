@@ -4356,6 +4356,28 @@ docker rm -f vllm_node 2>/dev/null || true
 """
 
 
+# Defence in depth behind `_OVERRIDE_ENV`'s allow-list: the placeholders expand host-side
+# straight into docker argv, so a value that reached the environment by any other route
+# (a stray `export`, a hand-edited unit) must abort before `docker run`, not after.
+_VLLM_OVERRIDE_GUARD = r"""# Override guard — these expand into docker argv.
+for _dmm_var in VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS; do
+  _dmm_val="${!_dmm_var:-}"
+  if [[ -n "$_dmm_val" && ! "$_dmm_val" =~ ^[0-9]+$ ]]; then
+    echo "Invalid $_dmm_var: expected a positive integer, got '$_dmm_val'" >&2
+    exit 2
+  fi
+done
+if [[ -n "${VLLM_GPU_MEMORY_UTILIZATION:-}" \
+   && ! "${VLLM_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "Invalid VLLM_GPU_MEMORY_UTILIZATION: expected a decimal, got" \
+       "'${VLLM_GPU_MEMORY_UTILIZATION}'" >&2
+  exit 2
+fi
+unset _dmm_var _dmm_val
+
+"""
+
+
 def _recipe_profile_body(recipe_dir, recipe_name: str) -> str:
     recipe_path = Path(os.path.expanduser(os.fspath(recipe_dir)))
     return f"""RECIPE_DIR={shlex.quote(str(recipe_path))}
@@ -4437,18 +4459,25 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         f'  --served-model-name {shlex.quote(info["name"])} {shlex.quote(info["served"])} vllm-active \\',
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
-        f"  --gpu-memory-utilization {resolved['util'] if resolved.get('util') is not None else 0.75} \\",
+        # Placeholders are deliberately NOT shlex.quote'd: the comment above concerns
+        # dynamic atoms, and these must stay bash-expandable. The derived value is the
+        # default, so an unset environment reproduces today's script exactly.
+        f"  --gpu-memory-utilization ${{VLLM_GPU_MEMORY_UTILIZATION:-"
+        f"{resolved['util'] if resolved.get('util') is not None else 0.75}}} \\",
     ]
     if is_gpt_oss:
         # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
         # sampling-tail noise on the harmony path); 65536 = ~324K token KV capacity.
         arg_lines += [
-            "  --max-model-len 65536 --max-num-seqs 2 \\",
+            "  --max-model-len ${VLLM_MAX_MODEL_LEN:-65536} \\",
+            "  --max-num-seqs ${VLLM_MAX_NUM_SEQS:-2} \\",
             "  --enable-chunked-prefill \\",
         ]
     else:
         arg_lines += [
-            f"  --max-model-len {resolved['max_model_len'] if resolved.get('max_model_len') is not None else 32768} --max-num-seqs 2 \\",
+            f"  --max-model-len ${{VLLM_MAX_MODEL_LEN:-"
+            f"{resolved['max_model_len'] if resolved.get('max_model_len') is not None else 32768}}} \\",
+            "  --max-num-seqs ${VLLM_MAX_NUM_SEQS:-2} \\",
         ]
         if resolved.get("kv_dtype") == "fp8":
             arg_lines.append("  --kv-cache-dtype fp8 --enable-chunked-prefill \\")
@@ -4489,7 +4518,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         arg_lines.insert(0, f"  {_serve_cmd} \\")
     image = shlex.quote(str(image))
 
-    script = preamble + f"""exec docker run --name vllm_node --gpus all -p 8000:8000 \\
+    script = preamble + _VLLM_OVERRIDE_GUARD + f"""docker run -d --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
   {image} \\

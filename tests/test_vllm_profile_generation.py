@@ -322,3 +322,81 @@ def test_recipe_dir_env_override_reaches_the_generator(monkeypatch):
     monkeypatch.setattr(appmod, "_app_config", {"vllm": {}}, raising=False)
     monkeypatch.setenv("MODEL_MANAGER_VLLM_RECIPE_DIR", "/from/env")
     assert appmod._live_vllm_cfg().get("recipe_dir") == "/from/env"
+
+
+# ── Phase 04-01: env-override placeholders ────────────────────────────────────
+
+def test_generated_script_carries_the_three_placeholders(tmp_path):
+    """Criterion 1: a launch is tunable without rewriting the script on disk."""
+    model_dir = _plain_model(tmp_path, "placeholders")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/Placeholder-7B")
+
+    assert "${VLLM_MAX_MODEL_LEN:-" in script
+    assert "${VLLM_GPU_MEMORY_UTILIZATION:-" in script
+    assert "${VLLM_MAX_NUM_SEQS:-2}" in script
+
+
+def test_placeholder_default_is_the_derived_value_not_a_constant(tmp_path):
+    """The default must track `_derive_launch_spec`, or the script silently
+    downgrades a model the moment the derivation improves."""
+    import json as _json
+    import re as _re
+
+    model_dir = _plain_model(tmp_path, "derived")
+    # A real-shaped config: the minimal fixture derives nothing, so it would prove
+    # only that the fallback constant is the fallback constant.
+    config = {
+        "model_type": "qwen3", "torch_dtype": "bfloat16",
+        "max_position_embeddings": 40960, "num_hidden_layers": 36,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "hidden_size": 4096,
+    }
+    (model_dir / "config.json").write_text(_json.dumps(config))
+    _, script, info = appmod._build_vllm_profile_script(model_dir, "Acme/Derived-7B")
+
+    kv_dtype = appmod._kv_dtype_from_config(config)
+    spec = appmod._derive_launch_spec(
+        config, weights_gb=info.get("size_gb", 0.0), pool_gb=121.0,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2)
+    expected = spec["max_model_len"]
+
+    emitted = _re.search(r"\$\{VLLM_MAX_MODEL_LEN:-(\d+)\}", script)
+    assert emitted, script
+    assert int(emitted.group(1)) == int(expected)
+
+
+def test_gpt_oss_branch_keeps_65536_as_its_default(tmp_path, monkeypatch):
+    model_dir = _plain_model(tmp_path, "gptoss-ph")
+    monkeypatch.setitem(appmod._app_config, "vllm", {})
+
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "openai/gpt-oss-120b")
+
+    assert "--max-model-len ${VLLM_MAX_MODEL_LEN:-65536}" in script
+    assert "--max-num-seqs ${VLLM_MAX_NUM_SEQS:-2}" in script
+    assert _bash_syntax_ok(tmp_path, script)
+
+
+def test_parameterized_script_still_parses_as_bash(tmp_path):
+    """The guard block uses [[ ]] and ${!var} — bash -n is the cheap proof."""
+    model_dir = _plain_model(tmp_path, "syntax")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/Syntax-7B")
+    assert _bash_syntax_ok(tmp_path, script)
+
+
+def test_recipe_shape_is_left_unparameterized(tmp_path):
+    """`run-recipe.sh` lives in another repo; emitting placeholders it never reads
+    would advertise a knob that does nothing."""
+    model_dir = _plain_model(tmp_path, "recipe-shape")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
+
+    assert "run-recipe.sh" in script
+    assert "${VLLM_" not in script
+
+
+def test_generator_emits_detached_docker_run(tmp_path):
+    """079917b fixed the 12 on-disk profiles but not the generator, so any
+    regeneration silently reverted half the cgroup fix."""
+    model_dir = _plain_model(tmp_path, "detached")
+    _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/Detached-7B")
+
+    assert "docker run -d --name vllm_node" in script
+    assert "exec docker run" not in script
