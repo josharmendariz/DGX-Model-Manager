@@ -331,6 +331,10 @@ class PullRequest(BaseModel):
 class EngineStartRequest(BaseModel):
     profile: str
     force: bool = False
+    # llama.cpp only: names an entry in config.json llamacpp.recipes. One profile script
+    # covers the whole quant ladder, so the quant/ctx/spec choice is a request parameter
+    # rather than a script per combination.
+    recipe: Optional[str] = None
 
 class OllamaStopRequest(BaseModel):
     name: str
@@ -2921,19 +2925,54 @@ def _launch_argv(script: str, safe_id: str) -> list[str]:
     ]
 
 
+def _llamacpp_recipes() -> dict:
+    """The llama.cpp quant ladder from config.json, or {} if unconfigured.
+
+    Read live rather than cached at import: editing config.json is how the ladder is
+    tuned, and a restart-to-see-it loop is how stale recipes get launched by mistake.
+    """
+    try:
+        cfg = json.loads(_CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+    return cfg.get("llamacpp", {}).get("recipes", {}) or {}
+
+
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
-                        engine_key: str | None = None, force: bool = False) -> dict:
+                        engine_key: str | None = None, force: bool = False,
+                        recipe: str | None = None) -> dict:
     """Start a Docker engine by launching the selected profile script."""
     profiles = scan_fn()
     profile = next((p for p in profiles if p["id"] == req_profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req_profile}' not found")
+    # Resolve the recipe BEFORE admission: the script header declares one nominal
+    # footprint, but the ladder spans 17 GB (tiny) to 60 GB (longctx). Admitting on the
+    # header would wave through a launch three times its declared size.
+    known_recipes = _llamacpp_recipes() if recipe else {}
+    if recipe:
+        if recipe not in known_recipes:
+            raise HTTPException(400, f"Unknown recipe '{recipe}'; "
+                                     f"have: {', '.join(known_recipes) or 'none'}")
+        r_vram = known_recipes[recipe].get("vram_gb")
+        if r_vram is not None:
+            profile = {**profile, "vram_gb": r_vram}
+
     await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
     script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
         raise HTTPException(400, f"Script not found: {script}")
     safe_id = _re.sub(r"[^a-zA-Z0-9._-]", "_", req_profile)
     log_path = f"/tmp/{engine_name.lower()}_{safe_id}.log"
+
+    # Recipe reaches the script as an env var. Already allow-listed against the configured
+    # map above — it arrives in an HTTP body and lands in a bash script's environment, so
+    # a known-names check is the only acceptable filter.
+    env = os.environ.copy()
+    if recipe:
+        env["RECIPE"] = recipe
+        _logger.info("%s recipe '%s' -> %s", engine_name, recipe, known_recipes[recipe])
+
     _logger.info("%s starting profile '%s' — script: %s", engine_name, profile["name"], script)
     try:
         _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -2945,9 +2984,11 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
             _launch_argv(script, safe_id),
             stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
     _logger.info("%s launched — logs at %s", engine_name, log_path)
-    return {"ok": True, "message": f"Launched {profile['name']} — logs at {log_path}"}
+    label = f"{profile['name']} [{recipe}]" if recipe else profile["name"]
+    return {"ok": True, "message": f"Launched {label} — logs at {log_path}"}
 
 
 # ── Unified-memory visibility ─────────────────────────────────────────────────
@@ -3801,9 +3842,26 @@ for _ek, _ev in _ENGINES.items():
                   dependencies=[Depends(verify_auth)])
         async def start(req: EngineStartRequest, k=key):
             return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k,
-                                       engine_key=k, force=req.force)
+                                       engine_key=k, force=req.force,
+                                       recipe=req.recipe if k == "llamacpp" else None)
 
     _make_engine_routes(_ek, _ev)
+
+
+@app.get("/api/llamacpp/recipes")
+async def llamacpp_recipes():
+    """The quant ladder the llama.cpp profile scripts read.
+
+    llama.cpp differs from vLLM here: one GGUF repo ships ten quants of the same weights,
+    so a script-per-quant would be ten near-identical files that drift. The ladder is data.
+    """
+    try:
+        cfg = json.loads(_CONFIG_FILE.read_text())
+    except Exception as e:
+        return {"recipes": {}, "default": None, "error": str(e)}
+    lc = cfg.get("llamacpp", {})
+    return {"recipes": lc.get("recipes", {}) or {},
+            "default": lc.get("default_recipe")}
 
 # ── HuggingFace Download ───────────────────────────────────────────────────────
 
@@ -5710,6 +5768,13 @@ a.model-card:hover{border-color:var(--amber)}
 .engine-actions{margin-left:auto;display:flex;gap:6px}
 
 /* ── Profile list ── */
+.recipe-bar{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 10px;
+  border:1px solid var(--border);border-radius:8px;background:var(--s2)}
+.recipe-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.recipe-select{font-family:var(--mono);font-size:12px;color:var(--text);background:var(--s1);
+  border:1px solid var(--border2);border-radius:6px;padding:5px 8px;min-width:230px}
+.recipe-select:focus{outline:none;border-color:var(--amber)}
+.recipe-desc{font-size:11px;color:var(--muted);line-height:1.4;flex:1}
 .profile-list{display:flex;flex-direction:column;gap:6px}
 .profile-item{
   display:flex;align-items:center;gap:12px;
@@ -6434,6 +6499,11 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
         <button class="subtab active" id="{k}-subtab-models" onclick="setProfileView('{k}','models')">Models</button>
         <button class="subtab" id="{k}-subtab-profiles" onclick="setProfileView('{k}','profiles')">Profiles</button>
         <span class="subtab-note" id="{k}-subtab-note"></span>
+      </div>
+      <div class="recipe-bar" id="{k}-recipe-bar" style="display:none">
+        <label class="recipe-label" for="{k}-recipe">Recipe</label>
+        <select class="recipe-select" id="{k}-recipe" onchange="selectRecipe('{k}', this.value)"></select>
+        <span class="recipe-desc" id="{k}-recipe-desc"></span>
       </div>
       <div class="profile-list" id="{k}-profile-list">
         <div class="empty"><div class="spin-icon" style="margin:0 auto"></div></div>
@@ -7742,7 +7812,7 @@ async function warmStopOllama(name) {
 
 const engines = {
 """ + ",\n".join(f'''  {k}: {{
-    name: '{e["name"]}', api: '/api/{k}', selectedProfile: null,{" webui: true," if e.get("webui") else ""}
+    name: '{e["name"]}', api: '/api/{k}', selectedProfile: null, selectedRecipe: null, recipes: null,{" webui: true," if e.get("webui") else ""}
     key: '{k}',
     ids: {{ led: '{k}-engine-led', title: '{k}-engine-title', model: '{k}-engine-model',
            card: '{k}-engine-card', stop: '{k}-stop-btn', start: '{k}-start-btn',
@@ -7806,6 +7876,51 @@ async function loadEngineProfiles(eng) {
     renderEngineProfiles(eng);
   } catch(e) {
     el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+  }
+  if (eng.key === 'llamacpp') loadRecipes(eng);
+}
+
+// llama.cpp only. A GGUF repo ships one set of weights at ten quantizations, so the
+// quant/context/speculation choice is a launch *parameter*, not a separate profile —
+// otherwise the profile list becomes ten near-identical rows that drift apart.
+async function loadRecipes(eng) {
+  const bar = document.getElementById(eng.key + '-recipe-bar');
+  const sel = document.getElementById(eng.key + '-recipe');
+  if (!bar || !sel) return;
+  let d;
+  try { d = await apiFetch('/api/llamacpp/recipes'); }
+  catch(e) { bar.style.display = 'none'; return; }
+
+  const names = Object.keys(d.recipes || {});
+  // No recipes configured means the scripts use their own defaults. Showing an empty
+  // dropdown would imply a choice that does not exist.
+  if (!names.length) { bar.style.display = 'none'; eng.recipes = null; return; }
+
+  eng.recipes = d.recipes;
+  if (!eng.selectedRecipe || !eng.recipes[eng.selectedRecipe]) {
+    eng.selectedRecipe = (d.default && eng.recipes[d.default]) ? d.default : names[0];
+  }
+  sel.innerHTML = names.map(n => {
+    const r = eng.recipes[n];
+    return '<option value="' + _escHtml(n) + '"' +
+           (n === eng.selectedRecipe ? ' selected' : '') + '>' +
+           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GB') +
+           '</option>';
+  }).join('');
+  bar.style.display = 'flex';
+  selectRecipe(eng.key, eng.selectedRecipe);
+}
+
+function selectRecipe(key, name) {
+  const eng = engines[key];
+  if (!eng || !eng.recipes || !eng.recipes[name]) return;
+  eng.selectedRecipe = name;
+  const r = eng.recipes[name];
+  const d = document.getElementById(key + '-recipe-desc');
+  if (d) {
+    d.textContent = (r.desc || '') +
+      (r.spec && r.spec !== 'none' ? '  ·  spec: ' + r.spec : '') +
+      (r.vision ? '  ·  vision' : '');
   }
 }
 
@@ -7972,7 +8087,9 @@ async function startEngine(eng) {
   };
 
   const startWith = (force) =>
-    apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
+    apiFetch(eng.api + '/start', 'POST',
+             {profile: eng.selectedProfile, force,
+              recipe: eng.key === 'llamacpp' ? eng.selectedRecipe : undefined});
 
 
   try {
