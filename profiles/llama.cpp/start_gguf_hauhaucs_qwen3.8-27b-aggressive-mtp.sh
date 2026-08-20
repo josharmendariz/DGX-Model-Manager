@@ -78,6 +78,10 @@ SPEC="${SPEC:-$R_SPEC}"
 VISION="${VISION:-$R_VISION}"
 NGL="${NGL:-all}"
 PORT="${PORT:-8081}"
+# The image's HEALTHCHECK is hardcoded to `curl -f http://localhost:8080/health`, so the
+# container must serve on 8080 internally or docker reports it unhealthy forever while it
+# is in fact serving. Publish on $PORT, listen on 8080.
+CT_PORT=8080
 DEPTH="${DEPTH:-3}"
 IMAGE="${LLAMACPP_IMAGE:-$R_IMAGE}"
 CT_NAME="${CT_NAME:-$R_NAME_CT}"
@@ -114,7 +118,7 @@ fi
 ARGS=(
   --model "$CT_SNAP/$BASE-$QUANT.gguf"
   --alias "HauhauCS/Qwen3.8-27B-Uncensored-Aggressive-$QUANT"
-  --host 0.0.0.0 --port "$PORT"
+  --host 0.0.0.0 --port "$CT_PORT"
   --ctx-size "$CTX"
   --n-gpu-layers "$NGL"
   --split-mode none
@@ -150,7 +154,7 @@ esac
 #
 # The dgx.profile label is how reclaim identifies what to stop: substring-matching a
 # served model name is ambiguous across profiles that all mention the same repo.
-exec docker run -d --name "$CT_NAME" --gpus all -p "$PORT:$PORT" \
+exec docker run -d --name "$CT_NAME" --gpus all -p "$PORT:$CT_PORT" \
   --label "dgx.profile=gguf_hauhaucs_qwen3.8-27b-aggressive-mtp" \
   --label "dgx.engine=llamacpp" \
   -v "$HOST_CACHE:$CT_CACHE:ro" \
