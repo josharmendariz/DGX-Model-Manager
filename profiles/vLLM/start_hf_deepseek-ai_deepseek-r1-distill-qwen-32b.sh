@@ -9,7 +9,7 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
+exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
   -v /opt/models/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-32B:/models/deepseek-ai_deepseek-r1-distill-qwen-32b:ro \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \

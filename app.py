@@ -2885,6 +2885,42 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
             f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
+def _launch_argv(script: str, safe_id: str) -> list[str]:
+    """Wrap a profile launch so it OUTLIVES this service.
+
+    DMM runs as a systemd --user unit, and a profile script spawned with plain Popen
+    lands in dgx-model-manager.service's cgroup. systemd's default
+    KillMode=control-group then takes every one of those children down on `systemctl
+    --user restart dgx-model-manager` — including a `docker run` client in the
+    foreground, which stops the container it is attached to. Observed 2026-08-18: a
+    routine restart to pick up new code stopped a vllm_node that had been serving for
+    25 hours (clean exit 0, ~4 min outage). start_new_session=True does NOT help; it
+    detaches the session, not the cgroup.
+
+    `systemd-run --user --scope` puts the launch in its own transient scope, a sibling
+    of this service rather than a child, so a restart or crash-loop of DMM cannot reach
+    it. Verified: the scope's cgroup is .../app.slice/<unit>.scope.
+
+    Falls back to a bare `bash` when systemd-run is unavailable (non-systemd host, no
+    session bus). That restores the old fragile behavior rather than failing the launch
+    — a manager that cannot start a model is worse than one whose restarts are unsafe.
+    """
+    if not shutil.which("systemd-run"):
+        _logger.warning("systemd-run not found — launching in DMM's own cgroup; a DMM "
+                        "restart will kill this engine")
+        return ["bash", script]
+    # Unit names must be unique per launch: a lingering scope from a previous start of
+    # the same profile would otherwise collide and fail the launch.
+    unit = f"dmm-{safe_id}-{int(_time.time())}"[:200]
+    return [
+        "systemd-run", "--user", "--scope", "--quiet",
+        # --collect reaps the scope if the script exits non-zero; without it a failed
+        # launch leaves a dead unit that blocks nothing but clutters `systemctl --user`.
+        "--collect", f"--unit={unit}",
+        "bash", script,
+    ]
+
+
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
                         engine_key: str | None = None, force: bool = False) -> dict:
     """Start a Docker engine by launching the selected profile script."""
@@ -2906,7 +2942,7 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(_fd, "w") as logf:
         subprocess.Popen(
-            ["bash", script],
+            _launch_argv(script, safe_id),
             stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
