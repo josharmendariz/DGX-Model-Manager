@@ -9,7 +9,7 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
+exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -v "$HOME/super_v3_reasoning_parser.py:/app/super_v3_reasoning_parser.py:ro" \
   -e HF_HUB_OFFLINE=1 \
