@@ -21,9 +21,24 @@
     "image_gpt_oss": "eugr/spark-vllm:latest",
     "moe_backend":   "marlin"
   },
+  "llamacpp": {
+    "_comment": "Optional — the GGUF quant ladder. One profile script covers a whole repo's quants, so the quant/ctx/spec choice is data the UI enumerates and passes as RECIPE, not a script per combination. vram_gb is what admission checks, so keep it honest.",
+    "_comment_spec": "spec: embedded = the NextN/MTP head baked into the target GGUF, works on a stock build. fastmtp = a separate sidecar GGUF, which needs fastmtp_binary — a patched build in its own worktree, never a rewind of the main checkout other profiles depend on.",
+    "binary":         "~/llama.cpp/build-cuda/bin/llama-server",
+    "fastmtp_binary": "~/llama.cpp-fastmtp/build/bin/llama-server",
+    "default_recipe": "balanced",
+    "recipes": {
+      "balanced": {"quant": "Q6_K_P", "ctx": 65536, "spec": "embedded", "vision": true,  "vram_gb": 31, "desc": "Default. Near-Q8 quality, holds up on tool-calling."},
+      "coexist":  {"quant": "Q4_K_P", "ctx": 32768, "spec": "embedded", "vision": true,  "vram_gb": 23, "desc": "Fits beside a large vLLM model. Run both engines at once."},
+      "longctx":  {"quant": "Q4_K_P", "ctx": 204800, "spec": "embedded", "vision": false, "vram_gb": 60, "desc": "Max native context. KV dominates; vision off for headroom."}
+    }
+  },
   "paths": {
-    "litellm_config": "~/litellm/litellm_config.yaml",
-    "hf_cache":       "~/.cache/huggingface/hub"
+    "_comment": "vllm_scripts and llamacpp_scripts are where generated profile scripts are written and scanned from; relative paths resolve against $HOME.",
+    "litellm_config":   "~/litellm/litellm_config.yaml",
+    "hf_cache":         "~/.cache/huggingface/hub",
+    "vllm_scripts":     "DGX-Model-Manager/profiles/vLLM",
+    "llamacpp_scripts": "DGX-Model-Manager/profiles/llama.cpp"
   },
   "alerts": {
     "_comment": "All keys optional — omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
