@@ -3023,8 +3023,32 @@ _OVERRIDE_ENV: dict[str, tuple[str, object]] = {
 }
 
 
+def _collect_overrides(raw: dict | None) -> dict:
+    """Drop the fields the user left blank. The pure request-body builder.
+
+    The profile card sends one input per override; an empty or whitespace-only box means
+    "use the derived default", which must be expressed as the key being ABSENT, not as an
+    empty string (an empty string is a validation error, and the derived default lives in
+    the script's own `${VAR:-N}` placeholder). The browser applies the same rule before
+    sending; this is the server-side half of the pair, so a hand-rolled client cannot make
+    a blank field mean something different.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        out[key] = value.strip() if isinstance(value, str) else value
+    return out
+
+
 def _resolve_overrides(overrides: dict | None) -> dict[str, str]:
     """Validate an untrusted override map into env-ready strings, or raise 400."""
+    if isinstance(overrides, dict):
+        overrides = _collect_overrides(overrides)
     if not overrides:
         return {}
     if not isinstance(overrides, dict):
@@ -6101,8 +6125,24 @@ a.model-card:hover{border-color:var(--amber)}
 .recipe-select:focus{outline:none;border-color:var(--amber)}
 .recipe-desc{font-size:11px;color:var(--muted);line-height:1.4;flex:1}
 .profile-list{display:flex;flex-direction:column;gap:6px}
+/* 04-02 launch-settings panel: only the selected card shows it, so the list stays
+   scannable and the inputs visibly reset when the selection moves. */
+.p-settings{flex-basis:100%;display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);cursor:default}
+.profile-item.selected .p-settings{display:block}
+.p-set-row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+.p-set-field{display:flex;flex-direction:column;gap:3px}
+.p-set-field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.p-set-field input{
+  width:110px;background:var(--s0);border:1px solid var(--border);border-radius:5px;
+  color:var(--fg);font-family:var(--mono);font-size:11px;padding:4px 6px;
+}
+.p-set-field input:disabled{opacity:.45}
+.p-set-rec{font-size:10px;color:var(--amber);font-family:var(--mono)}
+.p-set-note{font-size:10px;color:var(--dim);margin-top:6px}
+.p-set-warn{font-size:10px;color:var(--amber);margin-top:6px;font-family:var(--mono)}
+.p-set-error{font-size:11px;color:var(--red,#e05252);margin-top:6px;font-weight:600}
 .profile-item{
-  display:flex;align-items:center;gap:12px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
   padding:12px 14px;
   background:var(--s1);border:1px solid var(--border);
   border-radius:8px;cursor:pointer;
@@ -8312,9 +8352,113 @@ function renderEngineProfiles(eng) {
           <button class="btn-icon-del" title="Delete this profile script"
                   onclick="deleteEngineProfile('${eng.key}','${q(p.id)}','${q(p.name)}')">&#10005;</button>
         </div>
+        ${eng.key === 'vllm' ? renderProfileSettings(p) : ''}
       </div>
     `).join('');
+    // Warning and meta-error text is vendor-supplied (it embeds {value!r} of config
+    // fields), so it is written with textContent, never interpolated into the HTML
+    // above. T-04-07.
+    el.querySelectorAll('.profile-item').forEach((card, i) => {
+      const p = profiles[i];
+      if (!p) return;
+      const errEl = card.querySelector('.p-set-error');
+      if (errEl) errEl.textContent =
+        'Profile header is unreadable: ' + (p.meta_error || 'unknown parse failure');
+      const warnEl = card.querySelector('.p-set-warn');
+      if (warnEl && (p.warnings || []).length) {
+        warnEl.textContent = '⚠ ' + p.warnings.join(' · ');
+      }
+    });
   }
+}
+
+// Five card states: header-error, recipe-backed, editable, read-only (04-03) and
+// unparseable (04-03). meta_error is checked FIRST and on its own: a corrupt header is a
+// defect, not a fallback (04-CONTEXT.md), so it must never fall through to the legacy
+// rendering that would silently show a launch as ordinary.
+function renderProfileSettings(p) {
+  if (p.meta_error) {
+    return `<div class="p-settings" data-state="header-error" onclick="event.stopPropagation()">
+      <div class="p-set-error"></div>
+      <div class="p-set-note">The script itself is still valid and can be launched, but its
+        generated metadata cannot be read. Regenerate the profile to repair it.</div>
+    </div>`;
+  }
+  const d = p.derived;
+  if (d && d.editable === false) {
+    return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+      <div class="p-set-row">
+        <div class="p-set-field"><label>Context</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="—"></div>
+      </div>
+      <div class="p-set-note">Not adjustable here — ${d.reason || 'the recipe YAML owns these flags'}.</div>
+    </div>`;
+  }
+  if (!d) return '';  // legacy / unparseable: 04-03 owns those states.
+  const rec = p.recommended || {};
+  const recUtil = rec.gpu_memory_utilization != null
+    ? `<span class="p-set-rec">recommended ${rec.gpu_memory_utilization}</span>` : '';
+  const recCtx = rec.max_model_len != null
+    ? `<span class="p-set-rec">recommended ${rec.max_model_len}</span>` : '';
+  const ceiling = d.declared_max_context != null
+    ? ` Over-requesting is clamped to the KV ceiling (${d.max_fitting_context}) and the
+        vendor ceiling (${d.declared_max_context}); the request is discarded, not applied,
+        so a value above those will silently give you less context than you typed.` : '';
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context ${recCtx}</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="${d.max_model_len}">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util ${recUtil}</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization" placeholder="${d.util}">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="${d.max_num_seqs}">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+    </div>
+    <div class="p-set-note">Per-launch only — nothing is written to the script on disk.
+      Leave a box empty to use the derived default shown in grey. Linux page cache is billed
+      against the same budget as gpu-memory-utilization, so reclaim it before judging a
+      utilization recommendation.${ceiling}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// Page cache counts against the util budget, so a correct recommendation looks broken
+// until it is reclaimed. Same endpoint the Dry Run memory check offers.
+async function reclaimPageCache(btn) {
+  btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+    toast('✓ ' + res.message, 'ok');
+  } catch (e) {
+    toast('Reclaim failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// The request-body builder. Mirrors `_collect_overrides` in app.py: a blank or
+// whitespace-only box means "use the derived default", expressed as the key being ABSENT.
+function collectProfileOverrides() {
+  const panel = document.querySelector('#vllm-profile-list .profile-item.selected .p-settings[data-state="editable"]');
+  if (!panel) return undefined;
+  const out = {};
+  panel.querySelectorAll('input[data-override]').forEach(inp => {
+    const raw = String(inp.value == null ? '' : inp.value).trim();
+    if (!raw) return;
+    const num = Number(raw);
+    out[inp.dataset.override] = Number.isFinite(num) ? num : raw;
+  });
+  return Object.keys(out).length ? out : undefined;
 }
 
 async function deleteEngineProfile(key, id, name) {
@@ -8348,6 +8492,9 @@ function selectEngineProfile(key, id, el) {
   engines[key].selectedProfile = id;
   const container = document.getElementById(engines[key].ids.profiles);
   container.querySelectorAll('.profile-item').forEach(p => p.classList.remove('selected'));
+  // Overrides are per-launch and per-profile: carrying a typed context across a selection
+  // change would launch a different model with numbers the user meant for the old one.
+  container.querySelectorAll('.p-settings input[data-override]').forEach(i => { i.value = ''; });
   el.classList.add('selected');
 }
 
@@ -8414,6 +8561,7 @@ async function startEngine(eng) {
   const startWith = (force) =>
     apiFetch(eng.api + '/start', 'POST',
              {profile: eng.selectedProfile, force,
+              overrides: eng.key === 'vllm' ? collectProfileOverrides() : undefined,
               recipe: eng.key === 'llamacpp' ? eng.selectedRecipe : undefined});
 
 
