@@ -17,9 +17,9 @@ import app as appmod
 # read would make the suite depend on which models happen to be present, so adding or
 # deleting one model would break unrelated tests. Regenerating this snapshot is a
 # deliberate act (02-VALIDATION.md, Wave 0 fixture rule).
-MODEL_FIXTURES_PATH = (
-    REPO_ROOT / ".planning" / "phases" / "02-derived-launch-spec" / "02-MODEL-FIXTURES.json"
-)
+# Lives under tests/ rather than .planning/ because it is a test input: PR branches strip
+# transient .planning/ paths, and a fixture parked there makes the suite uncollectable there.
+MODEL_FIXTURES_PATH = REPO_ROOT / "tests" / "fixtures" / "model-fixtures.json"
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +32,7 @@ def isolate_alert_state(tmp_path, monkeypatch):
 
 @pytest.fixture(scope="session")
 def model_fixtures():
-    """The whole parsed 02-MODEL-FIXTURES.json snapshot: {generated, pool_gb, models, anomalies}."""
+    """The whole parsed model-fixtures.json snapshot: {generated, pool_gb, models, anomalies}."""
     with MODEL_FIXTURES_PATH.open(encoding="utf-8") as fh:
         return json.load(fh)
 
