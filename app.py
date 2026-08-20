@@ -335,6 +335,9 @@ class EngineStartRequest(BaseModel):
     # covers the whole quant ladder, so the quant/ctx/spec choice is a request parameter
     # rather than a script per combination.
     recipe: Optional[str] = None
+    # vLLM only: per-launch tuning knobs. Transient by design — nothing is written to
+    # the script on disk, so an override cannot outlive the launch that asked for it.
+    overrides: Optional[dict] = None
 
 class OllamaStopRequest(BaseModel):
     name: str
@@ -2938,9 +2941,74 @@ def _llamacpp_recipes() -> dict:
     return cfg.get("llamacpp", {}).get("recipes", {}) or {}
 
 
+def _override_int(lo: int, hi: int | None = None):
+    def _check(value):
+        if isinstance(value, bool) or not isinstance(value, (int, str, float)):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}")
+        try:
+            ival = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}, "
+                                     f"got {value!r}")
+        if ival < lo or (hi is not None and ival > hi):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}, got {ival}")
+        return str(ival)
+    return _check
+
+
+def _override_float(lo: float, hi: float):
+    def _check(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}")
+        try:
+            fval = float(str(value).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}, got {value!r}")
+        if not (lo <= fval <= hi):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}, got {fval}")
+        return repr(fval)
+    return _check
+
+
+# Allow-list of NAMES, never a prefix match and never pass-through: these values arrive in
+# an HTTP body and land in a bash script's environment, then in docker argv. The bounds
+# reuse `_derive_launch_spec`'s own util_floor/util_cap rather than inventing new numbers —
+# two sources of truth for the same clamp is how they drift apart.
+_UTIL_FLOOR = 0.10
+_UTIL_CAP = 0.95
+_OVERRIDE_ENV: dict[str, tuple[str, object]] = {
+    "max_model_len": ("VLLM_MAX_MODEL_LEN", _override_int(1)),
+    "gpu_memory_utilization": ("VLLM_GPU_MEMORY_UTILIZATION",
+                               _override_float(_UTIL_FLOOR, _UTIL_CAP)),
+    "max_num_seqs": ("VLLM_MAX_NUM_SEQS", _override_int(1, 256)),
+}
+
+
+def _resolve_overrides(overrides: dict | None) -> dict[str, str]:
+    """Validate an untrusted override map into env-ready strings, or raise 400."""
+    if not overrides:
+        return {}
+    if not isinstance(overrides, dict):
+        raise HTTPException(400, "overrides must be an object")
+    accepted = ", ".join(sorted(_OVERRIDE_ENV))
+    resolved: dict[str, str] = {}
+    for key, value in overrides.items():
+        if key not in _OVERRIDE_ENV:
+            raise HTTPException(400, f"Unknown override '{key}'; accepted: {accepted}")
+        if value is None:
+            continue
+        env_name, validator = _OVERRIDE_ENV[key]
+        try:
+            resolved[env_name] = validator(value)
+        except HTTPException as exc:
+            raise HTTPException(400, f"Invalid override '{key}': {exc.detail}")
+    return resolved
+
+
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
                         engine_key: str | None = None, force: bool = False,
-                        recipe: str | None = None) -> dict:
+                        recipe: str | None = None,
+                        overrides: dict | None = None) -> dict:
     """Start a Docker engine by launching the selected profile script."""
     profiles = scan_fn()
     profile = next((p for p in profiles if p["id"] == req_profile), None)
@@ -2958,6 +3026,10 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         if r_vram is not None:
             profile = {**profile, "vram_gb": r_vram}
 
+    # Same ordering rule as the recipe block: an override that raises the real footprint
+    # must be admitted against that footprint, not the script header's static comment.
+    override_env = _resolve_overrides(overrides)
+
     await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
     script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
@@ -2972,6 +3044,11 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
     if recipe:
         env["RECIPE"] = recipe
         _logger.info("%s recipe '%s' -> %s", engine_name, recipe, known_recipes[recipe])
+    if override_env:
+        # `systemd-run --user --scope` inherits Popen(env=), so there is one transport
+        # here, not two; no --setenv= enumeration in _launch_argv.
+        env.update(override_env)
+        _logger.info("%s launch overrides: %s", engine_name, override_env)
 
     _logger.info("%s starting profile '%s' — script: %s", engine_name, profile["name"], script)
     try:
@@ -3843,7 +3920,8 @@ for _ek, _ev in _ENGINES.items():
         async def start(req: EngineStartRequest, k=key):
             return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k,
                                        engine_key=k, force=req.force,
-                                       recipe=req.recipe if k == "llamacpp" else None)
+                                       recipe=req.recipe if k == "llamacpp" else None,
+                                       overrides=req.overrides if k == "vllm" else None)
 
     _make_engine_routes(_ek, _ev)
 
