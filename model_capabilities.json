@@ -2,7 +2,7 @@
  "meta": {
   "schema_version": 1,
   "emission_policy": "an entry emits tool/reasoning parser flags iff its confidence is one of [recipe-proven, template-identical-to-recipe-proven] unless the entry carries an explicit 'emit' bool",
-  "architecture_fallback": "An architecture counts as a match key only where every row carrying that architecture agrees on the emitted parser values (Qwen3_5MoeForConditionalGeneration: qwen3_xml/qwen3 everywhere; Qwen3ForCausalLM: single hermes row, emit=false). Ambiguous families \u2014 Qwen2ForCausalLM, Qwen3NextForCausalLM, NemotronHForCausalLM \u2014 are NOT architecture keys: a model unknown to the map but of such an architecture gets no tool flags rather than a first-row guess."
+  "architecture_fallback": "An architecture counts as a match key only where every row carrying that architecture agrees on the emitted parser values (Qwen3_5MoeForConditionalGeneration: qwen3_xml/qwen3 everywhere; Qwen3ForCausalLM: single hermes row, emit=false; Qwen3_5ForConditionalGeneration: single dense-3.8 row, emit=false). Ambiguous families \u2014 Qwen2ForCausalLM, Qwen3NextForCausalLM, NemotronHForCausalLM \u2014 are NOT architecture keys: a model unknown to the map but of such an architecture gets no tool flags rather than a first-row guess."
  },
  "models": [
   {
@@ -144,6 +144,21 @@
    "supports_tool_calling": null,
    "confidence": "template-inferred",
    "evidence": "Survey \u00a74 DeepSeek-R1-Distill-Qwen-32B row: config.json and tokenizer_config.json show <think> but no tool injection; no recipe or parser-bearing profile file. Qwen2ForCausalLM deliberately NOT in matches: the family maps to conflicting parsers across rows, so unknown members resolve to no tool flags.",
+   "emit": false
+  },
+  {
+   "matches": [
+    "unsloth/Qwen3.8-27B",
+    "Qwen/Qwen3.8-27B",
+    "philbert440/Qwen3.8-27B-Uncensored-Aggressive",
+    "philbert440/Qwen3.8-27B-Uncensored-Aggressive-NVFP4",
+    "Qwen3_5ForConditionalGeneration"
+   ],
+   "tool_call_parser": "qwen3_xml",
+   "reasoning_parser": "qwen3",
+   "supports_tool_calling": true,
+   "confidence": "template-inferred",
+   "evidence": "Qwen3.8 dense (Qwen3_5ForConditionalGeneration) is a thinking VL model, so without --reasoning-parser qwen3 it returns content=None and callers silently degrade. A hand-corrected profile for unsloth/Qwen3.8-27B set qwen3_xml and qwen3 on 2026-08-15, but that profile never ran \u2014 its snapshot was never downloaded \u2014 so the values are unproven here. NOT template-identical-to-recipe-proven: chat_template sha256 differs from the recipe-proven Qwen/Qwen3.6-35B-A3B-FP8 row (12827f24 vs e84f32a2, checked 2026-08-20), and the known 3.8 dense repos disagree with each other too (philbert440 abliterated: c3cf9e34). Upgrade to recipe-proven the first time a dense 3.8 actually serves under vLLM on this box; philbert440's NVFP4 is the cheap route at ~26 GB versus the bf16 base at ~87 GB.",
    "emit": false
   },
   {
