@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: planned
-last_updated: "2026-08-20T05:00:00.000Z"
-last_activity: 2026-08-20 -- PR #4 opened from rec-approve-actions-pr; Phase 04 planned (3 plans, checker PASS)
+status: executing
+last_updated: "2026-08-21T02:49:06.122Z"
+last_activity: 2026-08-21 -- Phase 04 closed (waves 1-3 shipped, live checkpoint run, gsd-verifier PASS)
 progress:
   total_phases: 7
-  completed_phases: 4
-  total_plans: 5
-  completed_plans: 4
-  percent: 57
+  completed_phases: 5
+  total_plans: 8
+  completed_plans: 5
+  percent: 63
 ---
 
 # Project State
@@ -20,27 +20,29 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-02)
 
 **Core value:** Switching the active vLLM model must be safe and correct.
-**Current focus:** Phase 04 — parameterized scripts + UI settings (planned; next: /gsd-execute-phase 4)
+**Current focus:** Phase 5 — admission truth
 
 ## Current Position
 
-Phase: 04 (parameterized-scripts-ui-settings) — PLANNED, 3 plans, waves 1-3 (serial;
-all three modify app.py). Plan-checker PASS on the second pass.
-Status: PR #4 open from `rec-approve-actions-pr` (34 commits, .planning/ filtered, 337
-tests green). Phase 03 closed 5/5. Research falsified the assumption that the
-systemd-run --scope change broke Phase 4's criterion 2 — `--user --scope` inherits
-Popen(env=), verified on the box; one transport, criterion unchanged.
-Next: `/gsd-execute-phase 4`.
-Last activity: 2026-08-20 -- off-roadmap engine work committed; next action is /gsd-pr-branch
+Phase: 04 (parameterized-scripts-ui-settings) — COMPLETE, 3/3 plans, gsd-verifier PASS
+(04-VERIFICATION.md). Suite 464 passing at HEAD (rec-approve-actions, 3ccb35d). Live
+human-verify checkpoint run 2026-08-21: override reaches the container (docker inspect),
+concurrent-edit 409, HF-browse XSS payload renders as text, two profile scripts
+parameterized for real via the browser dialog. Checkpoint caught three renderer defects
+(classification outranking flag-parseability) and one missing affordance (Regenerate
+metadata on generated-lineage scripts), all fixed and tested.
+Next: Phase 5 (admission truth) — not yet planned. Phase 6 (verifiable research capture)
+is independent and can be planned at any point.
+Last activity: 2026-08-21 -- Phase 04 closed
 
 See .planning/HANDOFF.json for the full situation: live engine/litellm state, the PR
 intent and why a direct PR would be 41 commits, three open questions, and the one
 root cause (litellm file-vs-ConfigMap drift) that is still unguarded.
-Remaining: Phase 4 parameterizes generated scripts and surfaces the derived/recommended
-values (and the so-far-unconsumed `warnings`) in the UI. Phase 6 (verifiable research
-capture) is independent and can be planned at any point.
+Remaining: Phase 5 admits on executor budget and identifies the reclaim target by docker
+label. Phase 6 (verifiable research capture) is independent and can be planned at any
+point.
 
-Progress: [██████░░░░] 57%
+Progress: [██████░░░░] 63%
 
 ## Performance Metrics
 

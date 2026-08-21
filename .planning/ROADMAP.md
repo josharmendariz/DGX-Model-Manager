@@ -22,7 +22,7 @@ printed, and so synthesis runs on this box rather than an external service.
 - [x] **Phase 1.1: Launch feedback** - INSERTED - Repair the Qwen3.6 profile; preflight + live load progress
 - [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [x] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
-- [ ] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls
+- [x] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls (completed 2026-08-21)
 - [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label
 - [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
 
@@ -160,9 +160,9 @@ clobbering the script on disk.
 **Plans**: 3 plans
 
 Plans:
-- [ ] 04-01: Emit parameterized scripts; env-override plumbing through `_engine_start`
-- [ ] 04-02: Profile-card settings controls with recommended-value hints
-- [ ] 04-03: Legacy-script parameterize action with diff preview; escape the raw-HTML paths
+- [x] 04-01: Emit parameterized scripts; env-override plumbing through `_engine_start`
+- [x] 04-02: Profile-card settings controls with recommended-value hints
+- [x] 04-03: Legacy-script parameterize action with diff preview; escape the raw-HTML paths
 
 ### Phase 5: Admission truth
 **Goal**: Admission compares the same quantity vLLM will actually reserve, and credits the
