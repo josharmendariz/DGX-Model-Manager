@@ -148,31 +148,82 @@ None.
 
 ## Issues Encountered
 
-**Task 4 (the blocking human-verify checkpoint) has NOT been performed.** This run was
-constrained to code and tests: no writes under `profiles/vLLM/`, no service restart, no
-container action, and `vllm_node` is serving production traffic. Outstanding, in order:
-1. `systemctl --user restart dgx-model-manager.service`.
-2. Legacy profile card renders parsed values read-only with a Parameterize action.
-3. Diff appears before any write; `git status --porcelain profiles/vLLM/` still empty.
-4. Concurrent edit → Apply → 409, file unchanged apart from the edit.
-5. Apply for real → diff applied, `.bak` exists, `bash -n` clean.
-6. HF browse renders a repo name as text, not markup; `# Name:` payload test.
+**Task 4 was NOT performed by this run** (code-and-tests constraint), and was run with
+Josh on 2026-08-21. It is now **COMPLETE**, and it found three defects — see below.
 
-Steps 3, 4 and 5 are unit-tested against a `monkeypatch`ed profile directory; what is
-untested is the browser→HTTP hop and a real write to the live directory. **Note that
-applying the rewrite to any live profile is a diff-then-adopt decision for Josh, not the
-executor's** — the Qwen3.6 recipe wrapper serves production.
+Two premises stated by this run were wrong and are corrected here:
+- *"`vllm_node` is serving production traffic"* — it was not running. `llamacpp_node` is
+  the live engine. The vLLM launch path was therefore free to be exercised.
+- *"Also still outstanding from 04-02: util 0.60 → `docker inspect`"* — closed the same
+  night, ahead of this checkpoint. See below.
 
-Also still outstanding from 04-02: its Task 3 human-verify steps (util 0.60 →
-`docker inspect vllm_node`).
+### 04-02 Task 3 — CLOSED 2026-08-21
+util `0.60` was **refused by admission** (72.6 GB needed vs 73 GB projected free, 8 GB
+margin, llama.cpp named as the holder) — which is wave 1's overridden-footprint check
+working on the *requested* value rather than the header's static `# VRAM:`, i.e. the
+harder half of the criterion. `force=true` was declined; it would have raced llama.cpp
+for the pool. Re-run at util `0.30` + ctx `8192`: `docker inspect vllm_node` showed
+`--gpu-memory-utilization 0.3`, `--max-model-len 8192`, and `--max-num-seqs 2` falling
+back to the script's own `${VLLM_MAX_NUM_SEQS:-2}`. Both halves of the contract. The
+container was stopped (exit 1 = SIGTERM during init) and the script restored.
+
+### Task 4 — COMPLETE 2026-08-21
+1. Service restarted. ✅
+2. Legacy card renders read-only values + Parameterize…, confirmed in-browser. ✅
+3. Preview wrote nothing: no diff on disk, no `.bak`. ✅
+4. Concurrent edit → apply with the stale sha → **409**, file byte-identical, no `.bak`. ✅
+5. Applied for real to **two** profiles Josh approved — `start_hf_qwen3-vl-4b-fp8` (via
+   API) and `start_hf_qwen_qwen3-8b` (via the browser dialog, the untested hop). Both:
+   `.bak` written, mode preserved `0755`, `bash -n` clean, only the two intended lines
+   changed, values identical. ✅
+6. HF browse renders repo names as text. ✅
+
+The production Qwen3.6 recipe wrapper was **not** touched.
+
+### Defects found by the checkpoint — fixed in `5652b57`
+One root cause: `_parse_script_flags` reads literal numbers only, so `${VAR:-N}` reports
+`unparseable` — a fact about the regex, not the file — and the card keyed off `flags`
+while never reading the `classification` this very plan had added beside it.
+
+1. **`parameterized` rendered as `unparseable`.** The card claimed "3 of 3 flags could
+   not be read… Parameterizing is refused" over a script already in the target state.
+2. **`recipe` rendered as `unparseable`.** The recipe-backed branch triggers on
+   `derived.editable === false`, but **no profile on disk carries derived metadata at
+   all** — so the live Qwen3.6 wrapper, the one card that most needs "the recipe YAML
+   owns these flags", reported its flags unreadable instead.
+3. **The dead end.** `_classify_script` required the generated-by marker *and* the
+   placeholder for `parameterized`. Hand-written scripts have no marker — so
+   `parameterize/apply`, whose whole purpose is rewriting them, left its own output
+   classified `legacy` with three now-`unparseable` flags: no values, no button, and a
+   note saying parameterizing is refused. Reachable by using the feature as designed;
+   caught only because step 5 was run against a real hand-written script.
+
+Defect 3 required inverting a test this plan shipped
+(`test_classify_parameterized_requires_marker_and_placeholder`), whose premise —
+"placeholder without the marker is a hand-edit, not our output" — `parameterize/apply`
+had already invalidated. Replaced with an end-to-end test that parameterizes a
+hand-written script and re-classifies the bytes written.
 
 ## Next
 
-Phase verification (`gsd-verifier`), after Task 4 and the 04-02 checkpoint are run
-against the live service.
+Phase verification (`gsd-verifier`) — no longer blocked; both checkpoints are closed.
+
+Two follow-ups this checkpoint surfaced, neither blocking:
+- **No profile on disk carries `# Derived:` metadata.** All 13 classify without it, so
+  every card takes a no-header branch and no recommendation or KV-ceiling check is
+  available anywhere in the UI. 04-02's editable path is only reachable on a
+  freshly-regenerated profile. Worth deciding whether regeneration should be offered
+  next to Parameterize….
+- **Parameterized scripts show no default in their placeholders** (`"script default"`),
+  because the parser reads literals only and `${VAR:-32768}` is not one. Teaching
+  `_parse_script_flags` to report the templated default would close it.
+
+Uncommitted and left for Josh's call: the two rewritten profile scripts
+(`start_hf_qwen3-vl-4b-fp8.sh`, `start_hf_qwen_qwen3-8b.sh`) and their `.bak` files.
+Adopting the rewrites into git is a separate decision from proving the feature works.
 
 ## Self-Check: PASSED
 - `tests/test_ui_escaping.py` exists on disk.
-- Commits `f30337e`, `e60491d`, `c3de100` all present in `git log`.
-- Full suite re-run at HEAD: 449 passed, above the 404 floor.
-- Task 4 deferred by hard constraint (see Issues Encountered) — not a code failure.
+- Commits `f30337e`, `e60491d`, `c3de100`, `5652b57` all present in `git log`.
+- Full suite re-run at HEAD: **454 passed**, above the 404 floor.
+- Task 4 and the 04-02 checkpoint both run against the live service (2026-08-21).
