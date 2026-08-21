@@ -7431,6 +7431,18 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 
 <script>
 // ─────────────────────────────────────────────────────────────────────────────
+// Escaping. ONE helper for the whole UI (T-04-16): escape at the DOM sink, in JS,
+// exactly once. Covers all five of & < > " ' so it is safe in both element-text
+// and quoted-attribute position. `q` (further down) escapes for a JS STRING
+// literal and is NOT an HTML escaper — a bare `q` in an onclick= attribute is
+// still breakable with a double quote, so attribute sites need esc(q(x)).
+// Do not add per-site .replace('<','&lt;') calls: 86 innerHTML sinks is exactly
+// how the original gap happened.
+// ─────────────────────────────────────────────────────────────────────────────
+const _ESC_MAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => _ESC_MAP[c]);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -8068,10 +8080,10 @@ async function loadOllamaModels() {
     el.innerHTML = '<div class="model-grid">' + models.map(m => {
       const gb = m.size ? (m.size / 1e9).toFixed(1) + ' GB' : '?';
       const date = m.modified_at ? new Date(m.modified_at).toLocaleDateString() : '';
-      const safeName = m.name.replace(/'/g, "\\'");
+      const safeName = esc(m.name.replace(/'/g, "\\'"));
       return `<div class="model-card">
         <div class="model-card-info">
-          <div class="model-card-name">${m.name}</div>
+          <div class="model-card-name">${esc(m.name)}</div>
           <div class="model-card-meta">${gb}${date ? ' · ' + date : ''}</div>
         </div>
         <div class="model-card-right">
@@ -8184,7 +8196,7 @@ async function loadLiteLLMModels() {
       const isOllama = m.id.toLowerCase().includes('ollama') || m.id.toLowerCase().includes(':');
       return `<div class="model-card">
         <div class="model-card-info">
-          <div class="model-card-name">${m.id}</div>
+          <div class="model-card-name">${esc(m.id)}</div>
         </div>
         <span class="tag ${isOllama ? 'tag-ollama' : 'tag-sglang'}">${isOllama ? 'ollama' : 'sglang'}</span>
       </div>`;
@@ -8571,22 +8583,22 @@ function renderEngineProfiles(eng) {
     const q = s => String(s == null ? '' : s).replace(/'/g, "\\'");
     el.innerHTML = profiles.map(p => `
       <div class="profile-item ${eng.selectedProfile === p.id ? 'selected' : ''}"
-           onclick="selectEngineProfile('${eng.key}', '${p.id}', this)">
+           onclick="selectEngineProfile('${eng.key}', '${esc(q(p.id))}', this)">
         <div class="p-radio"></div>
         <div class="p-info">
-          <div class="p-name">${p.name}${p.model_missing
+          <div class="p-name">${esc(p.name)}${p.model_missing
             ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
-          <div class="p-desc">${p.description}</div>
+          <div class="p-desc">${esc(p.description)}</div>
         </div>
         <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
         <div class="p-actions" onclick="event.stopPropagation()">
           ${p.model_dir
             ? `<button class="btn-icon-del" title="Delete model weights from disk${
                  p.model_size_gb ? ' (' + p.model_size_gb + ' GB)' : ''}"
-                 onclick="deleteProfileWeights('${eng.key}','${q(p.model_dir)}','${q(p.name)}',${p.model_size_gb || 0})">&#9679;</button>`
+                 onclick="deleteProfileWeights('${eng.key}','${esc(q(p.model_dir))}','${esc(q(p.name))}',${p.model_size_gb || 0})">&#9679;</button>`
             : ''}
           <button class="btn-icon-del" title="Delete this profile script"
-                  onclick="deleteEngineProfile('${eng.key}','${q(p.id)}','${q(p.name)}')">&#10005;</button>
+                  onclick="deleteEngineProfile('${eng.key}','${esc(q(p.id))}','${esc(q(p.name))}')">&#10005;</button>
         </div>
         ${eng.key === 'vllm' ? renderProfileSettings(p) : ''}
       </div>
@@ -8628,35 +8640,35 @@ function renderProfileSettings(p) {
         <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="—"></div>
         <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="—"></div>
       </div>
-      <div class="p-set-note">Not adjustable here — ${d.reason || 'the recipe YAML owns these flags'}.</div>
+      <div class="p-set-note">Not adjustable here — ${esc(d.reason || 'the recipe YAML owns these flags')}.</div>
     </div>`;
   }
-  if (!d) return '';  // legacy / unparseable: 04-03 owns those states.
+  if (!d) return renderLegacyProfileSettings(p);  // 04-03 owns read-only/unparseable.
   const rec = p.recommended || {};
   const recUtil = rec.gpu_memory_utilization != null
-    ? `<span class="p-set-rec">recommended ${rec.gpu_memory_utilization}</span>` : '';
+    ? `<span class="p-set-rec">recommended ${esc(rec.gpu_memory_utilization)}</span>` : '';
   const recCtx = rec.max_model_len != null
-    ? `<span class="p-set-rec">recommended ${rec.max_model_len}</span>` : '';
+    ? `<span class="p-set-rec">recommended ${esc(rec.max_model_len)}</span>` : '';
   const ceiling = d.declared_max_context != null
-    ? ` Over-requesting is clamped to the KV ceiling (${d.max_fitting_context}) and the
-        vendor ceiling (${d.declared_max_context}); the request is discarded, not applied,
+    ? ` Over-requesting is clamped to the KV ceiling (${esc(d.max_fitting_context)}) and the
+        vendor ceiling (${esc(d.declared_max_context)}); the request is discarded, not applied,
         so a value above those will silently give you less context than you typed.` : '';
   return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
     <div class="p-set-row">
       <div class="p-set-field">
         <label>Context ${recCtx}</label>
         <input type="number" min="1" step="1" data-override="max_model_len"
-               placeholder="${d.max_model_len}">
+               placeholder="${esc(d.max_model_len)}">
       </div>
       <div class="p-set-field">
         <label>GPU memory util ${recUtil}</label>
         <input type="number" min="0.10" max="0.95" step="0.01"
-               data-override="gpu_memory_utilization" placeholder="${d.util}">
+               data-override="gpu_memory_utilization" placeholder="${esc(d.util)}">
       </div>
       <div class="p-set-field">
         <label>Max num seqs</label>
         <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
-               placeholder="${d.max_num_seqs}">
+               placeholder="${esc(d.max_num_seqs)}">
       </div>
       <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
     </div>
@@ -8666,6 +8678,67 @@ function renderProfileSettings(p) {
       utilization recommendation.${ceiling}</div>
     <div class="p-set-warn"></div>
   </div>`;
+}
+
+// 04-03: a hand-written script has no `# Derived:` header, so its numbers come from
+// `_parse_script_flags` — a regex over the script text. Those values are READ-ONLY:
+// nothing here can override a flag the launcher does not template. A flag the parser
+// could not read as a literal renders the word "unparseable", never a guess.
+const LEGACY_FIELDS = [
+  ['max_model_len', 'Context'],
+  ['util', 'GPU memory util'],
+  ['max_num_seqs', 'Max num seqs'],
+];
+
+function renderLegacyProfileSettings(p) {
+  const flags = p.flags || {};
+  const unparseable = LEGACY_FIELDS.filter(([k]) => flags[k] === 'unparseable' ||
+                                                    flags[k] == null);
+  const fields = LEGACY_FIELDS.map(([k, label]) => {
+    const raw = flags[k];
+    const bad = (raw === 'unparseable' || raw == null);
+    return `<div class="p-set-field"><label>${esc(label)}</label>
+      <input disabled value="${bad ? 'unparseable' : esc(raw)}"></div>`;
+  }).join('');
+  const note = unparseable.length
+    ? `Read-only. ${unparseable.length} of 3 flags could not be read as a literal number
+       (they may be shell variables or built at runtime), so no value is shown rather than
+       a guessed one. Parameterizing is refused while any flag is unparseable.`
+    : `Read-only — this script hard-codes its flags. "Parameterize" rewrites each value
+       into a <code>\${VAR:-value}</code> placeholder with the SAME number as the default,
+       so behaviour is unchanged and per-launch overrides become possible. You will see a
+       diff before anything is written.`;
+  const action = unparseable.length ? '' :
+    // `q` is block-scoped to the card renderer, so the JS-string escape is inlined
+    // here; esc() then closes the surrounding attribute context.
+    `<button class="btn btn-sm" onclick="parameterizeProfile('${
+       esc(String(p.id == null ? '' : p.id).replace(/'/g, "\\'"))}')">Parameterize…</button>`;
+  return `<div class="p-settings" data-state="${unparseable.length ? 'unparseable' : 'read-only'}"
+        onclick="event.stopPropagation()">
+    <div class="p-set-row">${fields}${action}</div>
+    <div class="p-set-note">${note}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// Preview FIRST, always. The server builds the diff and hands back a sha256 of the file
+// it read; apply sends that hash straight back and the server refuses (409) if the file
+// moved underneath us — ~6 concurrent sessions share this profile directory.
+async function parameterizeProfile(profileId) {
+  try {
+    const prev = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                                + '/parameterize/preview', 'POST', {});
+    if (!prev.changed) { toast('Already parameterized — nothing to do', 'ok'); return; }
+    const ok = confirm('Rewrite ' + profileId + '.sh?\n\n' + prev.notes.join('\n')
+                       + '\n\n' + prev.diff);
+    if (!ok) return;
+    const res = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                               + '/parameterize/apply', 'POST', {sha256: prev.sha256});
+    toast('✓ Parameterized (backup: ' + res.backup.split('/').pop() + ')', 'ok');
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch (e) {
+    toast('Parameterize failed: ' + e.message, 'err');
+  }
 }
 
 // Page cache counts against the util budget, so a correct recommendation looks broken
@@ -9358,38 +9431,42 @@ async function hfbSearch() {
     const d = await apiFetch(url);
     const models = d.models || [];
     if (!models.length) {
-      root.innerHTML = '<div class="empty"><div class="empty-text">No results found for "' + q + '"</div></div>';
+      root.innerHTML = '<div class="empty"><div class="empty-text">No results found for "' + esc(q) + '"</div></div>';
       return;
     }
     root.innerHTML = models.map(renderHFBCard).join('');
   } catch(e) {
-    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Search failed: ' + e.message + '</div></div>';
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Search failed: ' + esc(e.message) + '</div></div>';
   }
 }
 
 function renderHFBCard(m) {
   const taskBadge = m.task_label && m.task_label !== 'Unknown'
-    ? '<span class="inv-task-badge">' + m.task_label + '</span>' : '';
+    ? '<span class="inv-task-badge">' + esc(m.task_label) + '</span>' : '';
   const fmtTags = [];
   if (m.has_safetensors) fmtTags.push('<span class="hfb-tag fmt">safetensors</span>');
   if (m.has_gguf) fmtTags.push('<span class="hfb-tag fmt">gguf</span>');
   const tags = (m.tags || []).filter(t => t !== 'safetensors' && t !== 'gguf').slice(0, 8)
-    .map(t => '<span class="hfb-tag">' + t + '</span>').join('');
-  const safeId = m.id.replace(/'/g, "\\'");
+    .map(t => '<span class="hfb-tag">' + esc(t) + '</span>').join('');
+  // T-04-10: m.id / m.library_name / m.tags are named by a third party (hf.co).
+  // esc(q(...)) for the onclick attributes: q closes the JS-string context, esc
+  // closes the HTML-attribute context. Neither alone is sufficient.
+  const safeId = esc(String(m.id == null ? '' : m.id).replace(/'/g, "\\'"));
+  const domId = esc(String(m.id == null ? '' : m.id).replace(/\//g, '--'));
 
-  return '<div class="hfb-card" id="hfb-card-' + m.id.replace(/\//g, '--') + '">'
-    + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + m.id + '</div>' + taskBadge + '</div>'
+  return '<div class="hfb-card" id="hfb-card-' + domId + '">'
+    + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + esc(m.id) + '</div>' + taskBadge + '</div>'
     + '<div class="hfb-card-meta">'
     + '<span class="dl">&#11015; ' + fmtNum(m.downloads) + '</span>'
     + '<span class="lk">&#9829; ' + fmtNum(m.likes) + '</span>'
-    + (m.library_name ? '<span>' + m.library_name + '</span>' : '')
+    + (m.library_name ? '<span>' + esc(m.library_name) + '</span>' : '')
     + '</div>'
     + '<div class="hfb-tags">' + fmtTags.join('') + tags + '</div>'
     + '<div class="hfb-card-actions">'
     + '<button class="btn btn-sm btn-primary" onclick="hfbDownload(\'' + safeId + '\')">Download</button>'
     + '<button class="hfb-expand-toggle" onclick="hfbToggleExpand(\'' + safeId + '\')">&#9660; Files &amp; Variants</button>'
     + '</div>'
-    + '<div class="hfb-expand" id="hfb-exp-' + m.id.replace(/\//g, '--') + '" style="display:none"></div>'
+    + '<div class="hfb-expand" id="hfb-exp-' + domId + '" style="display:none"></div>'
     + '</div>';
 }
 
@@ -9455,9 +9532,9 @@ function hfbDownload(repoId) {
 let _debugEngineTab = 'sglang';
 const _debugTimers = {};
 
-function _escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+// Kept as an alias so the warm-models call sites keep reading naturally; there is
+// still exactly one implementation, and it now also escapes " and '.
+function _escHtml(s) { return esc(s); }
 function _fmtUptime(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
   if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';

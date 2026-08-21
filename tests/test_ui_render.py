@@ -38,14 +38,16 @@ def test_each_control_takes_its_placeholder_from_the_derived_object():
             ("max_num_seqs", "d.max_num_seqs"),
     ):
         assert f'data-override="{field}"' in body, field
-        assert "${" + derived_key + "}" in body, derived_key
+        # 04-03: every interpolation is escaped at the sink, so the guard
+        # asserts the escaped form — a bare ${d.x} is now a regression.
+        assert "${esc(" + derived_key + ")}" in body, derived_key
     assert "const d = p.derived" in body
 
 
 def test_recommended_util_label_sits_next_to_the_utilization_input():
     body = _fn("renderProfileSettings")
     assert "rec.gpu_memory_utilization" in body
-    assert "recommended ${rec.gpu_memory_utilization}" in body
+    assert "recommended ${esc(rec.gpu_memory_utilization)}" in body
     # The label markup must carry it, not a detached note elsewhere.
     assert "<label>GPU memory util ${recUtil}</label>" in body
 
