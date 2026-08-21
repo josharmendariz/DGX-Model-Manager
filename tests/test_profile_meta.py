@@ -261,10 +261,13 @@ _EXPECTED_CLASSES = {
     "start_hf_lyf_qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-nvfp4.sh": "generated",
     "start_hf_openai_gpt-oss-120b.sh": "legacy",
     "start_hf_qwen2.5-14b-instruct-gptq-int8.sh": "generated",
-    "start_hf_qwen3-vl-4b-fp8.sh": "generated",
+    # Rewritten by parameterize/apply during the 04-03 live checkpoint (2026-08-21,
+    # commit 43fee2e) — both were `generated`/`legacy` when this oracle was first
+    # written; the .sh.bak beside each still holds the pre-rewrite text.
+    "start_hf_qwen3-vl-4b-fp8.sh": "parameterized",
     "start_hf_qwen_qwen3-14b.sh": "legacy",
     "start_hf_qwen_qwen3.6-35b-a3b-fp8.sh": "recipe",
-    "start_hf_qwen_qwen3-8b.sh": "legacy",
+    "start_hf_qwen_qwen3-8b.sh": "parameterized",
     "start_nemotron_nano.sh": "legacy",
     "start_nemotron_super.sh": "legacy",
     "start_qwen3_coder_next.sh": "legacy",
