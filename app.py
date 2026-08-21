@@ -4958,6 +4958,159 @@ async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
     return _create_vllm_profile_from_path(req.path, req.model_name)
 
 
+# ─── Parameterize a legacy script (04-03) ─────────────────────────────────────
+# Single source of truth for flag → placeholder variable: the same allow-list the
+# override API validates against, so a script can never grow a placeholder the
+# override path would reject as unknown.
+_FLAG_TO_ENV = {
+    "--max-model-len": _OVERRIDE_ENV["max_model_len"][0],
+    "--gpu-memory-utilization": _OVERRIDE_ENV["gpu_memory_utilization"][0],
+    "--max-num-seqs": _OVERRIDE_ENV["max_num_seqs"][0],
+}
+
+
+def _placeholder_re(env_name: str):
+    return _re.compile(r"^\$\{" + _re.escape(env_name) + r":-[0-9]+(?:\.[0-9]+)?\}$")
+
+
+class ParameterizeRefused(Exception):
+    """A rewrite that would be partial. Refusing whole is the only safe answer:
+    the hand-tuned scripts carry root-cause writeups and are not reconstructible."""
+
+
+def _parameterize_script_text(text: str) -> tuple[str, list[str]]:
+    """Rewrite literal flag values into `${VLLM_*:-<literal>}` placeholders.
+
+    Pure and total: the original literal becomes the default, so an unset
+    environment reproduces the current script's behaviour byte-for-byte in argv.
+    Idempotent — a token that is already the exact placeholder is left alone.
+    Raises `ParameterizeRefused` if any target flag is present-but-not-literal or
+    absent entirely; a half-rewritten hand-tuned script is worse than none.
+    """
+    notes: list[str] = []
+    rewrote: dict[str, str] = {}
+    already: set = set()
+
+    lines = (text or "").splitlines(keepends=True)
+    out_lines = []
+    for raw in lines:
+        if raw.strip().startswith("#"):
+            out_lines.append(raw)
+            continue
+
+        def _sub(match):
+            flag, token = match.group(1), match.group(2)
+            env = _FLAG_TO_ENV[flag]
+            if _placeholder_re(env).match(token):
+                already.add(flag)
+                return match.group(0)
+            if not _NUM_RE.match(token):
+                raise ParameterizeRefused(
+                    f"{flag} value {token!r} is not a literal number — refusing to "
+                    f"rewrite this script (it would be a partial rewrite)")
+            if flag in rewrote and rewrote[flag] != token:
+                raise ParameterizeRefused(
+                    f"{flag} appears twice with different values "
+                    f"({rewrote[flag]!r} and {token!r}) — refusing")
+            rewrote[flag] = token
+            return f"{flag} ${{{env}:-{token}}}"
+
+        out_lines.append(_FLAG_RE.sub(_sub, raw))
+
+    missing = [f for f in _FLAG_TO_ENV if f not in rewrote and f not in already]
+    if missing:
+        raise ParameterizeRefused(
+            "script does not set " + ", ".join(sorted(missing)) +
+            " as a literal value — refusing rather than guessing a default")
+
+    for flag in sorted(rewrote):
+        notes.append(f"{flag} {rewrote[flag]} → ${{{_FLAG_TO_ENV[flag]}:-{rewrote[flag]}}}"
+                     " (same value; only the default changes source)")
+    for flag in sorted(already):
+        notes.append(f"{flag} is already parameterized — left unchanged")
+    return "".join(out_lines), notes
+
+
+_PROFILE_ID_RE = _re.compile(r"^start_[A-Za-z0-9._-]+$")
+
+
+def _resolve_profile_script(profile_id: str) -> Path:
+    """profile_id → the script Path, with no way out of the profile directory."""
+    if not _PROFILE_ID_RE.match(profile_id or ""):
+        raise HTTPException(400, "Invalid profile id")
+    target = (_engine_dirs["vllm"] / f"{profile_id}.sh")
+    if not _path_under(target, _engine_dirs["vllm"]) or not target.is_file():
+        raise HTTPException(404, "Profile script not found")
+    return target
+
+
+def _parameterize_preview(profile_id: str) -> dict:
+    target = _resolve_profile_script(profile_id)
+    current = target.read_text()
+    try:
+        proposed, notes = _parameterize_script_text(current)
+    except ParameterizeRefused as exc:
+        raise HTTPException(422, str(exc))
+    # Built server-side on purpose: the client never holds or resends script text,
+    # so the apply path cannot be fed attacker-authored content (T-04-13).
+    diff = "".join(difflib.unified_diff(
+        current.splitlines(keepends=True), proposed.splitlines(keepends=True),
+        fromfile=f"a/{target.name}", tofile=f"b/{target.name}"))
+    return {
+        "profile_id": profile_id,
+        "current": current,
+        "proposed": proposed,
+        "diff": diff,
+        "changed": proposed != current,
+        "notes": notes,
+        "sha256": hashlib.sha256(current.encode()).hexdigest(),
+    }
+
+
+class ParameterizeApplyRequest(BaseModel):
+    sha256: str
+
+
+def _parameterize_apply(profile_id: str, expect_sha: str) -> dict:
+    target = _resolve_profile_script(profile_id)
+    current = target.read_text()
+    actual = hashlib.sha256(current.encode()).hexdigest()
+    if not expect_sha or not hmac.compare_digest(actual, expect_sha.strip()):
+        # TOCTOU guard (T-04-12): ~3 concurrent sessions share this directory, so
+        # "the preview I showed you" and "the file on disk" are not the same claim.
+        raise HTTPException(409, (
+            "Profile script changed since the preview was generated "
+            f"(expected sha256 {expect_sha[:12]}…, on disk {actual[:12]}…). "
+            "Nothing was written — re-run the preview."))
+    try:
+        proposed, notes = _parameterize_script_text(current)
+    except ParameterizeRefused as exc:
+        raise HTTPException(422, str(exc))
+
+    backup = target.with_suffix(target.suffix + ".bak")
+    backup.write_text(current)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(proposed)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    _logger.info("Parameterized profile %s (backup %s)", target, backup.name)
+    return {"ok": True, "profile_id": profile_id, "backup": str(backup),
+            "notes": notes, "sha256": hashlib.sha256(proposed.encode()).hexdigest(),
+            "profile": _parse_script_meta(target)}
+
+
+@app.post("/api/vllm/profiles/{profile_id}/parameterize/preview",
+          dependencies=[Depends(verify_auth)])
+async def vllm_parameterize_preview(profile_id: str):
+    return _parameterize_preview(profile_id)
+
+
+@app.post("/api/vllm/profiles/{profile_id}/parameterize/apply",
+          dependencies=[Depends(verify_auth)])
+async def vllm_parameterize_apply(profile_id: str, req: ParameterizeApplyRequest):
+    return _parameterize_apply(profile_id, req.sha256)
+
+
 _active_downloads: set = set()  # (repo_id, local_dir) of in-progress HF downloads
 
 

@@ -270,13 +270,25 @@ _EXPECTED_CLASSES = {
 }
 
 
+def _committed_text(name):
+    """Read the COMMITTED script, not the working-tree copy. ~6 concurrent sessions
+    share this checkout and the app itself rewrites profiles/vLLM/ at runtime, so a
+    working-tree read makes this oracle flap for reasons unrelated to the classifier."""
+    import subprocess
+    out = subprocess.run(["git", "show", f"HEAD:profiles/vLLM/{name}"],
+                         cwd=_REPO_PROFILES.parents[1],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
 def test_classify_covers_every_committed_profile(tmp_path):
     """Copied into tmp_path so the classifier is proved text-only — no live reads."""
     names = sorted(p.name for p in _REPO_PROFILES.glob("start_*.sh"))
     assert names == sorted(_EXPECTED_CLASSES), "profile set changed; update the oracle"
     for name, expected in _EXPECTED_CLASSES.items():
         copy = tmp_path / name
-        copy.write_text((_REPO_PROFILES / name).read_text())
+        copy.write_text(_committed_text(name))
         assert appmod._classify_script(copy.read_text()) == expected, name
 
 
@@ -349,3 +361,131 @@ def test_parse_script_flags_uses_no_third_party_import():
     import inspect
     src = inspect.getsource(appmod._parse_script_flags)
     assert "import " not in src
+
+
+# ── parameterize preview / apply (04-03) ──────────────────────────────────────
+
+import hashlib
+import shutil
+import subprocess
+
+_LEGACY = ("#!/bin/bash\n"
+           "# Name: Legacy\n"
+           "set -euo pipefail\n"
+           "docker run -d --name vllm_node \\\n"
+           "  --gpu-memory-utilization 0.55 \\\n"
+           "  --max-model-len 32768 --max-num-seqs 4 \\\n"
+           "  vllm/vllm-openai\n")
+
+
+@pytest.fixture
+def profile_dir(tmp_path, monkeypatch):
+    """Point the app's vLLM profile dir at tmp_path. HARD requirement: no test in
+    this file may touch the live profiles/vLLM/ directory."""
+    d = tmp_path / "vLLM"
+    d.mkdir()
+    monkeypatch.setitem(appmod._engine_dirs, "vllm", d)
+    return d
+
+
+def test_parameterize_rewrites_literals_preserving_defaults():
+    out, notes = appmod._parameterize_script_text(_LEGACY)
+    assert "--max-model-len ${VLLM_MAX_MODEL_LEN:-32768}" in out
+    assert "--gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.55}" in out
+    assert "--max-num-seqs ${VLLM_MAX_NUM_SEQS:-4}" in out
+    # The rewrite changes no behaviour: every default is the original literal.
+    assert len(notes) == 3
+
+
+def test_parameterize_idempotent_and_bash_clean(tmp_path):
+    once, _ = appmod._parameterize_script_text(_LEGACY)
+    twice, _ = appmod._parameterize_script_text(once)
+    assert twice == once
+    script = tmp_path / "p.sh"
+    script.write_text(once)
+    assert subprocess.run(["bash", "-n", str(script)]).returncode == 0
+
+
+def test_parameterize_refuses_unparseable_flag():
+    text = _LEGACY.replace("--max-model-len 32768", '--max-model-len "$CTX"')
+    with pytest.raises(appmod.ParameterizeRefused):
+        appmod._parameterize_script_text(text)
+
+
+def test_parameterize_refuses_when_a_target_flag_is_absent():
+    text = _LEGACY.replace(" --max-num-seqs 4", "")
+    with pytest.raises(appmod.ParameterizeRefused):
+        appmod._parameterize_script_text(text)
+
+
+def test_preview_writes_nothing_and_returns_a_diff(profile_dir):
+    script = profile_dir / "start_legacy.sh"
+    script.write_text(_LEGACY)
+    before = hashlib.sha256(script.read_bytes()).hexdigest()
+    res = appmod._parameterize_preview("start_legacy")
+    assert res["changed"] and "VLLM_MAX_MODEL_LEN" in res["diff"]
+    assert res["diff"].startswith("---")
+    assert res["sha256"] == before
+    assert hashlib.sha256(script.read_bytes()).hexdigest() == before
+
+
+def test_apply_with_stale_hash_is_409_and_file_untouched(profile_dir):
+    script = profile_dir / "start_legacy.sh"
+    script.write_text(_LEGACY)
+    stale = appmod._parameterize_preview("start_legacy")["sha256"]
+    script.write_text(_LEGACY + "\n# a concurrent session edited this\n")
+    mutated = hashlib.sha256(script.read_bytes()).hexdigest()
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod._parameterize_apply("start_legacy", stale)
+    assert exc.value.status_code == 409
+    assert hashlib.sha256(script.read_bytes()).hexdigest() == mutated
+    assert not (profile_dir / "start_legacy.sh.bak").exists()
+
+
+def test_apply_writes_backup_and_parameterizes(profile_dir):
+    script = profile_dir / "start_legacy.sh"
+    script.write_text(_LEGACY)
+    prev = appmod._parameterize_preview("start_legacy")
+    res = appmod._parameterize_apply("start_legacy", prev["sha256"])
+    assert res["ok"]
+    bak = profile_dir / "start_legacy.sh.bak"
+    assert bak.exists() and bak.read_text() == _LEGACY
+    assert script.read_text() == prev["proposed"]
+    assert res["profile"]["classification"] in ("legacy", "parameterized")
+    assert not (profile_dir / "start_legacy.sh.tmp").exists()
+    assert script.stat().st_mode & 0o111
+
+
+def test_apply_refuses_unparseable_script_and_leaves_it_untouched(profile_dir):
+    text = _LEGACY.replace("--max-model-len 32768", '--max-model-len "$CTX"')
+    script = profile_dir / "start_hand.sh"
+    script.write_text(text)
+    sha = hashlib.sha256(text.encode()).hexdigest()
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod._parameterize_apply("start_hand", sha)
+    assert exc.value.status_code == 422
+    assert script.read_text() == text
+    assert not (profile_dir / "start_hand.sh.bak").exists()
+
+
+def test_profile_id_traversal_is_rejected(profile_dir):
+    for bad in ("../../etc/passwd", "start_../x", "notstart_foo", ""):
+        with pytest.raises(appmod.HTTPException) as exc:
+            appmod._resolve_profile_script(bad)
+        assert exc.value.status_code in (400, 404)
+
+
+def test_parameterize_endpoints_require_auth():
+    routes = {r.path: r for r in appmod.app.routes if hasattr(r, "dependencies")}
+    for path in ("/api/vllm/profiles/{profile_id}/parameterize/preview",
+                 "/api/vllm/profiles/{profile_id}/parameterize/apply"):
+        deps = routes[path].dependencies
+        assert any(getattr(d, "dependency", None) is appmod.verify_auth for d in deps), path
+
+
+def test_apply_uses_the_atomic_write_idiom():
+    import inspect
+    src = inspect.getsource(appmod._parameterize_apply)
+    assert "os.replace" in src and "os.chmod" in src
+    assert "target.write_text" not in src
