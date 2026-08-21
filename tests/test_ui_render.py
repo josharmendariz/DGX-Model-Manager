@@ -167,3 +167,43 @@ def test_reclaim_cache_is_offered_alongside_the_utilization_control():
     assert APP_SOURCE.count("reclaim-cache") >= 2
     assert "reclaimPageCache" in _fn("renderProfileSettings")
     assert "/api/vllm/reclaim-cache" in _fn("reclaimPageCache")
+
+
+# ── 04-03 fix: classification outranks flag-parseability ──────────────────────
+# `_parse_script_flags` reads literal numbers only, so a recipe wrapper and an
+# already-parameterized script BOTH report three `unparseable` flags. Routing either
+# into the legacy renderer showed "3 of 3 flags could not be read … Parameterizing is
+# refused" over a file that was already in the target state. Observed live on
+# 2026-08-21 against start_hf_qwen3-vl-4b-fp8 (parameterized) and
+# start_hf_qwen_qwen3.6-35b-a3b-fp8 (the production recipe wrapper).
+
+def test_recipe_without_a_header_does_not_fall_through_to_unparseable():
+    body = _fn("renderProfileSettings")
+    assert "p.classification === 'recipe'" in body
+    assert body.index("p.classification === 'recipe'") < body.index(
+        "return renderLegacyProfileSettings(p)"), \
+        "the classification branches must precede the legacy fallback"
+    assert 'data-state="recipe-backed"' in _fn("renderRecipeProfileSettings")
+
+
+def test_parameterized_without_a_header_gets_live_controls():
+    body = _fn("renderProfileSettings")
+    assert "p.classification === 'parameterized'" in body
+    panel = _fn("renderParameterizedProfileSettings")
+    assert 'data-state="editable"' in panel, \
+        "collectProfileOverrides only reads the editable panel"
+    for field in ("max_model_len", "gpu_memory_utilization", "max_num_seqs"):
+        assert f'data-override="{field}"' in panel, field
+    assert "disabled" not in panel
+
+
+def test_parameterized_panel_claims_no_recommendation_it_cannot_make():
+    panel = _fn("renderParameterizedProfileSettings")
+    assert "unparseable" not in panel, "the file is fine; only the regex could not read it"
+    assert "recommend" in panel.lower()
+
+
+def test_meta_error_still_outranks_the_new_classification_branches():
+    """The 04-02 carry-over: meta_error is branched on first, or its test fails."""
+    body = _fn("renderProfileSettings")
+    assert body.index("p.meta_error") < body.index("p.classification === 'recipe'")

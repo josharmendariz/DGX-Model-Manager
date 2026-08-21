@@ -3145,7 +3145,12 @@ def _classify_script(text: str) -> str:
     """
     text = text or ""
     has_marker = _GENERATED_FROM_MARKER in text
-    if has_marker and _PLACEHOLDER_MARKER in text:
+    # The placeholder alone is the evidence — requiring the generated-by marker too made
+    # `parameterize/apply` on a HAND-WRITTEN script (the exact case the feature exists
+    # for) leave it classified `legacy` with three now-`unparseable` flags: no values, no
+    # Parameterize button, a note claiming parameterizing is refused. A dead end reachable
+    # by using the feature as designed. Seen live on start_hf_qwen_qwen3-8b.sh 2026-08-21.
+    if _PLACEHOLDER_MARKER in text:
         return "parameterized"
     if _PF_RECIPE_RE.search(text):
         return "recipe"
@@ -8643,6 +8648,17 @@ function renderProfileSettings(p) {
       <div class="p-set-note">Not adjustable here — ${esc(d.reason || 'the recipe YAML owns these flags')}.</div>
     </div>`;
   }
+  // 04-03 fix: classification is authoritative when there is no `# Derived:` header.
+  // `_parse_script_flags` only reads LITERAL numbers, so a recipe wrapper and an
+  // already-parameterized script both report three `unparseable` flags — which is a
+  // statement about the regex, not about the script. Routing either into the legacy
+  // renderer told the truth about the parser and a lie about the file.
+  if (!d && p.classification === 'recipe') {
+    return renderRecipeProfileSettings();
+  }
+  if (!d && p.classification === 'parameterized') {
+    return renderParameterizedProfileSettings(p);
+  }
   if (!d) return renderLegacyProfileSettings(p);  // 04-03 owns read-only/unparseable.
   const rec = p.recommended || {};
   const recUtil = rec.gpu_memory_utilization != null
@@ -8689,6 +8705,54 @@ const LEGACY_FIELDS = [
   ['util', 'GPU memory util'],
   ['max_num_seqs', 'Max num seqs'],
 ];
+
+// 04-03 fix: a recipe wrapper whose `# Derived:` header is absent. The recipe YAML owns
+// these flags exactly as it does for a header-bearing one, so this reuses the same copy
+// rather than inventing a fourth way to say "not adjustable here".
+function renderRecipeProfileSettings() {
+  return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field"><label>Context</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="&#8212;"></div>
+    </div>
+    <div class="p-set-note">Not adjustable here — the recipe YAML owns these flags.</div>
+  </div>`;
+}
+
+// 04-03 fix: already parameterized, but with no `# Derived:` header — the state every
+// script reaches by going through Parameterize…, since that rewrites flags without
+// generating metadata. Overrides DO work (the script templates all three vars), so the
+// controls are live; what is missing is the derived default, which lives in the script's
+// own `${VAR:-N}` and is deliberately not echoed here — `_parse_script_flags` reads
+// literals only, and a guessed placeholder would be worse than an empty one.
+function renderParameterizedProfileSettings(p) {
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="script default">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization" placeholder="script default">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="script default">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+    </div>
+    <div class="p-set-note">This script is parameterized — per-launch overrides work, and
+      an empty box uses the default written into the script itself. No recommendation or
+      KV-ceiling check is available because it carries no generated metadata; regenerate
+      the profile from its model directory to get those back.</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
 
 function renderLegacyProfileSettings(p) {
   const flags = p.flags || {};

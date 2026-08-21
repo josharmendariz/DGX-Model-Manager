@@ -297,12 +297,30 @@ def test_classify_covers_every_committed_profile(tmp_path):
         assert got in allowed, f"{name}: {got} not in {allowed}"
 
 
-def test_classify_parameterized_requires_marker_and_placeholder():
+def test_classify_parameterized_needs_only_the_placeholder():
+    """The placeholder is the evidence; the generated-by marker is not required.
+
+    Originally this asserted the opposite — placeholder-without-marker was read as "a
+    hand-edit, not our output". `parameterize/apply` invalidated that premise: it
+    rewrites HAND-WRITTEN scripts, which have no marker, so the old rule left its own
+    output classified `legacy` with three `unparseable` flags and no way back.
+    """
     marker = appmod._GENERATED_FROM_MARKER
     body = "docker run --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}\n"
     assert appmod._classify_script(marker + "\n" + body) == "parameterized"
-    # Placeholder without the marker is a hand-edit, not our output.
-    assert appmod._classify_script(body) == "legacy"
+    assert appmod._classify_script(body) == "parameterized"
+
+
+def test_parameterizing_a_hand_written_script_leaves_it_classified_parameterized(tmp_path):
+    """End-to-end on the real defect: apply, then re-classify the bytes written."""
+    script = tmp_path / "start_handwritten.sh"
+    script.write_text("#!/bin/bash\ndocker run -d --name vllm_node \\\n"
+                      "  --gpu-memory-utilization 0.75 \\\n"
+                      "  --max-model-len 32768 --max-num-seqs 8 \\\n")
+    assert appmod._classify_script(script.read_text()) == "legacy"
+    rewritten, notes = appmod._parameterize_script_text(script.read_text())
+    assert notes
+    assert appmod._classify_script(rewritten) == "parameterized"
 
 
 @pytest.mark.parametrize("token,expected", [
