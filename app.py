@@ -542,6 +542,9 @@ def _parse_script_meta(script_path: Path) -> dict:
         # a "Regenerate" button would offer to discard tuning it cannot reproduce. So
         # the affordance is only offered where the script names its own source.
         "regen_path":     _regen_source_dir(text),
+        # Placeholder-only: the defaults baked into `${VLLM_X:-N}`. See
+        # `_parse_templated_defaults` for why this is not folded into `flags`.
+        "script_defaults": _parse_templated_defaults(text),
     }
 
 
@@ -3154,6 +3157,42 @@ def _parse_script_flags(text: str) -> dict:
         else:
             out[key] = values[0]
     return out
+
+
+# The default baked into a `${VLLM_X:-N}` placeholder. Kept SEPARATE from
+# `_parse_script_flags`: there, `${VAR:-N}` is correctly `unparseable`, because that
+# verdict drives classification and the read-only branch, and the flag genuinely is not a
+# literal. But the number is right there in the text, and a parameterized card was showing
+# the word "script default" — truncated to "script defau" by a 110px input — where every
+# other card shows a grey number. Placeholders only; nothing here feeds classification.
+_TEMPLATED_DEFAULT_RE = _re.compile(r"\$\{(VLLM_[A-Z0-9_]+):-([0-9]+(?:\.[0-9]+)?)\}")
+
+# env var → the `data-override` name the card uses, so the two cannot drift apart.
+_ENV_TO_OVERRIDE_KEY = {env: key for key, (env, _v) in _OVERRIDE_ENV.items()}
+
+
+def _parse_templated_defaults(text: str) -> dict:
+    """`{override_key: number}` for each `${VLLM_X:-N}` with a literal default.
+
+    Only the three keys the card can override are reported, and a var whose default is
+    absent or non-numeric (`${VLLM_MAX_MODEL_LEN:-$CTX}`) is simply omitted — an absent
+    placeholder is honest, a guessed one is not.
+    """
+    out: dict = {}
+    for raw_line in (text or "").splitlines():
+        if raw_line.strip().startswith("#"):
+            continue
+        for env_name, token in _TEMPLATED_DEFAULT_RE.findall(raw_line):
+            key = _ENV_TO_OVERRIDE_KEY.get(env_name)
+            if key is None:
+                continue
+            value = float(token) if "." in token else int(token)
+            # A var templated twice with different defaults is ambiguous; show neither.
+            if key in out and out[key] != value:
+                out[key] = None
+            else:
+                out.setdefault(key, value)
+    return {k: v for k, v in out.items() if v is not None}
 
 
 _PLACEHOLDER_MARKER = "${VLLM_MAX_MODEL_LEN"
@@ -8764,29 +8803,36 @@ function renderParameterizedProfileSettings(p) {
     : ` This script does not record a source directory — regenerating it would mean
         replacing it from HF browse → Create vLLM profile, which discards anything
         hand-written in it.`;
+  // The grey number is the script's own `${VAR:-N}` default, so this card reads like
+  // every other one. A var with no literal default falls back to the em dash rather than
+  // to a guess.
+  const sd = p.script_defaults || {};
+  const ph = k => esc(sd[k] != null ? sd[k] : '—');
   return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
     <div class="p-set-row">
       <div class="p-set-field">
         <label>Context</label>
         <input type="number" min="1" step="1" data-override="max_model_len"
-               placeholder="script default">
+               placeholder="${ph('max_model_len')}">
       </div>
       <div class="p-set-field">
         <label>GPU memory util</label>
         <input type="number" min="0.10" max="0.95" step="0.01"
-               data-override="gpu_memory_utilization" placeholder="script default">
+               data-override="gpu_memory_utilization"
+               placeholder="${ph('gpu_memory_utilization')}">
       </div>
       <div class="p-set-field">
         <label>Max num seqs</label>
         <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
-               placeholder="script default">
+               placeholder="${ph('max_num_seqs')}">
       </div>
       <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
       ${regen}
     </div>
     <div class="p-set-note">This script is parameterized — per-launch overrides work, and
-      an empty box uses the default written into the script itself. No recommendation or
-      KV-ceiling check is available because it carries no generated metadata.${regenNote}</div>
+      an empty box uses the grey default written into the script itself. No recommendation
+      or KV-ceiling check is available, because those need the model's own config rather
+      than the script text.${regenNote}</div>
     <div class="p-set-warn"></div>
   </div>`;
 }

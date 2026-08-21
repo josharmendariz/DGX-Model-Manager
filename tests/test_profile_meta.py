@@ -539,3 +539,51 @@ def test_regen_source_dir_does_not_stat_the_filesystem():
     body = src.split('"""')[-1]
     for banned in ("is_dir", "exists", "Path("):
         assert banned not in body, banned
+
+
+# ── 04-03 follow-up: templated defaults feed the placeholders ─────────────────
+
+def test_templated_defaults_are_read_from_the_placeholder():
+    text = ("docker run --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.75} \\\n"
+            "  --max-model-len ${VLLM_MAX_MODEL_LEN:-32768} "
+            "--max-num-seqs ${VLLM_MAX_NUM_SEQS:-8}\n")
+    assert appmod._parse_templated_defaults(text) == {
+        "max_model_len": 32768, "gpu_memory_utilization": 0.75, "max_num_seqs": 8}
+
+
+def test_templated_defaults_stay_out_of_the_flags_verdict():
+    """`flags` still says unparseable — that verdict drives classification."""
+    text = "docker run --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}\n"
+    assert appmod._parse_script_flags(text)["max_model_len"] == UNPARSEABLE
+    assert appmod._parse_templated_defaults(text)["max_model_len"] == 32768
+
+
+def test_non_literal_default_is_omitted_not_guessed():
+    text = "--max-model-len ${VLLM_MAX_MODEL_LEN:-$CTX} --max-num-seqs ${VLLM_MAX_NUM_SEQS:-4}\n"
+    out = appmod._parse_templated_defaults(text)
+    assert "max_model_len" not in out
+    assert out["max_num_seqs"] == 4
+
+
+def test_conflicting_templated_defaults_show_neither():
+    text = ("--max-model-len ${VLLM_MAX_MODEL_LEN:-32768}\n"
+            "--max-model-len ${VLLM_MAX_MODEL_LEN:-8192}\n")
+    assert appmod._parse_templated_defaults(text) == {}
+
+
+def test_commented_out_placeholder_is_ignored():
+    assert appmod._parse_templated_defaults(
+        "# --max-model-len ${VLLM_MAX_MODEL_LEN:-999}\n") == {}
+
+
+def test_env_to_override_key_map_cannot_drift_from_the_allow_list():
+    assert set(appmod._ENV_TO_OVERRIDE_KEY.values()) == set(appmod._OVERRIDE_ENV)
+
+
+def test_parameterized_profile_exposes_script_defaults(tmp_path):
+    script = tmp_path / "start_x.sh"
+    script.write_text("#!/bin/bash\ndocker run "
+                      "--max-model-len ${VLLM_MAX_MODEL_LEN:-16384}\n")
+    meta = appmod._parse_script_meta(script)
+    assert meta["classification"] == "parameterized"
+    assert meta["script_defaults"]["max_model_len"] == 16384
