@@ -432,6 +432,23 @@ async def _restart_litellm_backend() -> tuple[bool, str]:
     return True, "systemd unit restarted"
 
 
+def _regen_source_dir(text: str) -> str | None:
+    """The `# Auto-generated … from:` launch dir, read from text we already hold.
+
+    Deliberately string-only: `_parse_script_meta` sits on the hot list path and must not
+    stat the filesystem (T-04-08), so this does NOT check that the directory still
+    exists. A vanished dir surfaces as an error from `from-hf` at click time rather than
+    as a stat per profile per list render.
+    """
+    lines = (text or "").splitlines()[:20]
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(_GENERATED_FROM_MARKER):
+            if idx + 1 < len(lines) and lines[idx + 1].startswith("# "):
+                candidate = lines[idx + 1][2:].strip()
+                return candidate or None
+    return None
+
+
 def _parse_script_meta(script_path: Path) -> dict:
     """Derive profile metadata from a start_*.sh script.
 
@@ -519,6 +536,12 @@ def _parse_script_meta(script_path: Path) -> dict:
         # legacy script parsed values to render read-only (or `unparseable`).
         "classification": _classify_script(text),
         "flags":          _parse_script_flags(text),
+        # 04-03 follow-up: the launch dir to regenerate FROM, or None when regenerating
+        # would not be safe. `from-hf` refuses (409) when the target script does not
+        # already reference the dir, which is exactly the hand-written case — and there
+        # a "Regenerate" button would offer to discard tuning it cannot reproduce. So
+        # the affordance is only offered where the script names its own source.
+        "regen_path":     _regen_source_dir(text),
     }
 
 
@@ -8727,6 +8750,20 @@ function renderRecipeProfileSettings() {
 // own `${VAR:-N}` and is deliberately not echoed here — `_parse_script_flags` reads
 // literals only, and a guessed placeholder would be worse than an empty one.
 function renderParameterizedProfileSettings(p) {
+  // The button is offered ONLY when the script names its own source dir. Without that,
+  // `from-hf` would 409 (or worse, silently replace a hand-tuned script), so the note
+  // points at where regeneration actually lives instead of at a control that isn't there.
+  const regen = p.regen_path
+    ? `<button class="btn btn-sm" onclick="regenerateProfile('${
+         esc(String(p.id).replace(/'/g, "\\'"))}','${
+         esc(String(p.regen_path).replace(/'/g, "\\'"))}')">Regenerate metadata</button>`
+    : '';
+  const regenNote = p.regen_path
+    ? ` "Regenerate metadata" rebuilds it from ${esc(p.regen_path)}, keeping the
+        parameterized flags.`
+    : ` This script does not record a source directory — regenerating it would mean
+        replacing it from HF browse → Create vLLM profile, which discards anything
+        hand-written in it.`;
   return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
     <div class="p-set-row">
       <div class="p-set-field">
@@ -8745,11 +8782,11 @@ function renderParameterizedProfileSettings(p) {
                placeholder="script default">
       </div>
       <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+      ${regen}
     </div>
     <div class="p-set-note">This script is parameterized — per-launch overrides work, and
       an empty box uses the default written into the script itself. No recommendation or
-      KV-ceiling check is available because it carries no generated metadata; regenerate
-      the profile from its model directory to get those back.</div>
+      KV-ceiling check is available because it carries no generated metadata.${regenNote}</div>
     <div class="p-set-warn"></div>
   </div>`;
 }
@@ -8788,6 +8825,23 @@ function renderLegacyProfileSettings(p) {
 // Preview FIRST, always. The server builds the diff and hands back a sha256 of the file
 // it read; apply sends that hash straight back and the server refuses (409) if the file
 // moved underneath us — ~6 concurrent sessions share this profile directory.
+// Rebuilds the `# Derived:` / `# Recommended:` / `# Warnings:` headers a parameterized
+// script lacks, by regenerating it from the launch dir it names. Only ever called with a
+// `regen_path` the server supplied, so the from-hf 409 guard (target exists with
+// different contents) cannot fire — the script already references that dir.
+async function regenerateProfile(profileId, path) {
+  if (!confirm('Regenerate ' + profileId + '.sh from ' + path + '?\n\n'
+               + 'This rewrites the script from its model directory, restoring the '
+               + 'derived defaults, recommendation and KV-ceiling warnings.')) return;
+  try {
+    await apiFetch('/api/vllm/profiles/from-hf', 'POST', {path: path});
+    toast('✓ Regenerated ' + profileId, 'ok');
+    await loadEngineProfiles(engines.vllm);
+  } catch (e) {
+    toast('Regenerate failed: ' + e.message, 'err');
+  }
+}
+
 async function parameterizeProfile(profileId) {
   try {
     const prev = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)

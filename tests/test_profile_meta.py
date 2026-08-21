@@ -1,5 +1,7 @@
 """Tests for profile script parsing and model metadata inference."""
 
+import inspect
+
 import app as appmod
 
 
@@ -512,3 +514,28 @@ def test_apply_uses_the_atomic_write_idiom():
     src = inspect.getsource(appmod._parameterize_apply)
     assert "os.replace" in src and "os.chmod" in src
     assert "target.write_text" not in src
+
+
+# ── 04-03 follow-up: regenerate is offered only where it is safe ──────────────
+
+def test_regen_path_is_the_dir_the_script_names(tmp_path):
+    script = tmp_path / "start_x.sh"
+    script.write_text(f"#!/bin/bash\n{appmod._GENERATED_FROM_MARKER}\n"
+                      "# /mnt/models/thing\nset -e\n")
+    assert appmod._parse_script_meta(script)["regen_path"] == "/mnt/models/thing"
+
+
+def test_hand_written_script_offers_no_regen_path(tmp_path):
+    """No marker means from-hf would 409 — or replace tuning it cannot reproduce."""
+    script = tmp_path / "start_handwritten.sh"
+    script.write_text("#!/bin/bash\n# Name: hand tuned\ndocker run -d --gpus all\n")
+    assert appmod._parse_script_meta(script)["regen_path"] is None
+
+
+def test_regen_source_dir_does_not_stat_the_filesystem():
+    """T-04-08: this sits on the hot list path, so it must stay string-only."""
+    src = inspect.getsource(appmod._regen_source_dir)
+    # Strip the docstring: prose ABOUT not statting must not satisfy — or fail — the gate.
+    body = src.split('"""')[-1]
+    for banned in ("is_dir", "exists", "Path("):
+        assert banned not in body, banned
