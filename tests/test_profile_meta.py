@@ -240,3 +240,112 @@ def test_parse_script_meta_does_no_filesystem_reads_beyond_the_script(tmp_path):
                       "_derive_launch_spec", "open("):
         assert forbidden not in source, f"{forbidden} must not appear in _parse_script_meta"
     assert source.count("read_text()") == 1
+
+
+# ── _parse_script_flags / _classify_script (04-03) ────────────────────────────
+
+import pathlib
+
+import pytest
+
+UNPARSEABLE = appmod.UNPARSEABLE
+_REPO_PROFILES = pathlib.Path(appmod.__file__).parent / "profiles" / "vLLM"
+
+# Expected class per committed script. Derived by inspection, not by running the
+# classifier — this table is the oracle, so it must not be generated from the code.
+_EXPECTED_CLASSES = {
+    "start_hf_deepseek-ai_deepseek-r1-distill-qwen-14b.sh": "generated",
+    "start_hf_deepseek-ai_deepseek-r1-distill-qwen-32b.sh": "generated",
+    "start_hf_lyf_qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-nvfp4.sh": "generated",
+    "start_hf_openai_gpt-oss-120b.sh": "legacy",
+    "start_hf_qwen2.5-14b-instruct-gptq-int8.sh": "generated",
+    "start_hf_qwen3-vl-4b-fp8.sh": "generated",
+    "start_hf_qwen_qwen3-14b.sh": "legacy",
+    "start_hf_qwen_qwen3.6-35b-a3b-fp8.sh": "recipe",
+    "start_hf_qwen_qwen3-8b.sh": "legacy",
+    "start_nemotron_nano.sh": "legacy",
+    "start_nemotron_super.sh": "legacy",
+    "start_qwen3_coder_next.sh": "legacy",
+    "start_qwen3_next_80b.sh": "legacy",
+}
+
+
+def test_classify_covers_every_committed_profile(tmp_path):
+    """Copied into tmp_path so the classifier is proved text-only — no live reads."""
+    names = sorted(p.name for p in _REPO_PROFILES.glob("start_*.sh"))
+    assert names == sorted(_EXPECTED_CLASSES), "profile set changed; update the oracle"
+    for name, expected in _EXPECTED_CLASSES.items():
+        copy = tmp_path / name
+        copy.write_text((_REPO_PROFILES / name).read_text())
+        assert appmod._classify_script(copy.read_text()) == expected, name
+
+
+def test_classify_parameterized_requires_marker_and_placeholder():
+    marker = appmod._GENERATED_FROM_MARKER
+    body = "docker run --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}\n"
+    assert appmod._classify_script(marker + "\n" + body) == "parameterized"
+    # Placeholder without the marker is a hand-edit, not our output.
+    assert appmod._classify_script(body) == "legacy"
+
+
+@pytest.mark.parametrize("token,expected", [
+    ("32768", 32768),
+    ("$VLLM_MAX_MODEL_LEN", UNPARSEABLE),
+    ("${VLLM_MAX_MODEL_LEN:-32768}", UNPARSEABLE),
+    ("$(cat x)", UNPARSEABLE),
+    ('"$CTX"', UNPARSEABLE),
+])
+def test_parse_flags_literal_vs_expansion(token, expected):
+    text = f"docker run --max-model-len {token} --served-model-name m\n"
+    assert appmod._parse_script_flags(text)["max_model_len"] == expected
+
+
+def test_parse_flags_absent_is_unparseable():
+    flags = appmod._parse_script_flags("docker run --model foo\n")
+    assert flags == {"max_model_len": UNPARSEABLE, "util": UNPARSEABLE,
+                     "max_num_seqs": UNPARSEABLE}
+
+
+def test_parse_flags_conflicting_duplicates_are_unparseable():
+    text = "docker run --max-model-len 32768\ndocker run --max-model-len 65536\n"
+    assert appmod._parse_script_flags(text)["max_model_len"] == UNPARSEABLE
+
+
+def test_parse_flags_identical_duplicates_resolve():
+    text = "docker run --max-model-len 32768\necho --max-model-len 32768\n"
+    assert appmod._parse_script_flags(text)["max_model_len"] == 32768
+
+
+def test_parse_flags_llamacpp_array_shape_is_unparseable():
+    """The `ARGS=( --flag "$VAR" )` shape must fail safe, not report a value."""
+    text = 'ARGS=( --max-model-len "$CTX" --max-num-seqs "$SEQS" )\n"${ARGS[@]}"\n'
+    flags = appmod._parse_script_flags(text)
+    assert flags["max_model_len"] == UNPARSEABLE
+    assert flags["max_num_seqs"] == UNPARSEABLE
+
+
+def test_parse_flags_reads_all_three_and_a_float_util():
+    text = ("docker run --gpu-memory-utilization 0.55 \\\n"
+            "  --max-model-len 32768 --max-num-seqs 4\n")
+    assert appmod._parse_script_flags(text) == {
+        "max_model_len": 32768, "util": 0.55, "max_num_seqs": 4}
+
+
+def test_parse_flags_ignores_comment_lines():
+    text = "# --max-model-len 999999 in an earlier revision\ndocker run --max-model-len 8192\n"
+    assert appmod._parse_script_flags(text)["max_model_len"] == 8192
+
+
+def test_parse_script_meta_surfaces_classification_and_flags(tmp_path):
+    script = _write_script(tmp_path, "start_legacy.sh", (
+        "#!/bin/bash\n# Name: Legacy\n"
+        "docker run --gpu-memory-utilization 0.55 --max-model-len 32768 --max-num-seqs 4\n"))
+    meta = appmod._parse_script_meta(script)
+    assert meta["classification"] == "legacy"
+    assert meta["flags"]["max_model_len"] == 32768
+
+
+def test_parse_script_flags_uses_no_third_party_import():
+    import inspect
+    src = inspect.getsource(appmod._parse_script_flags)
+    assert "import " not in src
