@@ -108,7 +108,7 @@ Copy `config.example.json` to `config.json` and edit as needed. The repo ships w
     "litellm_base":  "http://127.0.0.1:4000",
     "sglang_base":   "http://127.0.0.1:30000",
     "vllm_base":     "http://127.0.0.1:8000",
-    "llamacpp_base": "http://127.0.0.1:8080",
+    "llamacpp_base": "http://127.0.0.1:8081",
     "localai_base":  "http://127.0.0.1:9090",
     "comfyui_base":  "http://127.0.0.1:8188"
   },
