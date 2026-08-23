@@ -16,6 +16,8 @@ These tests encode the rule that survived the cleanup: an alias may abbreviate w
 routes to, but it may not contradict it.
 """
 
+from pathlib import Path
+
 import pytest
 
 yaml = pytest.importorskip("yaml")
@@ -114,6 +116,57 @@ def test_live_config_has_no_impersonations():
 
     names = [e["model_name"] for e in model_list]
     assert len(names) == len(set(names)), f"duplicate model_name in {path}"
+
+
+def _model_lists_in(path):
+    """Yield every model_list in a file: a bare router config, or a ConfigMap wrapping one."""
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except Exception:
+        return
+    if not isinstance(doc, dict):
+        return
+    if isinstance(doc.get("model_list"), list):
+        yield doc["model_list"]
+    for value in (doc.get("data") or {}).values():
+        if not isinstance(value, str) or "model_list" not in value:
+            continue
+        try:
+            inner = yaml.safe_load(value)
+        except Exception:
+            continue
+        if isinstance(inner, dict) and isinstance(inner.get("model_list"), list):
+            yield inner["model_list"]
+
+
+# Every router config on this host, not just the one DMM syncs. On 2026-08-23 six
+# impersonating aliases were found in k8s/codernext-activator/litellm-config.repoint.yaml
+# and four more in an uncommitted ConfigMap — both invisible to the single-file check
+# above, which is why the 2026-08-20 cleanup did not stay clean.
+_ROUTER_CONFIG_ROOTS = [
+    Path.home() / "dgx-stack",
+    Path.home() / "wt-phase2",
+    Path.home() / "ai-infra",
+]
+
+
+def test_every_router_config_on_host_is_clean():
+    checked, bad = [], {}
+    for root in _ROUTER_CONFIG_ROOTS:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*litellm*.y*ml"):
+            if ".git" in path.parts:
+                continue
+            for model_list in _model_lists_in(path):
+                checked.append(path)
+                found = _impersonations(model_list)
+                if found:
+                    bad.setdefault(str(path), []).extend(found)
+
+    if not checked:
+        pytest.skip("no router configs found on this host")
+    assert not bad, f"impersonating aliases: {bad}"
 
 
 def test_helix_mandatory_aliases_present():
