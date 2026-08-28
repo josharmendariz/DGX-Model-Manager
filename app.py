@@ -2529,6 +2529,49 @@ async def run_alert_check():
         "webhook_configured": "discord" in channels,
     }
 
+
+# ── Image drift ───────────────────────────────────────────────────────────────
+#
+# Detection only. The checker cannot mutate the cluster (tests assert it holds
+# no kubectl write verbs); applying an upgrade is the manual procedure in
+# ai-infra/k8s/inference/UPGRADING.md. The gap this closes is purely knowing --
+# litellm ran 47 minor versions behind for months with nothing reporting it.
+
+_image_check_lock = asyncio.Lock()
+
+
+@app.get("/api/images/drift")
+async def get_image_drift():
+    """Last drift report from disk. No network, safe to poll from the UI."""
+    import image_updates
+    return await asyncio.to_thread(image_updates.load_report)
+
+
+@app.post("/api/images/check", dependencies=[Depends(verify_auth)])
+async def run_image_check():
+    """Re-run the drift check against upstream, then route findings to alerts.
+
+    Alerts are keyed on `image_update:<deployment>:<version>`, which is also the
+    cooldown key in _send_alerts, so each new release notifies once and then
+    stays quiet across restarts.
+    """
+    if _image_check_lock.locked():
+        raise HTTPException(409, "An image check is already running")
+    async with _image_check_lock:
+        import image_updates
+        try:
+            report = await asyncio.to_thread(image_updates.check)
+        except Exception as e:
+            _logger.error("Image drift check failed: %s", e)
+            raise HTTPException(500, f"Image check failed: {e}")
+        alerts = image_updates.to_alerts(report)
+        sent = await asyncio.to_thread(_send_alerts, alerts, False)
+        outdated = [r for r in report.get("rows", []) if r.get("status") == "outdated"]
+        _logger.info("Image drift check: %d outdated, %d alert(s) sent",
+                     len(outdated), len(sent))
+        return {**report, "alerts": alerts, "sent": sent}
+
+
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scriptdirs")
@@ -6927,6 +6970,10 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       <span class="nav-icon">💡</span>Recommendations
       <span class="nav-badge" id="badge-recs">—</span>
     </div>
+    <div class="nav-item" id="nav-updates" onclick="switchTab('updates')">
+      <span class="nav-icon">📦</span>Updates
+      <span class="nav-badge" id="badge-updates">—</span>
+    </div>
     <div class="nav-section-label">Routing</div>
     <div class="nav-item" id="nav-litellm" onclick="switchTab('litellm')">
       <span class="nav-icon">⚡</span>LiteLLM
@@ -7491,6 +7538,21 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <div class="tab" id="tab-updates">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Image Updates</div>
+          <div class="page-sub">How far each <code>llm-inference</code> image is behind upstream. Read-only &mdash; apply via <code>ai-infra/k8s/inference/UPGRADING.md</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="updates-refresh-btn" onclick="refreshImageDrift()"
+                title="Query GitHub / Docker Hub for the newest release in each image's version track (~10-30s). Reports only; nothing is applied.">&#8635; Check now</button>
+      </div>
+      <div id="updates-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="updates-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
@@ -7650,6 +7712,7 @@ function switchTab(name) {
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
   else if (name === 'recs') { loadRecommendations(); loadProposed(); }
+  else if (name === 'updates') { loadImageDrift(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7937,6 +8000,103 @@ async function refreshKB() {
     toast(n ? '✓ ' + n + ' proposal(s) — review below' : 'No new proposals', n ? 'ok' : '');
   } catch(e) {
     toast('Refresh failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image drift — read-only. Every row is a statement about upstream, never an
+// action: there is no apply button here by design, because the risky half of an
+// upgrade (forward-only schema migrations) needs a human and a PVC backup.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _DRIFT_LABEL = {
+  outdated: ['Update available', 'var(--warn, #d98324)'],
+  current:  ['Up to date',       'var(--ok, #3fa66a)'],
+  unknown:  ['Unresolved',       'var(--muted)'],
+  partial:  ['Floating tag',     'var(--muted)'],
+  rolling:  ['Rolling tag',      'var(--muted)'],
+  digest:   ['Digest-pinned',    'var(--muted)'],
+};
+
+function renderImageDrift(d) {
+  const root = document.getElementById('updates-root');
+  const meta = document.getElementById('updates-meta');
+  const rows = (d && d.rows) || [];
+
+  if (!rows.length) {
+    root.innerHTML = '<div class="empty">' +
+      (d && d.exists === false
+        ? 'No report yet — press <b>Check now</b>.'
+        : esc((d && (d.errors || [])[0]) || 'No images found.')) + '</div>';
+    meta.textContent = '';
+    document.getElementById('badge-updates').textContent = '—';
+    return;
+  }
+
+  const order = {outdated:0, unknown:1, current:2, partial:3, rolling:4, digest:5};
+  rows.sort((a,b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) ||
+                     a.deployment.localeCompare(b.deployment));
+
+  const outdated = rows.filter(r => r.status === 'outdated').length;
+  document.getElementById('badge-updates').textContent = outdated || '0';
+
+  let html = '<div class="inv-table-wrap" style="border-radius:8px;border:1px solid var(--border)">' +
+             '<table class="inv-table"><thead><tr>' +
+             '<th>Deployment</th><th>Running</th><th>Latest in track</th><th>Status</th>' +
+             '</tr></thead><tbody>';
+  for (const r of rows) {
+    const [label, color] = _DRIFT_LABEL[r.status] || [r.status, 'var(--muted)'];
+    const running = r.tag || (r.image || '').split('@')[1] || '—';
+    let latest = r.latest ? esc(r.latest) : '<span style="color:var(--muted)">—</span>';
+    if (r.latest && r.verified === false) latest += ' <span title="Not present in the registry tag list — confirm before applying">*</span>';
+    html += '<tr><td><b>' + esc(r.deployment) + '</b></td>' +
+            '<td><code>' + esc(running) + '</code></td>' +
+            '<td><code>' + latest + '</code></td>' +
+            '<td style="color:' + color + '">' + esc(label) + '</td></tr>';
+    if (r.note) {
+      html += '<tr><td></td><td colspan="3" class="page-sub" style="padding-top:0">' +
+              esc(r.note) + '</td></tr>';
+    }
+  }
+  html += '</tbody></table></div>';
+
+  const stale = rows.filter(r => r.status === 'unknown').length;
+  html += '<div class="page-sub" style="margin-top:10px">' +
+    'Comparison stays inside each image’s version track, so a major-version move ' +
+    '(Postgres 15→16, Prometheus v2→v3) is deliberately not shown as an update — ' +
+    'those are migrations, not bumps. Floating and digest-pinned tags have nothing to compare against.' +
+    (stale ? ' <b>' + stale + '</b> image(s) could not be resolved upstream.' : '') +
+    '</div>';
+  root.innerHTML = html;
+
+  if (d.checked_at) {
+    const when = new Date(d.checked_at * 1000);
+    meta.textContent = outdated + ' of ' + rows.length + ' image(s) behind upstream · checked ' +
+                       when.toLocaleString();
+  }
+}
+
+async function loadImageDrift() {
+  try {
+    renderImageDrift(await apiFetch('/api/images/drift'));
+  } catch(e) { /* non-fatal: panel shows its empty state */ }
+}
+
+async function refreshImageDrift() {
+  const btn = document.getElementById('updates-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Checking…';
+  try {
+    const d = await apiFetch('/api/images/check', 'POST');
+    renderImageDrift(d);
+    const n = (d.rows || []).filter(r => r.status === 'outdated').length;
+    toast(n ? '✓ ' + n + ' image(s) behind upstream' : '✓ All tracked images current', n ? '' : 'ok');
+  } catch(e) {
+    toast('Image check failed: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
     btn.innerHTML = orig;

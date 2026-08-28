@@ -6,43 +6,71 @@
     "grafana_url": ""
   },
   "services": {
-    "ollama_base":   "http://127.0.0.1:11434",
-    "litellm_base":  "http://127.0.0.1:4000",
-    "sglang_base":   "http://127.0.0.1:30000",
-    "vllm_base":     "http://127.0.0.1:8000",
+    "ollama_base": "http://127.0.0.1:11434",
+    "litellm_base": "http://127.0.0.1:4000",
+    "sglang_base": "http://127.0.0.1:30000",
+    "vllm_base": "http://127.0.0.1:8000",
     "llamacpp_base": "http://127.0.0.1:8081",
-    "localai_base":  "http://127.0.0.1:9090",
-    "comfyui_base":  "http://127.0.0.1:8188"
+    "localai_base": "http://127.0.0.1:9090",
+    "comfyui_base": "http://127.0.0.1:8188"
   },
   "vllm": {
-    "_comment": "Optional — defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
-    "_comment_serve": "serve_command is normally omitted — it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
-    "image":         "vllm/vllm-openai:v0.20.0",
+    "_comment": "Optional \u2014 defaults for auto-generated vLLM profiles. image overrides the stock vllm/vllm-openai tag; image_gpt_oss overrides the gpt-oss image. Set moe_backend to \"\" to omit --moe-backend entirely and let vLLM autoselect (recommended on GB10/sm_121, where the Marlin MoE kernel miscomputes for some architectures).",
+    "_comment_serve": "serve_command is normally omitted \u2014 it is derived from the image, because whether an explicit 'vllm serve' is needed is a property of the image's entrypoint, not of the model. vllm-openai images serve on entrypoint (derives to \"\"); images that exec their arguments, such as eugr/spark-vllm, need 'vllm serve'. Set explicitly to override, including \"\" to add nothing.",
+    "image": "vllm/vllm-openai:v0.20.0",
     "image_gpt_oss": "eugr/spark-vllm:latest",
-    "moe_backend":   "marlin"
+    "moe_backend": "marlin"
   },
   "llamacpp": {
-    "_comment": "Optional — the GGUF quant ladder. One profile script covers a whole repo's quants, so the quant/ctx/spec choice is data the UI enumerates and passes as RECIPE, not a script per combination. vram_gb is what admission checks, so keep it honest.",
-    "_comment_spec": "spec: embedded = the NextN/MTP head baked into the target GGUF, works on a stock build. fastmtp = a separate sidecar GGUF, which needs fastmtp_image — an image built from the release patch. Verified 2026-08-20: the stock upstream image rejects the sidecar (expected 5120, 248320, got 5120, 32768), so the patched build is genuinely required.",
-    "image":          "ghcr.io/ggml-org/llama.cpp:server-cuda",
-    "fastmtp_image":  "127.0.0.1:5000/llama.cpp-fastmtp:latest",
+    "_comment": "Optional \u2014 the GGUF quant ladder. One profile script covers a whole repo's quants, so the quant/ctx/spec choice is data the UI enumerates and passes as RECIPE, not a script per combination. vram_gb is what admission checks, so keep it honest.",
+    "_comment_spec": "spec: embedded = the NextN/MTP head baked into the target GGUF, works on a stock build. fastmtp = a separate sidecar GGUF, which needs fastmtp_image \u2014 an image built from the release patch. Verified 2026-08-20: the stock upstream image rejects the sidecar (expected 5120, 248320, got 5120, 32768), so the patched build is genuinely required.",
+    "image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+    "fastmtp_image": "127.0.0.1:5000/llama.cpp-fastmtp:latest",
     "container_name": "llamacpp_node",
     "default_recipe": "balanced",
     "recipes": {
-      "balanced": {"quant": "Q6_K_P", "ctx": 65536, "spec": "embedded", "vision": true,  "vram_gb": 31, "desc": "Default. Near-Q8 quality, holds up on tool-calling."},
-      "coexist":  {"quant": "Q4_K_P", "ctx": 32768, "spec": "embedded", "vision": true,  "vram_gb": 23, "desc": "Fits beside a large vLLM model. Run both engines at once."},
-      "longctx":  {"quant": "Q4_K_P", "ctx": 204800, "spec": "embedded", "vision": false, "vram_gb": 60, "desc": "Max native context. KV dominates; vision off for headroom."}
+      "balanced": {
+        "quant": "Q6_K_P",
+        "ctx": 65536,
+        "spec": "embedded",
+        "vision": true,
+        "vram_gb": 31,
+        "desc": "Default. Near-Q8 quality, holds up on tool-calling."
+      },
+      "coexist": {
+        "quant": "Q4_K_P",
+        "ctx": 32768,
+        "spec": "embedded",
+        "vision": true,
+        "vram_gb": 23,
+        "desc": "Fits beside a large vLLM model. Run both engines at once."
+      },
+      "longctx": {
+        "quant": "Q4_K_P",
+        "ctx": 204800,
+        "spec": "embedded",
+        "vision": false,
+        "vram_gb": 60,
+        "desc": "Max native context. KV dominates; vision off for headroom."
+      }
     }
+  },
+  "image_updates": {
+    "enabled": true,
+    "namespace": "llm-inference",
+    "interval_s": 86400,
+    "tracks": {},
+    "github_repos": {}
   },
   "paths": {
     "_comment": "vllm_scripts and llamacpp_scripts are where generated profile scripts are written and scanned from; relative paths resolve against $HOME.",
-    "litellm_config":   "~/litellm/litellm_config.yaml",
-    "hf_cache":         "~/.cache/huggingface/hub",
-    "vllm_scripts":     "DGX-Model-Manager/profiles/vLLM",
+    "litellm_config": "~/litellm/litellm_config.yaml",
+    "hf_cache": "~/.cache/huggingface/hub",
+    "vllm_scripts": "DGX-Model-Manager/profiles/vLLM",
     "llamacpp_scripts": "DGX-Model-Manager/profiles/llama.cpp"
   },
   "alerts": {
-    "_comment": "All keys optional — omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
+    "_comment": "All keys optional \u2014 omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
     "enabled": true,
     "interval_s": 300,
     "cooldown_s": 1800,
@@ -50,10 +78,18 @@
       "memory_percent": 90,
       "endpoint_failures": 2
     },
-    "endpoints": ["vllm", "litellm"],
+    "endpoints": [
+      "vllm",
+      "litellm"
+    ],
     "channels": {
-      "discord": {"enabled": true, "webhook_url": ""},
-      "log":     {"enabled": false}
+      "discord": {
+        "enabled": true,
+        "webhook_url": ""
+      },
+      "log": {
+        "enabled": false
+      }
     }
   },
   "sites_discovery": {
@@ -67,8 +103,20 @@
     "include_ports": []
   },
   "sites": [
-    {"_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see — a UI on another host. Ports resolve against app.sites_base → app.host → the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."},
-    {"name": "Grafana",   "port": 3000, "group": "Metrics", "desc": "Metrics dashboards"},
-    {"name": "Other Box", "url": "https://otherhost.example:8443", "group": "Ops", "desc": "Dashboard on a different host"}
+    {
+      "_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see \u2014 a UI on another host. Ports resolve against app.sites_base \u2192 app.host \u2192 the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."
+    },
+    {
+      "name": "Grafana",
+      "port": 3000,
+      "group": "Metrics",
+      "desc": "Metrics dashboards"
+    },
+    {
+      "name": "Other Box",
+      "url": "https://otherhost.example:8443",
+      "group": "Ops",
+      "desc": "Dashboard on a different host"
+    }
   ]
 }
