@@ -9,7 +9,7 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
+exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
   -v "/mnt/models/qwen2.5-14b-instruct-gptq-int8:/models/qwen2.5-14b-instruct-gptq-int8:ro" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \

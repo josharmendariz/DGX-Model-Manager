@@ -9,7 +9,7 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --gpus all -p 8000:8000 \
+exec docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
