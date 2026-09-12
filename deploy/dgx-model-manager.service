@@ -3,6 +3,7 @@ Description=DGX Model Manager (LLM engine control UI, port 8090)
 Documentation=https://github.com/josharmendariz/DGX-Model-Manager
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -18,7 +19,6 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show tailscale0 2>/dev
 ExecStart=/usr/bin/python3 /home/josh/DGX-Model-Manager/app.py
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 # Health-gate the restart loop — / serves the UI without auth.
 ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://100.115.54.83:8090/ >/dev/null && exit 0; sleep 1; done; exit 1'
 
