@@ -129,6 +129,21 @@ def _plain_model(tmp_path, name="plain"):
     return model_dir
 
 
+def _configure_qwen36_recipe(tmp_path, monkeypatch):
+    """Give recipe-specific tests an explicit, self-contained operator config."""
+    recipe_dir = tmp_path / "recipes"
+    recipe_dir.mkdir()
+    (recipe_dir / "qwen3.6-35b-a3b-fp8-solo.yaml").write_text(
+        "name: Qwen 3.6 solo\n"
+        "model: Qwen/Qwen3.6-35B-A3B-FP8\n"
+        "command: vllm serve Qwen/Qwen3.6-35B-A3B-FP8 --port 8000\n"
+    )
+    monkeypatch.setitem(appmod._app_config, "vllm", {
+        "recipe_dir": str(recipe_dir),
+        "recipes": {"Qwen/Qwen3.6-*": "qwen3.6-35b-a3b-fp8-solo"},
+    })
+
+
 def test_exec_args_image_gets_explicit_serve_for_non_gpt_oss(tmp_path, monkeypatch):
     """The bug: `vllm serve` was gated on gpt-oss, so every other model was unlaunchable
     whenever vllm.image pointed at an image whose entrypoint execs its arguments."""
@@ -382,9 +397,10 @@ def test_parameterized_script_still_parses_as_bash(tmp_path):
     assert _bash_syntax_ok(tmp_path, script)
 
 
-def test_recipe_shape_is_left_unparameterized(tmp_path):
+def test_recipe_shape_is_left_unparameterized(tmp_path, monkeypatch):
     """`run-recipe.sh` lives in another repo; emitting placeholders it never reads
     would advertise a knob that does nothing."""
+    _configure_qwen36_recipe(tmp_path, monkeypatch)
     model_dir = _plain_model(tmp_path, "recipe-shape")
     _, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
 
@@ -493,9 +509,10 @@ def test_warnings_round_trip_without_a_literal_newline(tmp_path):
     assert len(warnings) == len(info["warnings"])
 
 
-def test_recipe_backed_header_declares_itself_non_editable(tmp_path):
+def test_recipe_backed_header_declares_itself_non_editable(tmp_path, monkeypatch):
     import json as _json
 
+    _configure_qwen36_recipe(tmp_path, monkeypatch)
     model_dir = _plain_model(tmp_path, "meta-recipe")
     _, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
 

@@ -1,6 +1,7 @@
 """Tests for profile script parsing and model metadata inference."""
 
 import inspect
+from pathlib import Path
 
 import app as appmod
 
@@ -287,9 +288,23 @@ def _committed_text(name):
     return out.stdout
 
 
+def _committed_profile_names():
+    """Return profile scripts tracked by HEAD, ignoring shared-checkout work."""
+    import subprocess
+    out = subprocess.run(
+        ["git", "ls-tree", "--name-only", "HEAD", "profiles/vLLM/"],
+        cwd=_REPO_PROFILES.parents[1], capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    return sorted(
+        Path(line).name for line in out.stdout.splitlines()
+        if Path(line).name.startswith("start_") and line.endswith(".sh")
+    )
+
+
 def test_classify_covers_every_committed_profile(tmp_path):
     """Copied into tmp_path so the classifier is proved text-only — no live reads."""
-    names = sorted(p.name for p in _REPO_PROFILES.glob("start_*.sh"))
+    names = _committed_profile_names()
     assert names == sorted(_EXPECTED_CLASSES), "profile set changed; update the oracle"
     for name, expected in _EXPECTED_CLASSES.items():
         copy = tmp_path / name
