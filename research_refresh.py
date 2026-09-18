@@ -118,14 +118,18 @@ def _fetch(url: str, limit: int) -> str:
         return f"[fetch failed: {e}]"
 
 
-def _build_prompt(kb: dict, sources_cfg: dict) -> str:
+def _build_prompt(kb: dict, sources_cfg: dict, progress_cb=None) -> str:
     limit = sources_cfg.get("meta", {}).get("max_chars_per_source", 6000)
     existing = [{"id": r["id"], "title": r["title"], "summary": r["summary"]}
                 for r in kb.get("recommendations", [])]
     blocks = []
-    for s in sources_cfg.get("sources", []):
+    sources = sources_cfg.get("sources", [])
+    n = len(sources)
+    for i, s in enumerate(sources, 1):
         blocks.append(f"### SOURCE: {s.get('note','')} ({s['url']})\n"
                       + _fetch(s["url"], limit))
+        if progress_cb:
+            progress_cb(0.5 * i / n if n else 0.5, f"Fetched source {i}/{n}")
     topics = "\n".join(f"- {t}" for t in sources_cfg.get("topics", []))
     return (
         "You are a systems engineer curating a knowledge base of NVIDIA DGX Spark "
@@ -194,22 +198,30 @@ def _synthesize_litellm(prompt: str) -> dict:
     return json.loads(m.group(0) if m else content)
 
 
-def research() -> dict:
+def research(progress_cb=None) -> dict:
     kb = _load(KB_FILE, {"recommendations": []})
     sources_cfg = _load(SOURCES_FILE, {"sources": [], "topics": []})
     if not sources_cfg.get("sources"):
         sys.exit("No sources configured in research_sources.json")
-    prompt = _build_prompt(kb, sources_cfg)
+    if progress_cb:
+        progress_cb(0.0, "Building prompt / fetching sources")
+    prompt = _build_prompt(kb, sources_cfg, progress_cb)
     print(f"Engine: {ENGINE} · {len(sources_cfg['sources'])} sources · "
           f"prompt {len(prompt):,} chars", file=sys.stderr)
     synth = {"codex": _synthesize_codex, "litellm": _synthesize_litellm}.get(ENGINE)
     if not synth:
         sys.exit(f"Unknown RESEARCH_ENGINE '{ENGINE}' (use codex|litellm)")
+    if progress_cb:
+        progress_cb(0.55, "Synthesizing proposals")
     result = synth(prompt)
     existing_ids = {r["id"] for r in kb.get("recommendations", [])}
     for p in result.get("proposed", []):
         p["status"] = "update" if p.get("id") in existing_ids else "new"
+    if progress_cb:
+        progress_cb(0.9, "Writing proposed updates")
     PROPOSED_FILE.write_text(json.dumps(result, indent=2) + "\n")
+    if progress_cb:
+        progress_cb(1.0, "Done")
     return result
 
 

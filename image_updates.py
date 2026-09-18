@@ -430,20 +430,30 @@ def pick_latest(current_tag: str, candidates: list[str], track: re.Pattern | Non
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def check(cfg: dict | None = None) -> dict:
-    """Build the drift report. Network reads + one kubectl get; no writes."""
+def check(cfg: dict | None = None, progress_cb=None) -> dict:
+    """Build the drift report. Network reads + one kubectl get; no writes.
+
+    `progress_cb(fraction, label)` is optional; it is invoked per row so a
+    caller (the app's Agents page) can surface percentage completion.
+    """
     cfg = cfg or load_config()
     ns = cfg.get("namespace", "llm-inference")
     rows, errors = [], []
 
+    if progress_cb:
+        progress_cb(0.0, "Collecting cluster images")
     try:
         images = collect_images(ns)
     except Exception as e:
         return {"ok": False, "namespace": ns, "checked_at": time.time(),
                 "rows": [], "errors": [str(e)]}
 
+    n = len(images)
     cache: dict[str, tuple[list[str], set[str], str]] = {}
-    for img in images:
+    for idx, img in enumerate(images):
+        if progress_cb and n:
+            progress_cb(0.05 + 0.95 * idx / n,
+                        f"Resolving upstream · {img['deployment']} ({idx + 1}/{n})")
         kind = classify(img)
         row = {
             "deployment": img["deployment"], "container": img["container"],
@@ -488,12 +498,16 @@ def check(cfg: dict | None = None) -> dict:
             row["status"] = "current"
         rows.append(row)
 
+    if progress_cb:
+        progress_cb(1.0, "Writing report")
     report = {"ok": True, "namespace": ns, "checked_at": time.time(),
               "rows": rows, "errors": errors}
     try:
         REPORT_FILE.write_text(json.dumps(report, indent=2))
     except Exception:
         pass
+    if progress_cb:
+        progress_cb(1.0, "Done")
     return report
 
 
