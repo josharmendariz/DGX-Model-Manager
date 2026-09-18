@@ -605,3 +605,54 @@ def test_parameterized_profile_exposes_script_defaults(tmp_path):
     meta = appmod._parse_script_meta(script)
     assert meta["classification"] == "parameterized"
     assert meta["script_defaults"]["max_model_len"] == 16384
+
+
+# ── _scan_directory: a dir that will not parse must not vanish silently ────────
+
+def _hf_model_dir(root, name, config_text):
+    snap = root / name / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text(config_text)
+    return root / name
+
+
+def _flat_model_dir(root, name, config_text):
+    d = root / name
+    d.mkdir()
+    (d / "config.json").write_text(config_text)
+    return d
+
+
+def test_scan_directory_clean_dirs_report_no_scan_error(tmp_path):
+    _hf_model_dir(tmp_path, "models--acme--good", '{"torch_dtype": "bfloat16"}')
+    _flat_model_dir(tmp_path, "good-flat", '{"torch_dtype": "bfloat16"}')
+    res = appmod._scan_directory(tmp_path)
+    assert {m["name"] for m in res["models"]} == {"good", "good-flat"}
+    assert res["scan_error"] is None
+
+
+def test_scan_directory_surfaces_unparseable_hf_dir(tmp_path, caplog):
+    _hf_model_dir(tmp_path, "models--acme--good", '{"torch_dtype": "bfloat16"}')
+    _hf_model_dir(tmp_path, "models--acme--broken", '["not a config object"]')
+    with caplog.at_level("WARNING"):
+        res = appmod._scan_directory(tmp_path)
+    assert [m["name"] for m in res["models"]] == ["good"]
+    assert "1 model dir(s) failed to parse" in res["scan_error"]
+    assert "models--acme--broken" in res["scan_error"]
+    assert "models--acme--broken" in caplog.text
+
+
+def test_scan_directory_surfaces_unparseable_flat_dir(tmp_path, caplog):
+    _flat_model_dir(tmp_path, "broken-flat", '["not a config object"]')
+    with caplog.at_level("WARNING"):
+        res = appmod._scan_directory(tmp_path)
+    assert res["models"] == []
+    assert "broken-flat" in res["scan_error"]
+    assert "broken-flat" in caplog.text
+
+
+def test_scan_directory_counts_every_failed_dir(tmp_path):
+    _hf_model_dir(tmp_path, "models--acme--broken", '["nope"]')
+    _flat_model_dir(tmp_path, "broken-flat", '["nope"]')
+    res = appmod._scan_directory(tmp_path)
+    assert res["scan_error"].startswith("2 model dir(s) failed to parse")

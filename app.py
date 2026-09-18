@@ -1335,9 +1335,12 @@ def _parse_flat_model_dir(model_dir: Path, all_profiles: list = None) -> dict:
 
 
 def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
-    """Scan a directory for models. Returns {path, is_hf_cache, models}."""
+    """Scan a directory for models. Returns {path, is_hf_cache, models, scan_error}."""
     models = []
     is_hf_cache = False
+    # A dir that will not parse is a DEFECT, not an empty result — dropping it
+    # silently makes a model vanish from the UI with nothing to explain it.
+    failed: list[str] = []
 
     if not directory.exists():
         return {"path": str(directory), "is_hf_cache": False, "models": [], "error": "Directory not found"}
@@ -1349,15 +1352,17 @@ def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
         for d in hf_dirs:
             try:
                 models.append(_parse_hf_model_dir(d, all_profiles))
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(d.name)
+                _logger.warning("Could not parse model dir %s: %s", d, e)
     # Also scan flat model dirs (subdirs with config.json) even alongside HF cache dirs
     for d in sorted(directory.iterdir()):
         if d.is_dir() and not d.name.startswith("models--") and (d / "config.json").exists():
             try:
                 models.append(_parse_flat_model_dir(d, all_profiles))
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(d.name)
+                _logger.warning("Could not parse model dir %s: %s", d, e)
 
     # Deduplicate: if same full_name appears from both HF cache and flat dir, keep HF cache version
     seen: dict[str, int] = {}
@@ -1374,7 +1379,12 @@ def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
             deduped.append(m)
     models = deduped
 
-    return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models}
+    scan_error = None
+    if failed:
+        scan_error = f"{len(failed)} model dir(s) failed to parse: {', '.join(failed)}"
+
+    return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models,
+            "scan_error": scan_error}
 
 # ─── HF Metadata cache ──────────────────────────────────────────────────────
 
