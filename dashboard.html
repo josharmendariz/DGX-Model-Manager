@@ -1,0 +1,4337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DGX · Model Manager</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:       #08080c;
+  --s1:       #0f0f14;
+  --s2:       #16161e;
+  --s3:       #1e1e28;
+  --border:   #252535;
+  --border2:  #30304a;
+  --text:     #d4d4e8;
+  --muted:    #6a6a90;
+  --amber:    #f0a034;
+  --amber2:   #c07020;
+  --amber-bg: #1a120400;
+  --green:    #3dba78;
+  --red:      #e05050;
+  --blue:     #5a9af5;
+  --purple:   #9a6af5;
+  --mono:     'IBM Plex Mono', monospace;
+  --sans:     'Space Grotesk', sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  font-size:14px;
+  line-height:1.5;
+  display:flex;
+  flex-direction:column;
+  height:100vh;
+  overflow:hidden;
+}
+
+/* ── Scanline texture ── */
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background:repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,.08) 2px,
+    rgba(0,0,0,.08) 4px
+  );
+  pointer-events:none;
+  z-index:1000;
+  opacity:.4;
+}
+
+/* ── Header ── */
+.header{
+  display:flex;align-items:center;gap:20px;
+  padding:0 20px;height:52px;
+  border-bottom:1px solid var(--border);
+  background:var(--s1);
+  flex-shrink:0;
+  position:relative;
+  z-index:10;
+}
+.hdr-logo{
+  display:flex;align-items:center;gap:10px;
+}
+.hdr-sigil{
+  width:28px;height:28px;
+  background:var(--amber);
+  clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:700;color:#000;
+  font-family:var(--mono);
+  flex-shrink:0;
+}
+.hdr-name{
+  font-family:var(--mono);
+  font-size:12px;font-weight:600;
+  letter-spacing:.12em;
+  color:var(--amber);
+  text-transform:uppercase;
+}
+.hdr-node{
+  font-family:var(--mono);
+  font-size:10px;color:var(--muted);
+  letter-spacing:.06em;
+}
+.hdr-sep{flex:1}
+
+/* ── Status pills ── */
+.status-cluster{display:flex;gap:6px;align-items:center}
+.pill{
+  display:flex;align-items:center;gap:5px;
+  padding:3px 10px 3px 7px;
+  border-radius:20px;
+  border:1px solid var(--border);
+  background:var(--s2);
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--muted);
+  transition:border-color .2s,color .2s;
+  cursor:default;
+  white-space:nowrap;
+}
+.pill.ok{border-color:#1e3a28;color:#8dd4a8}
+.pill.err{border-color:#3a1818;color:#e08888}
+.dot{width:5px;height:5px;border-radius:50%;background:var(--muted);transition:background .3s,box-shadow .3s}
+.pill.ok .dot{background:var(--green);box-shadow:0 0 5px var(--green)}
+.pill.err .dot{background:var(--red)}
+.refresh-btn{
+  width:26px;height:26px;
+  border-radius:6px;
+  border:1px solid var(--border);
+  background:var(--s2);
+  color:var(--muted);
+  cursor:pointer;
+  font-size:13px;
+  display:flex;align-items:center;justify-content:center;
+  transition:all .15s;
+}
+.refresh-btn:hover{border-color:var(--amber);color:var(--amber)}
+
+/* ── Header memory gauge ── */
+.hdr-mem{
+  display:none;align-items:center;gap:8px;
+  padding:3px 10px;
+  border-radius:6px;
+  border:1px solid var(--border);
+  background:var(--s2);
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--text);
+  text-decoration:none;
+  white-space:nowrap;
+  transition:border-color .2s;
+}
+a.hdr-mem[href]:hover{border-color:var(--amber)}
+.hdr-mem-pct{color:var(--muted);margin-left:6px}
+.hdr-mem-pct.crit{color:var(--red)}
+.hdr-mem svg{display:block;flex:none;width:72px;height:20px}
+.mem-spark-area{fill:var(--amber);opacity:.16;stroke:none}
+.mem-spark-line{fill:none;stroke:var(--amber);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round;opacity:.9}
+.mem-spark-threshold{stroke:var(--red);stroke-width:1;stroke-dasharray:2 3;opacity:.6}
+.mem-spark-dot{fill:var(--amber)}
+
+/* ── Layout ── */
+.body-wrap{display:flex;flex:1;overflow:hidden}
+.sidebar{
+  width:192px;flex-shrink:0;
+  border-right:1px solid var(--border);
+  background:var(--s1);
+  display:flex;flex-direction:column;
+  padding:12px 0;
+  overflow-y:auto;
+}
+.nav-section-label{
+  font-family:var(--mono);
+  font-size:9px;letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--muted);
+  padding:12px 16px 6px;
+  opacity:.6;
+}
+.nav-item{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 16px;
+  font-size:13px;font-weight:500;
+  color:var(--muted);
+  cursor:pointer;
+  border-left:2px solid transparent;
+  transition:all .12s;
+  user-select:none;
+}
+.nav-item:hover{color:var(--text);background:var(--s2)}
+.nav-item.active{
+  color:var(--amber);
+  border-left-color:var(--amber);
+  background:linear-gradient(90deg,rgba(240,160,52,.07),transparent);
+}
+.nav-icon{font-size:14px;width:16px;text-align:center;flex-shrink:0}
+.nav-badge{
+  margin-left:auto;
+  background:var(--s3);border:1px solid var(--border);
+  border-radius:10px;padding:1px 7px;
+  font-family:var(--mono);font-size:10px;
+  color:var(--muted);
+}
+
+/* ── Main ── */
+.main{flex:1;overflow-y:auto;padding:24px}
+.tab{display:none}
+.tab.active{display:block;animation:fadein .15s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* ── Page header ── */
+.page-hdr{margin-bottom:20px}
+.page-title{font-size:18px;font-weight:700;letter-spacing:-.01em}
+.page-sub{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.6}
+.page-sub code{font-family:var(--mono);color:var(--amber);font-size:11px}
+
+/* ── Section label ── */
+.sec-label{
+  font-family:var(--mono);
+  font-size:9px;letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--muted);
+  margin:20px 0 10px;
+  display:flex;align-items:center;gap:10px;
+}
+.sec-label::after{content:'';flex:1;height:1px;background:var(--border)}
+
+/* ── Cards ── */
+.card{
+  background:var(--s1);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:16px 18px;
+  margin-bottom:10px;
+}
+.card-row{display:flex;align-items:flex-start;gap:12px}
+.card-icon{
+  width:32px;height:32px;flex-shrink:0;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:7px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;
+}
+.card-info{flex:1;min-width:0}
+.card-name{font-size:13px;font-weight:600}
+.card-meta{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:2px}
+.card-actions{margin-left:auto;display:flex;gap:6px;align-items:center;flex-shrink:0}
+.card-desc{font-size:12px;color:var(--muted);line-height:1.6;margin-top:10px}
+.card-desc code{font-family:var(--mono);color:var(--amber);font-size:11px}
+
+/* ── Model grid ── */
+.model-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+  gap:8px;
+  margin-bottom:8px;
+}
+.model-card{
+  background:var(--s1);border:1px solid var(--border);
+  border-radius:8px;padding:12px 14px;
+  display:flex;align-items:center;gap:10px;
+  transition:border-color .15s;
+}
+.model-card:hover{border-color:var(--border2)}
+.model-card-info{flex:1;min-width:0}
+.model-card-name{
+  font-family:var(--mono);font-size:12px;font-weight:500;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.model-card-meta{font-size:11px;color:var(--muted);margin-top:2px}
+.model-card-right{display:flex;align-items:center;gap:6px;flex-shrink:0}
+
+/* ── Dashboards (site link cards reuse model-card) ── */
+a.model-card{text-decoration:none;color:inherit;cursor:pointer}
+a.model-card:hover{border-color:var(--amber)}
+.site-dot{
+  width:6px;height:6px;border-radius:50%;flex-shrink:0;
+  background:var(--s2);border:1px solid var(--border2);
+  transition:background .3s,box-shadow .3s;
+}
+.site-dot.ok{background:var(--green);border-color:var(--green);box-shadow:0 0 5px var(--green)}
+.site-dot.err{background:var(--red);border-color:var(--red)}
+
+/* ── Agents (on-demand background jobs) ── */
+.agent-head{display:flex;align-items:flex-start;gap:12px}
+.agent-titles{flex:1;min-width:0}
+.agent-name{font-size:13px;font-weight:600}
+.agent-desc{font-size:11px;color:var(--muted);line-height:1.5;margin-top:3px}
+.agent-chip{
+  display:inline-flex;align-items:center;gap:6px;flex-shrink:0;
+  font-family:var(--mono);font-size:10px;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;
+  padding:3px 9px;border-radius:20px;border:1px solid var(--border);
+  color:var(--muted);
+}
+.agent-chip::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--s3)}
+.agent-chip.run{color:var(--amber)}
+.agent-chip.run::before{background:var(--amber);box-shadow:0 0 5px var(--amber);animation:agpulse 1.1s ease-in-out infinite}
+.agent-chip.ok{color:var(--green)}
+.agent-chip.ok::before{background:var(--green);box-shadow:0 0 5px var(--green)}
+.agent-chip.err{color:var(--red)}
+.agent-chip.err::before{background:var(--red);box-shadow:0 0 5px var(--red)}
+.agent-track{height:5px;background:var(--s3);border-radius:3px;overflow:hidden;margin:14px 0 6px}
+.agent-fill{height:100%;background:var(--amber);border-radius:3px;transition:width .5s}
+.agent-progress{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.agent-last{font-size:12px;color:var(--text);margin-top:12px;line-height:1.5}
+.agent-hist{list-style:none;margin:8px 0 0;padding:0}
+.agent-hist-row{display:flex;gap:10px;align-items:baseline;font-size:11px;padding:5px 0;border-top:1px solid var(--border)}
+.agent-hist-time{font-family:var(--mono);color:var(--muted);white-space:nowrap;flex-shrink:0}
+.agent-hist-status{font-family:var(--mono);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0;min-width:46px}
+.agent-hist-status.ok{color:var(--green)}
+.agent-hist-status.err{color:var(--red)}
+.agent-hist-summary{color:var(--text);line-height:1.4;min-width:0}
+.agent-hist-empty{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:8px}
+@keyframes agpulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* ── Tags ── */
+.tag{
+  display:inline-block;padding:2px 7px;
+  border-radius:4px;font-size:9px;
+  font-family:var(--mono);font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;
+}
+.tag-ollama{background:#0e2018;color:#5cc480;border:1px solid #1a3a28}
+.tag-sglang{background:#101828;color:#6898e8;border:1px solid #1a2a40}
+.tag-amber{background:#1a1000;color:var(--amber);border:1px solid #2a2000}
+
+/* ── Buttons ── */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:7px 14px;border-radius:6px;
+  font-size:12px;font-weight:600;font-family:var(--sans);
+  cursor:pointer;border:1px solid var(--border);
+  background:var(--s2);color:var(--text);
+  transition:all .12s;white-space:nowrap;
+  line-height:1;
+}
+.btn:hover{border-color:var(--border2);background:var(--s3)}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+.btn-primary{background:var(--amber);color:#000;border-color:var(--amber)}
+.btn-primary:hover{background:var(--amber2);border-color:var(--amber2);color:#000}
+.btn-danger{background:#180808;color:#e08888;border-color:#2a1010}
+.btn-danger:hover{border-color:var(--red);color:var(--red)}
+.btn-sm{padding:4px 10px;font-size:11px}
+.btn-ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn-ghost:hover{color:var(--text);background:var(--s2);border-color:var(--border)}
+
+/* ── Input ── */
+.input-row{display:flex;gap:8px;align-items:stretch;margin-bottom:14px}
+.input{
+  flex:1;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:6px;padding:8px 12px;
+  color:var(--text);font-size:13px;font-family:var(--mono);
+  outline:none;transition:border-color .15s;
+}
+.input:focus{border-color:var(--amber)}
+.input::placeholder{color:var(--muted)}
+
+/* ── Progress ── */
+.progress-wrap{margin-top:10px;display:none}
+.progress-wrap.show{display:block}
+.prog-bar-outer{height:3px;background:var(--s3);border-radius:2px;overflow:hidden;margin-bottom:8px}
+.prog-bar{height:100%;background:var(--amber);border-radius:2px;transition:width .3s;width:0}
+.prog-bar.spin{width:35%!important;animation:pgslide 1.2s ease-in-out infinite}
+@keyframes pgslide{0%{transform:translateX(-200%)}100%{transform:translateX(500%)}}
+/* Phase line above the bar: the bar alone cannot distinguish a 30s weight load
+   from a 65s torch.compile, and that ambiguity is what made a dead container
+   look like a slow one. */
+.prog-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px}
+.prog-phase{font-size:12px;font-weight:600;color:var(--text)}
+.prog-meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.preflight-wrap{margin-top:12px}
+.preflight-wrap:empty{display:none}
+.preflight-head{
+  display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  font-size:12px;font-weight:600;padding:8px 10px;border-radius:5px 5px 0 0;
+  border:1px solid var(--border);border-bottom:none;background:var(--s2);
+}
+.preflight-head.pf-ok{color:var(--green)}
+.preflight-head.pf-warn{color:var(--amber)}
+.preflight-head.pf-fail{color:var(--red)}
+.preflight-budget{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--muted)}
+.preflight-row{
+  border:1px solid var(--border);border-top:none;padding:8px 10px;
+  border-left:3px solid var(--border);background:#04040a;
+}
+.preflight-row:last-child{border-radius:0 0 5px 5px}
+.preflight-row.pf-ok{border-left-color:var(--green)}
+.preflight-row.pf-warn{border-left-color:var(--amber)}
+.preflight-row.pf-fail{border-left-color:var(--red)}
+.preflight-row.pf-skip{border-left-color:var(--muted);opacity:.65}
+.pf-title{font-size:12px;font-weight:600;color:var(--text)}
+.pf-detail{font-size:11px;color:var(--muted);line-height:1.6;margin-top:3px}
+.pf-fix{
+  font-family:var(--mono);font-size:11px;color:var(--amber);
+  margin-top:5px;white-space:pre-wrap;word-break:break-word;
+}
+.prog-log{
+  font-family:var(--mono);font-size:11px;color:var(--muted);
+  background:#04040a;border:1px solid var(--border);
+  border-radius:5px;padding:8px 10px;
+  max-height:110px;overflow-y:auto;
+  line-height:1.7;
+  white-space:pre-wrap;
+}
+
+/* ── Engine card ── */
+.engine-card{
+  background:var(--s1);border:1px solid var(--border);
+  border-radius:10px;padding:20px 22px;margin-bottom:14px;
+  position:relative;overflow:hidden;
+}
+.engine-card::before{
+  content:'';position:absolute;
+  top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--amber),transparent);
+  opacity:0;transition:opacity .3s;
+}
+.engine-card.online::before{opacity:1}
+.engine-status-row{display:flex;align-items:center;gap:14px;margin-bottom:12px}
+.engine-led{
+  width:10px;height:10px;border-radius:50%;
+  background:var(--red);flex-shrink:0;
+  transition:background .3s,box-shadow .3s;
+}
+.engine-led.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.engine-led.loading{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:led-pulse 1.1s ease-in-out infinite}
+@keyframes led-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.engine-title{font-size:15px;font-weight:700}
+.engine-model{font-size:11px;color:var(--amber);font-family:var(--mono);margin-top:2px}
+.engine-footer{font-size:11px;color:var(--muted);font-family:var(--mono)}
+.engine-actions{margin-left:auto;display:flex;gap:6px}
+
+/* ── Profile list ── */
+.recipe-bar{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 10px;
+  border:1px solid var(--border);border-radius:8px;background:var(--s2)}
+.recipe-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.recipe-select{font-family:var(--mono);font-size:12px;color:var(--text);background:var(--s1);
+  border:1px solid var(--border2);border-radius:6px;padding:5px 8px;min-width:230px}
+.recipe-select:focus{outline:none;border-color:var(--amber)}
+.recipe-desc{font-size:11px;color:var(--muted);line-height:1.4;flex:1}
+.profile-list{display:flex;flex-direction:column;gap:6px}
+/* 04-02 launch-settings panel: only the selected card shows it, so the list stays
+   scannable and the inputs visibly reset when the selection moves. */
+.p-settings{flex-basis:100%;display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);cursor:default}
+.profile-item.selected .p-settings{display:block}
+.p-set-row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+.p-set-field{display:flex;flex-direction:column;gap:3px}
+.p-set-field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.p-set-field input{
+  width:110px;background:var(--s0);border:1px solid var(--border);border-radius:5px;
+  color:var(--fg);font-family:var(--mono);font-size:11px;padding:4px 6px;
+}
+.p-set-field input:disabled{opacity:.45}
+.p-set-rec{font-size:10px;color:var(--amber);font-family:var(--mono)}
+.p-set-note{font-size:10px;color:var(--dim);margin-top:6px}
+.p-set-warn{font-size:10px;color:var(--amber);margin-top:6px;font-family:var(--mono)}
+.p-set-error{font-size:11px;color:var(--red,#e05252);margin-top:6px;font-weight:600}
+.profile-item{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:12px 14px;
+  background:var(--s1);border:1px solid var(--border);
+  border-radius:8px;cursor:pointer;
+  transition:border-color .15s;
+}
+.profile-item:hover{border-color:var(--border2)}
+.profile-item.selected{border-color:var(--amber);background:linear-gradient(90deg,rgba(240,160,52,.05),transparent)}
+.p-radio{
+  width:14px;height:14px;border-radius:50%;
+  border:2px solid var(--border);flex-shrink:0;
+  transition:all .15s;
+}
+.profile-item.selected .p-radio{border-color:var(--amber);background:var(--amber);box-shadow:0 0 6px var(--amber)}
+.p-info{flex:1;min-width:0}
+.p-name{font-size:13px;font-weight:600}
+.p-desc{font-size:11px;color:var(--muted);margin-top:2px}
+.p-vram{font-family:var(--mono);font-size:11px;color:var(--amber);flex-shrink:0}
+/* Hidden until row hover: destructive controls should not sit under the cursor
+   on a list whose primary action is selecting a profile to launch. */
+.subtabs{display:flex;align-items:center;gap:4px;margin:0 0 10px;border-bottom:1px solid var(--border)}
+.subtab{
+  background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);
+  font-family:inherit;font-size:12px;font-weight:600;padding:7px 12px;cursor:pointer;
+}
+.subtab:hover{color:var(--fg)}
+.subtab.active{color:var(--amber);border-bottom-color:var(--amber)}
+.subtab-note{margin-left:auto;font-size:11px;color:var(--dim);font-family:var(--mono)}
+.p-actions{display:flex;gap:4px;flex-shrink:0;margin-left:8px;opacity:0;transition:opacity .12s}
+.profile-item:hover .p-actions,.profile-item.selected .p-actions{opacity:1}
+
+/* ── Config block ── */
+.config-block{
+  font-family:var(--mono);font-size:11px;
+  background:#04040a;border:1px solid var(--border);
+  border-radius:6px;padding:14px;
+  overflow:auto;max-height:280px;
+  color:#a0a0c0;line-height:1.8;
+  white-space:pre;
+}
+
+/* ── Wildcard status ── */
+.wc-active{
+  display:flex;align-items:center;gap:7px;
+  font-size:12px;color:#5cc480;
+  margin-top:8px;
+}
+.wc-inactive{font-size:12px;color:var(--muted);margin-top:8px}
+
+/* ── Empty state ── */
+.empty{
+  text-align:center;padding:40px 20px;
+  color:var(--muted);
+}
+.empty-icon{font-size:28px;margin-bottom:10px;opacity:.5}
+.empty-text{font-size:13px}
+
+/* ── Spinner ── */
+.spin-icon{
+  width:13px;height:13px;
+  border:2px solid rgba(255,255,255,.15);
+  border-top-color:currentColor;
+  border-radius:50%;
+  animation:spin .6s linear infinite;
+  flex-shrink:0;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Toast ── */
+#toast-root{
+  position:fixed;bottom:20px;right:20px;
+  display:flex;flex-direction:column;gap:6px;
+  z-index:9999;pointer-events:none;
+}
+.toast{
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:8px;padding:10px 14px;
+  font-size:13px;max-width:320px;
+  pointer-events:auto;
+  animation:toast-in .2s ease;
+}
+@keyframes toast-in{from{transform:translateX(100%);opacity:0}to{opacity:1;transform:none}}
+.toast.ok{border-color:#1e3a28}
+.toast.err{border-color:#3a1818}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* ── Inventory table ── */
+.inv-dir-block{margin-bottom:24px}
+.inv-dir-header{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 14px;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:8px 8px 0 0;
+  border-bottom:1px solid var(--border2);
+}
+.inv-dir-path{
+  font-family:var(--mono);font-size:11px;color:var(--amber);flex:1;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.inv-dir-badge{
+  font-family:var(--mono);font-size:9px;
+  padding:2px 7px;border-radius:3px;
+  background:rgba(240,160,52,.12);border:1px solid rgba(240,160,52,.25);
+  color:var(--amber);white-space:nowrap;
+}
+.inv-dir-badge.custom{
+  background:rgba(90,154,245,.1);border-color:rgba(90,154,245,.25);color:var(--blue);
+}
+.inv-table-wrap{
+  border:1px solid var(--border);border-top:none;
+  border-radius:0 0 8px 8px;overflow:hidden;
+}
+.inv-table{width:100%;border-collapse:collapse;font-size:12px;}
+.inv-table th{
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.12em;text-transform:uppercase;
+  color:var(--muted);background:var(--s2);
+  padding:7px 10px;text-align:left;
+  border-bottom:1px solid var(--border);
+  white-space:nowrap;
+}
+.inv-table td{
+  padding:9px 10px;border-bottom:1px solid var(--border);
+  vertical-align:middle;
+  color:var(--text);
+}
+.inv-table tr:last-child td{border-bottom:none}
+.inv-table tr:hover td{background:rgba(255,255,255,.02)}
+.inv-model-name{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--text)}
+.inv-owner{font-size:10px;color:var(--muted);margin-top:1px}
+.inv-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.05em;white-space:nowrap;
+  margin:1px;
+}
+.inv-fp32{background:#0a1830;color:#6090e0;border:1px solid #1030508}
+.inv-fp16{background:#0e1a30;color:#5a9af5;border:1px solid #1a2a50}
+.inv-bf16{background:#0e1a30;color:#5a9af5;border:1px solid #1a2a50}
+.inv-fp8{background:#12200e;color:#5cc480;border:1px solid #1a3a18}
+.inv-fp4{background:#1a1200;color:var(--amber);border:1px solid #2a2000}
+.inv-int4{background:#1a1200;color:#d09030;border:1px solid #2a1800}
+.inv-int8{background:#0e1818;color:#40b0b0;border:1px solid #183030}
+.inv-unknown{background:var(--s3);color:var(--muted);border:1px solid var(--border)}
+.inv-moe{background:#1a0a28;color:#a06af5;border:1px solid #2a1040}
+.inv-dense{background:var(--s3);color:var(--muted);border:1px solid var(--border)}
+.inv-yes{color:var(--green)}
+.inv-no{color:var(--muted)}
+.inv-engine{
+  font-family:var(--mono);font-size:10px;
+  padding:2px 6px;border-radius:3px;
+}
+.inv-engine-sg{background:#101828;color:#6898e8;border:1px solid #1a2a40}
+.inv-engine-vl{background:#0e1a14;color:#5cc480;border:1px solid #1a3020}
+.inv-modality{
+  display:inline-block;padding:1px 5px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;
+  background:var(--s3);color:var(--muted);border:1px solid var(--border);
+  margin:1px;
+}
+.inv-modality.embed{
+  background:#10102a;color:#8888e0;border-color:#20205a;
+}
+.inv-modality.audio{
+  background:#0e1a1a;color:#50c8b8;border-color:#183838;
+}
+.inv-empty{
+  text-align:center;padding:28px;color:var(--muted);
+  font-size:12px;
+  background:var(--s1);border:1px solid var(--border);
+  border-top:none;border-radius:0 0 8px 8px;
+}
+.btn-icon-del{
+  background:none;border:1px solid transparent;border-radius:4px;
+  color:var(--muted);font-size:13px;cursor:pointer;
+  width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+  transition:all .12s;padding:0;
+}
+.btn-icon-del:hover{color:var(--red);border-color:var(--red);background:#180808}
+.inv-custom-dirs{
+  display:flex;flex-direction:column;gap:6px;
+  margin-bottom:14px;
+}
+.inv-custom-dir-row{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 12px;
+  background:var(--s2);border:1px solid var(--border);
+  border-radius:6px;
+}
+.inv-custom-dir-path{font-family:var(--mono);font-size:11px;color:var(--blue);flex:1}
+.inv-remove-btn{
+  background:none;border:1px solid var(--border);
+  color:var(--muted);font-size:11px;
+  border-radius:4px;padding:2px 8px;cursor:pointer;
+  transition:all .12s;
+}
+.inv-remove-btn:hover{color:var(--red);border-color:var(--red)}
+
+/* ── Inventory toolbar ── */
+.inv-toolbar{
+  display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+  margin-bottom:12px;
+}
+.inv-search{
+  flex:1;min-width:160px;max-width:280px;
+  font-size:12px !important;padding:6px 10px !important;
+}
+.inv-filter{
+  background:var(--s2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:5px 8px;font-size:11px;font-family:var(--sans);
+  cursor:pointer;outline:none;
+}
+.inv-filter:focus{border-color:var(--amber)}
+.inv-stats{
+  font-family:var(--mono);font-size:11px;color:var(--muted);
+  margin-bottom:14px;padding:6px 0;
+  display:flex;gap:16px;flex-wrap:wrap;
+}
+.inv-stats span{color:var(--amber)}
+.inv-dirs-section{
+  margin-bottom:14px;border:1px solid var(--border);border-radius:8px;
+  background:var(--s1);
+}
+.inv-dirs-section summary{
+  padding:10px 14px;cursor:pointer;font-family:var(--mono);
+  font-size:11px;color:var(--muted);letter-spacing:.08em;
+  text-transform:uppercase;user-select:none;
+}
+.inv-dirs-section summary:hover{color:var(--text)}
+.inv-dirs-section[open] > summary{border-bottom:1px solid var(--border)}
+.inv-dirs-section > div,.inv-dirs-section > .input-row{padding:10px 14px}
+.inv-source-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.05em;white-space:nowrap;margin:1px;
+}
+.inv-src-hf{background:#1a1200;color:var(--amber);border:1px solid #2a2000}
+.inv-src-custom{background:rgba(90,154,245,.1);color:var(--blue);border:1px solid rgba(90,154,245,.25)}
+.inv-src-ollama{background:#0e1a14;color:#5cc480;border:1px solid #1a3020}
+.inv-format-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.04em;white-space:nowrap;margin:1px;
+  background:var(--s3);color:var(--muted);border:1px solid var(--border);
+}
+.inv-fmt-safe{background:#101828;color:#6898e8;border:1px solid #1a2a40}
+.inv-fmt-gguf{background:#1a0a28;color:#a06af5;border:1px solid #2a1040}
+.inv-fmt-pt{background:#1a1200;color:#d09030;border:1px solid #2a1800}
+.inv-fmt-ollama{background:#0e1a14;color:#5cc480;border:1px solid #1a3020}
+.inv-task-badge{
+  display:inline-block;padding:2px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:.04em;white-space:nowrap;margin:1px;
+  background:rgba(90,154,245,.08);color:#5a9af5;border:1px solid rgba(90,154,245,.2);
+}
+
+/* ── HF Browse ── */
+.hfb-search-bar{
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  margin-bottom:18px;
+}
+.hfb-card{
+  background:var(--s1);border:1px solid var(--border);border-radius:8px;
+  padding:14px 16px;margin-bottom:10px;transition:border-color .15s;
+}
+.hfb-card:hover{border-color:var(--amber)}
+.hfb-card-hdr{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px}
+.hfb-card-name{
+  font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text);
+  flex:1;word-break:break-word;
+}
+.hfb-card-meta{
+  display:flex;gap:12px;align-items:center;font-size:11px;color:var(--muted);
+  margin-bottom:8px;flex-wrap:wrap;
+}
+.hfb-card-meta .dl{color:#5cc480}
+.hfb-card-meta .lk{color:#e060a0}
+.hfb-tags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+.hfb-tag{
+  display:inline-block;padding:1px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:9px;
+  background:var(--s3);color:var(--muted);border:1px solid var(--border);
+}
+.hfb-tag.fmt{background:rgba(90,154,245,.08);color:#5a9af5;border-color:rgba(90,154,245,.2)}
+.hfb-card-actions{display:flex;gap:8px;align-items:center;margin-top:10px}
+.hfb-expand{
+  margin-top:10px;padding-top:10px;border-top:1px solid var(--border);
+  font-size:12px;
+}
+.hfb-expand-toggle{
+  background:none;border:none;color:var(--muted);font-size:11px;
+  cursor:pointer;font-family:var(--mono);padding:0;
+}
+.hfb-expand-toggle:hover{color:var(--amber)}
+.hfb-file-list{
+  max-height:250px;overflow-y:auto;margin-top:8px;
+  font-family:var(--mono);font-size:10px;
+}
+.hfb-file-row{
+  display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);
+  color:var(--text);
+}
+.hfb-file-row .size{color:var(--muted);margin-left:auto;white-space:nowrap}
+.hfb-variants{margin-top:10px}
+.hfb-variant-row{
+  display:flex;align-items:center;gap:8px;padding:4px 0;
+  font-family:var(--mono);font-size:11px;
+}
+.hfb-variant-row .fmt{
+  padding:2px 6px;border-radius:3px;font-size:9px;font-weight:600;
+  background:#1a0a28;color:#a06af5;border:1px solid #2a1040;
+}
+.hfb-loading{text-align:center;padding:20px;color:var(--muted);font-size:12px}
+
+/* ── Debug / Logs ── */
+.debug-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+  gap:10px;margin-bottom:14px;
+}
+.debug-stat{
+  background:var(--s2);border:1px solid var(--border);border-radius:6px;
+  padding:10px 12px;
+}
+.debug-stat-label{
+  font-family:var(--mono);font-size:9px;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);margin-bottom:4px;
+}
+.debug-stat-value{
+  font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text);
+}
+.debug-stat-value.ok{color:var(--green)}
+.debug-stat-value.err{color:var(--red)}
+.debug-stat-value.warn{color:var(--amber)}
+.debug-section-hdr{
+  font-family:var(--mono);font-size:12px;font-weight:600;cursor:pointer;
+  color:var(--text);list-style:none;display:flex;align-items:center;gap:8px;
+}
+.debug-section-hdr::before{content:'▸';color:var(--muted);transition:transform .15s;font-size:10px}
+details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
+.config-block{
+  font-family:var(--mono);font-size:11px;line-height:1.6;
+  background:#04040a;border:1px solid var(--border);border-radius:6px;
+  padding:10px 12px;white-space:pre-wrap;word-break:break-all;
+  max-height:350px;overflow-y:auto;color:var(--text);
+}
+.log-toolbar{
+  display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;
+}
+.log-level-select{width:120px;flex:none}
+.log-auto-label{
+  font-family:var(--mono);font-size:11px;color:var(--muted);
+  display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;
+}
+.log-auto-label input[type="checkbox"]{accent-color:var(--amber)}
+.log-pane{
+  font-family:var(--mono);font-size:11px;background:#04040a;
+  border:1px solid var(--border);border-radius:6px;padding:8px 10px;
+  max-height:400px;overflow-y:auto;line-height:1.7;
+  white-space:pre-wrap;word-break:break-all;
+}
+.log-footer{
+  font-family:var(--mono);font-size:10px;color:var(--muted);
+  margin-top:6px;text-align:right;
+}
+.log-entry{padding:1px 0}
+.log-ts{color:var(--muted)}
+.log-src{color:var(--blue)}
+.log-level-DEBUG{color:#6a6a90}
+.log-level-INFO{color:#8dd4a8}
+.log-level-WARNING{color:#f0c050}
+.log-level-ERROR{color:#e05050;font-weight:600}
+.log-tab-bar{display:flex;gap:4px}
+.log-tab-btn.active{background:var(--amber);color:#000;border-color:var(--amber)}
+.btn-danger{background:#2a0808;color:#e05050;border:1px solid #401010}
+.btn-danger:hover{background:#3a0a0a;border-color:#e05050}
+.docker-table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+.docker-table th{
+  text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);
+  color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.1em;
+}
+.docker-table td{padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text)}
+.docker-table tr:last-child td{border-bottom:none}
+.docker-table tr:hover td{background:var(--s2)}
+
+/* ── Warm Models ── */
+.warm-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.warm-panel{background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:14px}
+.warm-panel.full{grid-column:1/-1}
+.warm-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.warm-title-main{font-size:13px;font-weight:700;color:var(--text)}
+.warm-sub{font-size:11px;color:var(--muted);line-height:1.5}
+.warm-metric{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--text);margin-bottom:6px}
+.warm-bar{height:10px;border-radius:999px;background:var(--s3);overflow:hidden;border:1px solid var(--border)}
+.warm-bar-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--amber));width:0%}
+.warm-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid rgba(51,65,85,.55)}
+.warm-row:first-child{border-top:0}
+.warm-name{font-size:12px;font-weight:700;color:var(--text);word-break:break-word}
+.warm-meta{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px;word-break:break-word}
+.warm-pill{font-family:var(--mono);font-size:10px;border:1px solid var(--border);border-radius:999px;padding:3px 8px;color:var(--muted);white-space:nowrap}
+.warm-pill.ok{color:var(--green);border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.08)}
+.warm-pill.warn{color:var(--amber);border-color:rgba(251,191,36,.35);background:rgba(251,191,36,.08)}
+.warm-pill.err{color:var(--red);border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
+.warm-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.warm-profile-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}
+.warm-profile{border:1px solid var(--border);background:var(--s2);border-radius:8px;padding:10px;cursor:pointer;transition:all .12s}
+.warm-profile:hover{border-color:rgba(251,191,36,.45)}
+.warm-profile.active{border-color:var(--green);background:rgba(34,197,94,.08)}
+.warm-profile.selected{border-color:var(--amber);background:rgba(251,191,36,.08)}
+.warm-profile-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.warm-profile-name{font-size:12px;font-weight:700;color:var(--text)}
+.warm-profile-desc{font-size:11px;color:var(--muted);line-height:1.45;margin-top:5px}
+@media (max-width: 900px){.warm-grid{grid-template-columns:1fr}.warm-panel.full{grid-column:auto}}
+
+/* ── Settings ── */
+.svc-status{
+  font-family:var(--mono);font-size:11px;
+  display:flex;align-items:center;gap:6px;
+  min-width:90px;justify-content:flex-end;
+}
+.svc-status.ok{color:var(--green)}
+.svc-status.err{color:var(--red)}
+.svc-status.testing{color:var(--muted)}</style>
+</head>
+<body>
+
+<header class="header">
+  <div class="hdr-logo">
+    <div class="hdr-sigil">D</div>
+    <div>
+      <div class="hdr-name">Model Manager</div>
+      <div class="hdr-node" id="hdr-node">loading…</div>
+    </div>
+  </div>
+  <div class="hdr-sep"></div>
+  <a class="hdr-mem" id="hdr-mem" target="_blank" rel="noopener" title="Unified memory">
+    <svg width="72" height="20" viewBox="0 0 72 20" aria-hidden="true">
+      <polygon class="mem-spark-area" id="mem-spark-area" points=""></polygon>
+      <line class="mem-spark-threshold" id="mem-spark-threshold" x1="1" y1="2.8" x2="71" y2="2.8"></line>
+      <polyline class="mem-spark-line" id="mem-spark-line" points=""></polyline>
+      <circle class="mem-spark-dot" id="mem-spark-dot" r="2" cx="-5" cy="-5"></circle>
+    </svg>
+    <span><span id="mem-used">--</span><span class="hdr-mem-pct" id="mem-pct">--%</span></span>
+  </a>
+  <div class="status-cluster">
+    <div class="pill" id="pill-ollama"><div class="dot"></div><span>Ollama</span></div>
+    <div class="pill" id="pill-litellm"><div class="dot"></div><span>LiteLLM</span></div>
+<!--DGX:ENGINE_PILLS-->
+    <button class="refresh-btn" onclick="pollStatus()" title="Refresh status">↻</button>
+    <a href="/help" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--muted);text-decoration:none;padding:4px 10px;border:1px solid var(--border);border-radius:5px;transition:all .15s;" onmouseover="this.style.color='var(--amber)';this.style.borderColor='var(--amber)'" onmouseout="this.style.color='var(--muted)';this.style.borderColor='var(--border)'">? Docs</a>
+  </div>
+</header>
+
+<div class="body-wrap">
+  <nav class="sidebar">
+    <div class="nav-section-label">Dashboards</div>
+    <div class="nav-item" id="nav-sites" onclick="switchTab('sites')">
+      <span class="nav-icon">&#128202;</span>Dashboards
+    </div>
+    <div class="nav-item" id="nav-agents" onclick="switchTab('agents')">
+      <span class="nav-icon">&#129302;</span>Agents
+      <span class="nav-badge" id="badge-agents"></span>
+    </div>
+    <div class="nav-section-label">Models</div>
+    <div class="nav-item active" id="nav-ollama" onclick="switchTab('ollama')">
+      <span class="nav-icon">🦙</span>Ollama
+      <span class="nav-badge" id="badge-ollama">—</span>
+    </div>
+    <div class="nav-item" id="nav-inventory" onclick="switchTab('inventory')">
+      <span class="nav-icon">📦</span>Inventory
+      <span class="nav-badge" id="badge-inventory">—</span>
+    </div>
+    <div class="nav-item" id="nav-hfbrowse" onclick="switchTab('hfbrowse')">
+      <span class="nav-icon">🔍</span>HF Browse
+    </div>
+    <div class="nav-item" id="nav-hf" onclick="switchTab('hf')">
+      <span class="nav-icon">🤗</span>HF Download
+    </div>
+    <div class="nav-section-label">Advisor</div>
+    <div class="nav-item" id="nav-recs" onclick="switchTab('recs')">
+      <span class="nav-icon">💡</span>Recommendations
+      <span class="nav-badge" id="badge-recs">—</span>
+    </div>
+    <div class="nav-item" id="nav-updates" onclick="switchTab('updates')">
+      <span class="nav-icon">📦</span>Updates
+      <span class="nav-badge" id="badge-updates">—</span>
+    </div>
+    <div class="nav-section-label">Routing</div>
+    <div class="nav-item" id="nav-litellm" onclick="switchTab('litellm')">
+      <span class="nav-icon">⚡</span>LiteLLM
+      <span class="nav-badge" id="badge-litellm">—</span>
+    </div>
+    <div class="nav-section-label">Engines</div>
+<!--DGX:NAV_ITEMS-->
+    <div class="nav-section-label">System</div>
+    <div class="nav-item" id="nav-warm" onclick="switchTab('warm')">
+      <span class="nav-icon">&#9729;</span>Warm Models
+    </div>
+    <div class="nav-item" id="nav-settings" onclick="switchTab('settings')">
+      <span class="nav-icon">&#9881;</span>Settings
+    </div>
+    <div class="nav-section-label">Diagnostics</div>
+    <div class="nav-item" id="nav-debug" onclick="switchTab('debug')">
+      <span class="nav-icon">&#128269;</span>Logs &amp; Debug
+    </div>
+  </nav>
+
+  <main class="main">
+
+    <!-- ─── OLLAMA ─── -->
+    <div class="tab active" id="tab-ollama">
+      <div class="page-hdr">
+        <div class="page-title">Ollama Models</div>
+        <div class="page-sub">Pull models from the Ollama library. With wildcard routing enabled, every pulled model is instantly available at <code id="ollama-litellm-port">LiteLLM</code>.</div>
+      </div>
+
+      <div class="input-row">
+        <input class="input" id="pull-input"
+          placeholder="Model name — e.g. llama3.2  qwen2.5:7b  phi4  gemma3:4b  deepseek-r1:7b"
+          onkeydown="if(event.key==='Enter')pullModel()">
+        <button class="btn btn-primary" id="pull-btn" onclick="pullModel()">⬇ Pull</button>
+      </div>
+
+      <div class="progress-wrap" id="pull-progress">
+        <div class="prog-bar-outer"><div class="prog-bar spin" id="pull-bar"></div></div>
+        <div class="prog-log" id="pull-log"></div>
+      </div>
+
+      <div class="sec-label">Installed <span id="badge-ollama-inline"></span></div>
+      <div id="ollama-list"><div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div></div>
+    </div>
+
+    <!-- ─── HF DOWNLOAD ─── -->
+    <div class="tab" id="tab-hf">
+      <div class="page-hdr">
+        <div class="page-title">HuggingFace Download</div>
+        <div class="page-sub">Download any model from HuggingFace Hub directly to your device. Large models land in <code>~/.cache/huggingface/hub/</code> — ready for SGLang or vLLM.</div>
+      </div>
+
+      <div class="card">
+        <div class="sec-label" style="margin-top:0;margin-bottom:8px">Repository ID</div>
+        <div class="input-row">
+          <input class="input" id="hf-repo"
+            placeholder="e.g. mistralai/Mistral-7B-Instruct-v0.3">
+        </div>
+        <div class="sec-label" style="margin-bottom:8px">Local Directory <span style="color:var(--muted);font-size:10px">(optional — leave blank for HF cache default)</span></div>
+        <div class="input-row" style="margin-bottom:0">
+          <input class="input" id="hf-dir" placeholder="/home/user/models/my-model">
+          <button class="btn btn-primary" id="hf-btn" onclick="hfDownload()">⬇ Download</button>
+        </div>
+      </div>
+
+      <div class="progress-wrap" id="hf-progress">
+        <div class="prog-bar-outer"><div class="prog-bar spin" id="hf-bar"></div></div>
+        <div class="prog-log" id="hf-log"></div>
+      </div>
+
+    </div>
+
+    <!-- ─── INVENTORY ─── -->
+    <div class="tab" id="tab-inventory">
+      <div class="page-hdr">
+        <div class="page-title">Model Inventory</div>
+        <div class="page-sub">All models across HuggingFace cache, custom directories, and Ollama.</div>
+      </div>
+
+      <div class="inv-toolbar">
+        <input class="input inv-search" id="inv-search" placeholder="Search models..." oninput="filterInventory()">
+        <select class="inv-filter" id="inv-filter-source" onchange="filterInventory()">
+          <option value="">All Sources</option>
+          <option value="hf_cache">HF Cache</option>
+          <option value="custom_dir">Custom Dir</option>
+          <option value="ollama">Ollama</option>
+        </select>
+        <select class="inv-filter" id="inv-filter-format" onchange="filterInventory()">
+          <option value="">All Formats</option>
+          <option value="safetensors">Safetensors</option>
+          <option value="gguf">GGUF</option>
+          <option value="pytorch">PyTorch</option>
+          <option value="ollama">Ollama</option>
+        </select>
+        <select class="inv-filter" id="inv-filter-task" onchange="filterInventory()">
+          <option value="">All Tasks</option>
+          <option value="Text Gen">Text Gen</option>
+          <option value="Vision LLM">Vision LLM</option>
+          <option value="Embedding">Embedding</option>
+          <option value="STT">STT</option>
+          <option value="TTS">TTS</option>
+          <option value="Image Gen">Image Gen</option>
+          <option value="Audio">Audio</option>
+        </select>
+        <select class="inv-filter" id="inv-sort" onchange="sortAndRender()">
+          <option value="name">Sort: Name</option>
+          <option value="size">Sort: Size</option>
+          <option value="params">Sort: Params</option>
+        </select>
+        <button class="btn btn-sm btn-ghost" onclick="loadUnifiedInventory()">&#8635; Refresh</button>
+        <button class="btn btn-sm" onclick="enrichInventoryMeta()">Fetch HF Info</button>
+      </div>
+
+      <div class="inv-stats" id="inv-stats"></div>
+
+      <details class="inv-dirs-section">
+        <summary>Scan Directories</summary>
+        <div id="inv-custom-dirs"></div>
+        <div class="input-row" style="margin-top:8px">
+          <input class="input" id="inv-add-dir" placeholder="/home/user/models  or  ~/models" style="font-size:12px"
+            onkeydown="if(event.key==='Enter')addInventoryDir()">
+          <button class="btn btn-sm" onclick="addInventoryDir()">+ Add</button>
+        </div>
+      </details>
+
+      <div id="inv-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div><div style="font-size:12px;color:var(--muted)">Loading inventory...</div></div>
+      </div>
+    </div>
+
+    <!-- ─── HF BROWSE ─── -->
+    <div class="tab" id="tab-hfbrowse">
+      <div class="page-hdr">
+        <div class="page-title">Browse HuggingFace</div>
+        <div class="page-sub">Search and discover models on HuggingFace Hub. Find quant variants, preview files, and download directly.</div>
+      </div>
+
+      <div class="hfb-search-bar">
+        <input class="input" id="hfb-query" placeholder="Search models... e.g. llama 3.1, whisper, stable diffusion"
+          onkeydown="if(event.key==='Enter')hfbSearch()" style="flex:1">
+        <select class="inv-filter" id="hfb-pipeline">
+          <option value="">All Types</option>
+          <option value="text-generation">Text Generation</option>
+          <option value="image-text-to-text">Vision LLM</option>
+          <option value="feature-extraction">Embeddings</option>
+          <option value="automatic-speech-recognition">Speech-to-Text</option>
+          <option value="text-to-speech">Text-to-Speech</option>
+          <option value="text-to-image">Image Generation</option>
+          <option value="text-to-video">Video Generation</option>
+        </select>
+        <select class="inv-filter" id="hfb-sort">
+          <option value="downloads">Most Downloads</option>
+          <option value="likes">Most Likes</option>
+          <option value="lastModified">Recently Updated</option>
+          <option value="trending">Trending</option>
+        </select>
+        <button class="btn btn-primary" onclick="hfbSearch()">Search</button>
+      </div>
+
+      <div id="hfb-results">
+        <div class="empty"><div class="empty-icon" style="font-size:32px">&#129303;</div>
+        <div class="empty-text">Search HuggingFace to discover models</div></div>
+      </div>
+    </div>
+
+    <!-- ─── LITELLM ─── -->
+    <div class="tab" id="tab-litellm">
+      <div class="page-hdr">
+        <div class="page-title">LiteLLM Routing</div>
+        <div class="page-sub">Unified gateway at <code id="litellm-port-display">LiteLLM</code>. All apps — Open WebUI, scripts, agents — connect here. This config controls which models they can see.</div>
+      </div>
+
+      <div id="sudo-banner-litellm" style="display:none;margin-bottom:12px;padding:12px 16px;border-radius:8px;font-size:12px;line-height:1.8"></div>
+
+      <div class="card" id="wildcard-card">
+        <div class="card-row">
+          <div class="card-icon">🃏</div>
+          <div class="card-info">
+            <div class="card-name">Ollama Wildcard Routing</div>
+            <div class="card-meta" id="wc-meta">ollama/* → Ollama</div>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-primary" id="wc-btn" onclick="applyWildcard()">Apply Wildcard</button>
+          </div>
+        </div>
+        <div class="card-desc">
+          Adds a single <code>ollama/*</code> entry to your config. After this one change, any model you pull into Ollama is automatically available at <code id="wc-litellm-port">LiteLLM</code> — no YAML edits, no restarts.
+        </div>
+        <div id="wc-status"></div>
+      </div>
+
+      <div class="sec-label">Active Routes <span class="nav-badge" id="litellm-route-count">—</span></div>
+      <div id="litellm-list"><div class="empty"><div class="spin-icon" style="margin:0 auto"></div></div></div>
+
+      <div class="sec-label">Config File</div>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">~/litellm/litellm_config.yaml</span>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-ghost" onclick="loadLiteLLMConfig()">↻ Refresh</button>
+            <button class="btn btn-sm" onclick="restartLiteLLM()">⟳ Restart</button>
+          </div>
+        </div>
+        <div class="config-block" id="config-block">Loading…</div>
+      </div>
+    </div>
+
+    <!-- ─── ENGINE TABS (generated) ─── -->
+<!--DGX:ENGINE_TABS-->
+    <!-- ─── WARM MODELS ─── -->
+    <div class="tab" id="tab-warm">
+      <div class="page-hdr">
+        <div class="page-title">Warm Model Resources</div>
+        <div class="page-sub">See what is loaded, which processes are holding unified memory, and switch the active vLLM profile.</div>
+      </div>
+
+      <div class="warm-actions" style="margin-bottom:14px">
+        <button class="btn btn-sm btn-ghost" onclick="loadWarmModels()">&#8635; Refresh</button>
+        <button class="btn btn-sm btn-danger" onclick="warmStopVLLM()">Stop vLLM</button>
+        <span class="warm-sub" id="warm-updated">Not loaded yet</span>
+      </div>
+
+      <div class="warm-grid">
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Unified Memory</div>
+              <div class="warm-sub">GB10 RAM and GPU share this pool</div>
+            </div>
+            <span class="warm-pill" id="warm-memory-pill">--</span>
+          </div>
+          <div class="warm-metric" id="warm-memory-metric">--</div>
+          <div class="warm-bar"><div class="warm-bar-fill" id="warm-memory-bar"></div></div>
+          <div class="warm-sub" id="warm-memory-sub" style="margin-top:8px"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">vLLM Active</div>
+              <div class="warm-sub">Container, served model, and matched profile</div>
+            </div>
+            <span class="warm-pill" id="warm-vllm-pill">--</span>
+          </div>
+          <div id="warm-vllm-active"></div>
+        </div>
+
+        <div class="warm-panel full">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Switch vLLM Profile</div>
+              <div class="warm-sub">Launching a profile replaces the current vLLM container.</div>
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="warmStartSelected()">Start Selected</button>
+          </div>
+          <div class="warm-profile-grid" id="warm-vllm-profiles"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">GPU Compute Apps</div>
+              <div class="warm-sub">Resident GPU processes from nvidia-smi</div>
+            </div>
+            <span class="warm-pill" id="warm-gpu-total">--</span>
+          </div>
+          <div id="warm-gpu-apps"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Ollama Warm Models</div>
+              <div class="warm-sub">Models currently kept alive by Ollama</div>
+            </div>
+            <span class="warm-pill" id="warm-ollama-total">--</span>
+          </div>
+          <div id="warm-ollama-models"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Model Containers</div>
+              <div class="warm-sub">Docker runtimes related to model serving</div>
+            </div>
+          </div>
+          <div id="warm-containers"></div>
+        </div>
+
+        <div class="warm-panel">
+          <div class="warm-title">
+            <div>
+              <div class="warm-title-main">Kubernetes vLLM</div>
+              <div class="warm-sub">Scaled deployments in llm-inference</div>
+            </div>
+          </div>
+          <div id="warm-k8s"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── SETTINGS ─── -->
+    <div class="tab" id="tab-settings">
+      <div class="page-hdr">
+        <div class="page-title">Service Configuration</div>
+        <div class="page-sub">Configure the address and port for each service. Changes take effect immediately and are saved to <code>config.json</code>.</div>
+      </div>
+
+      <div class="card" id="svc-ollama-card" style="margin-bottom:8px">
+        <div class="card-row" style="align-items:center">
+          <div class="card-icon">🦙</div>
+          <div class="card-info" style="flex:1">
+            <div class="card-name">Ollama</div>
+            <div class="card-meta">Model pulling, listing, and deletion</div>
+          </div>
+          <div class="svc-status" id="svc-ollama-status"></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+          <input class="input" id="svc-ollama-url" placeholder="http://127.0.0.1:11434" style="flex:1;font-size:12px">
+          <button class="btn btn-sm" onclick="testService('ollama')">Test</button>
+        </div>
+      </div>
+
+      <div class="card" id="svc-litellm-card" style="margin-bottom:8px">
+        <div class="card-row" style="align-items:center">
+          <div class="card-icon">⚡</div>
+          <div class="card-info" style="flex:1">
+            <div class="card-name">LiteLLM</div>
+            <div class="card-meta">Unified API gateway and model routing</div>
+          </div>
+          <div class="svc-status" id="svc-litellm-status"></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+          <input class="input" id="svc-litellm-url" placeholder="http://127.0.0.1:4000" style="flex:1;font-size:12px">
+          <button class="btn btn-sm" onclick="testService('litellm')">Test</button>
+        </div>
+      </div>
+
+<!--DGX:SETTINGS_ENGINE_CARDS-->
+
+      <div style="display:flex;align-items:center;gap:12px;margin-top:16px">
+        <button class="btn btn-primary" onclick="saveConfig()">Save Configuration</button>
+        <button class="btn btn-sm btn-ghost" onclick="testAllServices()">Test All</button>
+        <span id="settings-msg" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+
+      <div class="sec-label" style="margin-top:24px">Security</div>
+
+      <div class="card" style="margin-bottom:8px">
+        <div class="card-row" style="align-items:center">
+          <div class="card-icon">🔒</div>
+          <div class="card-info" style="flex:1">
+            <div class="card-name">API Key</div>
+            <div class="card-meta">When set, all actions (pull, delete, start, stop, config changes) require this key. Leave blank for open access.</div>
+          </div>
+          <div class="svc-status" id="auth-status"></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center">
+          <input class="input" id="svc-api-key" type="password" placeholder="Enter a key to protect this instance (optional)" style="flex:1;font-size:12px">
+          <button class="btn btn-sm" onclick="saveApiKey()">Set Key</button>
+          <button class="btn btn-sm btn-danger" onclick="clearApiKey()">Clear</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── LOGS & DEBUG ─── -->
+    <div class="tab" id="tab-debug">
+      <div class="page-hdr">
+        <div class="page-title">Logs &amp; Debug</div>
+        <div class="page-sub">System diagnostics, running configuration, and log viewer.</div>
+      </div>
+
+      <div class="sec-label">System Overview</div>
+      <div id="debug-system" style="margin-bottom:18px">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div><div style="font-size:12px;color:var(--muted)">Loading system info...</div></div>
+      </div>
+
+      <div class="sec-label">Running Configuration</div>
+      <div class="card" style="margin-bottom:8px;padding:12px 14px">
+        <details><summary class="debug-section-hdr">App Configuration</summary>
+        <div id="debug-cfg-app" class="config-block" style="margin-top:10px">Loading...</div>
+        </details>
+      </div>
+      <div class="card" style="margin-bottom:8px;padding:12px 14px">
+        <details><summary class="debug-section-hdr">LiteLLM Configuration</summary>
+        <div id="debug-cfg-litellm" class="config-block" style="margin-top:10px">Loading...</div>
+        </details>
+      </div>
+<!--DGX:DEBUG_ENGINE_CARDS-->
+
+      <div class="sec-label">Application Logs</div>
+      <div class="card" style="margin-bottom:18px">
+        <div class="log-toolbar">
+          <select class="input log-level-select" id="log-level-filter" onchange="loadAppLogs()">
+            <option value="">All Levels</option>
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO+</option>
+            <option value="WARNING">WARNING+</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <input class="input" id="log-search" placeholder="Search logs..." style="flex:1" onkeydown="if(event.key==='Enter')loadAppLogs()">
+          <label class="log-auto-label"><input type="checkbox" id="log-auto-refresh"> Auto</label>
+          <button class="btn btn-sm" onclick="loadAppLogs()">Refresh</button>
+          <button class="btn btn-sm btn-danger" onclick="clearAppLogs()">Clear</button>
+        </div>
+        <div class="log-pane" id="app-log-pane">
+          <div class="empty"><div class="empty-text">No log entries yet.</div></div>
+        </div>
+        <div class="log-footer" id="app-log-footer"></div>
+      </div>
+
+      <div class="sec-label">Engine Logs</div>
+      <div class="card" style="margin-bottom:18px">
+        <div class="log-toolbar">
+          <div class="log-tab-bar">
+<!--DGX:LOG_TAB_BUTTONS-->          </div>
+          <input class="input" id="engine-log-search" placeholder="Search..." style="flex:1" onkeydown="if(event.key==='Enter')loadEngineLog()">
+          <label class="log-auto-label"><input type="checkbox" id="engine-auto-refresh"> Auto</label>
+          <button class="btn btn-sm" onclick="loadEngineLog()">Refresh</button>
+        </div>
+        <div class="log-pane" id="engine-log-pane">
+          <div class="empty"><div class="empty-text">Select an engine and click Refresh.</div></div>
+        </div>
+        <div class="log-footer" id="engine-log-footer"></div>
+      </div>
+
+      <div class="sec-label">LiteLLM Service Logs</div>
+      <div class="card" style="margin-bottom:18px">
+        <div class="log-toolbar">
+          <input class="input" id="litellm-log-search" placeholder="Search..." style="flex:1" onkeydown="if(event.key==='Enter')loadLiteLLMLogs()">
+          <label class="log-auto-label"><input type="checkbox" id="litellm-auto-refresh"> Auto</label>
+          <button class="btn btn-sm" onclick="loadLiteLLMLogs()">Refresh</button>
+        </div>
+        <div class="log-pane" id="litellm-log-pane">
+          <div class="empty"><div class="empty-text">Click Refresh to load journalctl output.</div></div>
+        </div>
+        <div class="log-footer" id="litellm-log-footer"></div>
+      </div>
+
+      <div class="sec-label">Docker Containers</div>
+      <div class="card">
+        <div style="display:flex;justify-content:flex-end;margin-bottom:8px">
+          <button class="btn btn-sm" onclick="loadDockerState()">Refresh</button>
+        </div>
+        <div id="docker-state-content">
+          <div class="empty"><div class="empty-text">Click Refresh to load Docker state.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── DASHBOARDS ─── -->
+    <div class="tab" id="tab-sites">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Dashboards</div>
+          <div class="page-sub">Web UIs running on this box right now &mdash; discovered from listening ports and Kubernetes NodePorts. Names and groups can be curated via the <code>sites</code> array in <code>config.json</code>.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;white-space:nowrap">
+          <label class="page-sub" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer"
+                 title="Also show ports that answered with JSON or plain text instead of a page (APIs, exporters).">
+            <input type="checkbox" id="sites-show-api" onchange="renderSites()"> APIs
+          </label>
+          <button class="btn btn-sm" onclick="loadSites(true)" title="Re-probe every listening port">&#8635; Rescan</button>
+        </div>
+      </div>
+      <div id="sites-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="sites-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
+    <!-- ─── AGENTS ─── -->
+    <div class="tab" id="tab-agents">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Agents</div>
+          <div class="page-sub">The background jobs this app runs on demand. Start one and it reports completion here; recent runs and their summaries are kept below.</div>
+        </div>
+        <div class="page-sub" style="white-space:nowrap">refreshes every 60s while open</div>
+      </div>
+      <div id="agents-list">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
+    <!-- ─── RECOMMENDATIONS ─── -->
+    <div class="tab" id="tab-recs">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Recommendations</div>
+          <div class="page-sub">Spark-specific tuning &amp; model advice, diffed against your vLLM profiles and live memory. Curated in <code>recommendations.json</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="recs-refresh-btn" onclick="refreshKB()"
+                title="Fetch curated sources and ask the research engine for proposed KB updates (~1-2 min). Proposals are for review only — apply via research_refresh.py.">&#8635; Refresh KB</button>
+      </div>
+      <div id="recs-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="recs-proposed" style="margin-bottom:18px"></div>
+      <div id="recs-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
+    <div class="tab" id="tab-updates">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Image Updates</div>
+          <div class="page-sub">How far each <code>llm-inference</code> image is behind upstream. Read-only &mdash; apply via <code>ai-infra/k8s/inference/UPGRADING.md</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="updates-refresh-btn" onclick="refreshImageDrift()"
+                title="Query GitHub / Docker Hub for the newest release in each image's version track (~10-30s). Reports only; nothing is applied.">&#8635; Check now</button>
+      </div>
+      <div id="updates-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="updates-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<div id="toast-root"></div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Escaping. ONE helper for the whole UI (T-04-16): escape at the DOM sink, in JS,
+// exactly once. Covers all five of & < > " ' so it is safe in both element-text
+// and quoted-attribute position. `q` (further down) escapes for a JS STRING
+// literal and is NOT an HTML escaper — a bare `q` in an onclick= attribute is
+// still breakable with a double quote, so attribute sites need esc(q(x)).
+// Do not add per-site .replace('<','&lt;') calls: 86 innerHTML sinks is exactly
+// how the original gap happened.
+// ─────────────────────────────────────────────────────────────────────────────
+const _ESC_MAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => _ESC_MAP[c]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+
+let activeTab = 'vllm';
+let selectedProfile = null;
+let selectedVLLMProfile = null;
+let statusTimer = null;
+let agentsTimer = null;
+let litellmPort = '';
+let ollamaBase = '';
+let warmSelectedProfile = null;
+
+// Header memory gauge — alert threshold spliced in from server config
+const MEM_ALERT_PCT = __MEM_ALERT_PCT__;
+let memHistory = [];  // last ~60 used_pct samples (12s poll ≈ 12 min window)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', () => {
+  switchTab(activeTab);  // land on the vLLM switcher (static markup defaults to ollama)
+  pollStatus();
+  loadOllamaModels();    // still needed for the sidebar badge
+  loadNodeInfo();
+  loadScriptDirs();
+  loadSites();           // pre-render the Dashboards pane
+  checkSudo();
+  statusTimer = setInterval(pollStatus, 12000);
+});
+
+let _nodeServices = {};
+function _engineBaseUrl(key) { return _nodeServices[key] || ''; }
+
+async function loadScriptDirs() {
+  try {
+    const d = await apiFetch('/api/scriptdirs');
+    for (const [key, path] of Object.entries(d)) {
+      const el = document.getElementById(key + '-script-dir-banner');
+      if (el) el.textContent = path + '/';
+    }
+  } catch(e) {}
+}
+
+async function checkSudo() {
+  try {
+    const r = await fetch('/api/sudo/check');
+    const d = await r.json();
+    const liteBanner = document.getElementById('sudo-banner-litellm');
+    if (!d.systemctl) {
+      liteBanner.style.display = 'block';
+      liteBanner.style.background = 'rgba(239,68,68,0.08)';
+      liteBanner.style.border = '1px solid rgba(239,68,68,0.25)';
+      liteBanner.innerHTML = '<div style="color:var(--red);font-weight:700;margin-bottom:4px">\u26a0 Passwordless sudo not configured</div>' +
+        'Restarting LiteLLM requires <code>sudo systemctl restart litellm</code>. To enable this without a password prompt:<br>' +
+        '<code style="font-size:11px;display:block;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.15);border-radius:4px">echo \\"$USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart litellm\\" | sudo tee /etc/sudoers.d/model-manager</code>';
+    } else {
+      liteBanner.style.display = 'block';
+      liteBanner.style.background = 'rgba(34,197,94,0.08)';
+      liteBanner.style.border = '1px solid rgba(34,197,94,0.25)';
+      liteBanner.innerHTML = '<span style="color:var(--green)">\u2713</span> Passwordless sudo is configured \u2014 LiteLLM restart will work.';
+    }
+    const dockerOk = d.docker;
+    Object.keys(engines).forEach(key => {
+      const el = document.getElementById('sudo-banner-' + key);
+      if (!el) return;
+      if (!dockerOk) {
+        el.style.display = 'block';
+        el.style.background = 'rgba(239,68,68,0.08)';
+        el.style.border = '1px solid rgba(239,68,68,0.25)';
+        el.innerHTML = '<div style="color:var(--red);font-weight:700;margin-bottom:4px">\u26a0 Docker access issue</div>' +
+          'Cannot list containers. Make sure Docker is installed and your user is in the <code>docker</code> group:<br>' +
+          '<code style="font-size:11px;display:block;margin-top:6px;padding:8px 10px;background:rgba(0,0,0,.15);border-radius:4px">sudo usermod -aG docker $USER && newgrp docker</code>';
+      } else {
+        el.style.display = 'block';
+        el.style.background = 'rgba(34,197,94,0.08)';
+        el.style.border = '1px solid rgba(34,197,94,0.25)';
+        el.innerHTML = '<span style="color:var(--green)">\u2713</span> Docker access confirmed \u2014 container management will work.';
+      }
+    });
+  } catch(e) {}
+}
+
+async function loadNodeInfo() {
+  try {
+    const r = await fetch('/api/nodeinfo');
+    const d = await r.json();
+    document.getElementById('hdr-node').textContent =
+      d.hostname + ' \u00b7 ' + d.ip + ' \u00b7 :' + d.port;
+    litellmPort = d.litellm_port || '';
+    ollamaBase = d.ollama_base || '';
+    // Memory gauge deep-links to Grafana when app.grafana_url is configured
+    if (d.grafana_url) document.getElementById('hdr-mem').href = d.grafana_url;
+    // Store service URLs for engine webui links
+    _nodeServices = d.services || {};
+    // Populate engine footers dynamically
+    for (const [key, eng] of Object.entries(engines)) {
+      const footer = document.getElementById(eng.ids.footer);
+      if (footer && d.engine_ports && d.engine_ports[key + '_port']) {
+        const parts = ['Port :' + d.engine_ports[key + '_port']];
+        if (d.arch) parts.push(d.arch);
+        if (d.memory_gb) parts.push(d.memory_gb + ' GB memory');
+        footer.textContent = parts.join(' \u00b7 ');
+      }
+    }
+    // Populate dynamic port displays
+    const lp = ':' + litellmPort;
+    const setTxt = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+    setTxt('ollama-litellm-port', lp);
+    setTxt('litellm-port-display', lp);
+    setTxt('wc-litellm-port', lp);
+    setTxt('wc-meta', 'ollama/* \u2192 ' + ollamaBase);
+  } catch(e) {
+    document.getElementById('hdr-node').textContent = 'could not detect';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tab switching
+// ─────────────────────────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  // Clear background timers when navigating away
+  stopAgentsPoll();
+  Object.keys(_debugTimers).forEach(k => { clearInterval(_debugTimers[k]); delete _debugTimers[k]; });
+  ['log-auto-refresh','engine-auto-refresh','litellm-auto-refresh'].forEach(id => {
+    const cb = document.getElementById(id); if (cb) cb.checked = false;
+  });
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.getElementById('nav-' + name).classList.add('active');
+  activeTab = name;
+  if (name === 'litellm') { loadLiteLLMModels(); loadLiteLLMConfig(); checkWildcard(); }
+  else if (engines[name]) { loadEngineStatus(engines[name]); loadEngineProfiles(engines[name]); }
+  else if (name === 'ollama') { loadOllamaModels(); }
+  else if (name === 'inventory') { loadUnifiedInventory(); loadCustomDirs(); }
+  else if (name === 'warm') { loadWarmModels(); }
+  else if (name === 'settings') { loadConfig(); }
+  else if (name === 'debug') { loadDebugTab(); }
+  else if (name === 'sites') { loadSites(); }
+  else if (name === 'recs') { loadRecommendations(); loadProposed(); }
+  else if (name === 'updates') { loadImageDrift(); }
+  else if (name === 'agents') { loadAgents(); startAgentsPoll(); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Status
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function pollStatus() {
+  try {
+    const d = await apiFetch('/api/status');
+    setPill('pill-ollama', d.ollama ? d.ollama.ok : false, 'Ollama');
+    setPill('pill-litellm', d.litellm ? d.litellm.ok : false, 'LiteLLM');
+    for (const [key, eng] of Object.entries(engines)) {
+      if (d[key]) {
+        setPill('pill-' + key, d[key].ok,
+          d[key].model ? eng.name + ' \u00b7 ' + d[key].model.split('/').pop().slice(0,18) : eng.name);
+      }
+    }
+    updateMemGauge(d.memory);
+  } catch(e) {}
+}
+
+function updateMemGauge(mem) {
+  if (!mem || mem.error || !mem.total_gb) return;
+  memHistory.push(mem.used_pct);
+  if (memHistory.length > 60) memHistory.shift();
+  const el = document.getElementById('hdr-mem');
+  el.style.display = 'flex';
+  document.getElementById('mem-used').textContent =
+    Math.round(mem.used_gb) + ' / ' + Math.round(mem.total_gb) + ' GB';
+  const pctEl = document.getElementById('mem-pct');
+  pctEl.textContent = Math.round(mem.used_pct) + '%';
+  pctEl.classList.toggle('crit', mem.used_pct >= MEM_ALERT_PCT);
+  el.title = 'Unified memory \u2014 ' + mem.used_gb + ' GB used, ' + mem.available_gb +
+    ' GB available of ' + mem.total_gb + ' GB \u00b7 alert threshold ' + MEM_ALERT_PCT +
+    '% (dashed line) \u00b7 ~12 min history';
+  // Inline-SVG sparkline on a fixed 0-100% scale so the threshold line is stable.
+  // A single sample is drawn as a full-width level so the gauge reads as a
+  // filled meter immediately, before ~12 min of history accumulates.
+  const W = 72, H = 20, n = memHistory.length, base = H - 1;
+  const y = p => base - (Math.min(Math.max(p, 0), 100) / 100) * (H - 2);
+  const x = i => n > 1 ? 1 + (i / (n - 1)) * (W - 2) : 71;
+  const linePts = n === 1
+    ? ['1,' + y(memHistory[0]).toFixed(1), '71,' + y(memHistory[0]).toFixed(1)]
+    : memHistory.map((p, i) => x(i).toFixed(1) + ',' + y(p).toFixed(1));
+  document.getElementById('mem-spark-line').setAttribute('points', linePts.join(' '));
+  // Fill the area under the line down to the baseline so the "level" is visible.
+  document.getElementById('mem-spark-area').setAttribute('points',
+    ['1,' + base, ...linePts, '71,' + base].join(' '));
+  const dot = document.getElementById('mem-spark-dot');
+  dot.setAttribute('cx', '71');
+  dot.setAttribute('cy', y(memHistory[n - 1]).toFixed(1));
+  const th = document.getElementById('mem-spark-threshold');
+  th.setAttribute('y1', y(MEM_ALERT_PCT).toFixed(1));
+  th.setAttribute('y2', y(MEM_ALERT_PCT).toFixed(1));
+}
+
+function setPill(id, ok, label) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'pill ' + (ok ? 'ok' : 'err');
+  const sp = el.querySelector('span');
+  if (sp) sp.textContent = label;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashboards
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _lastSites = null;
+
+async function loadSites(rescan) {
+  const root = document.getElementById('sites-root');
+  const meta = document.getElementById('sites-meta');
+  if (rescan) root.innerHTML = '<div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>';
+  try {
+    _lastSites = await apiFetch('/api/sites' + (rescan ? '?refresh=1' : ''));
+    const dd = _lastSites.discovery || {};
+    const bits = [];
+    if (dd.enabled === false) bits.push('discovery disabled &mdash; showing config only');
+    else bits.push(dd.candidates + ' listening ports probed &middot; ' + dd.ui + ' UIs, ' + dd.api + ' APIs');
+    if (dd.host && dd.host.ok === false) bits.push('host scan failed: ' + _escHtml(dd.host.error || ''));
+    if (dd.kubernetes && dd.kubernetes.ok === false) bits.push('kubectl unavailable');
+    if (_lastSites.cached_age_s) bits.push('cached ' + _lastSites.cached_age_s + 's ago');
+    meta.innerHTML = bits.join(' &middot; ');
+    renderSites();
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
+      '<div class="empty-text">Could not load dashboards &middot; ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+function renderSites() {
+  const root = document.getElementById('sites-root');
+  if (!_lastSites) return;
+  const showApi = document.getElementById('sites-show-api').checked;
+  const sites = (_lastSites.sites || []).filter(s => showApi || s.kind !== 'api');
+  if (!sites.length) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
+      '<div class="empty-text">No web UIs found on this box</div></div>';
+    return;
+  }
+  // Two services can share a <title> ("Node Exporter" on :9100 and :9101) — a
+  // repeated name makes the pair unreadable, so it earns its port back.
+  const nameCount = {};
+  sites.forEach(s => { nameCount[s.name] = (nameCount[s.name] || 0) + 1; });
+  const label = s => nameCount[s.name] > 1 && s.port ? s.name + ' :' + s.port : s.name;
+
+  // Group cards under sec-label headings. Curated groups keep their meaning and
+  // sort first; the auto-assigned buckets fall to the bottom of the page.
+  const TAIL = ['Kubernetes', 'Host', 'Other'];
+  const groups = new Map();
+  sites.forEach(s => {
+    const g = s.group || 'Other';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(s);
+  });
+  const order = [...groups.keys()].sort((a, b) => {
+    const ai = TAIL.indexOf(a), bi = TAIL.indexOf(b);
+    if (ai !== bi) return (ai < 0 ? -1 : ai) - (bi < 0 ? -1 : bi);
+    return a.localeCompare(b);
+  });
+  let html = '';
+  for (const group of order) {
+    html += '<div class="sec-label">' + _escHtml(group) + '</div>';
+    html += '<div class="model-grid">' + groups.get(group).map(s => {
+      let hostLabel = s.url;
+      try { hostLabel = new URL(s.url).host; } catch(e) {}
+      const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
+      const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
+      const href = _escHtml(s.url).replace(/"/g, '&quot;');
+      const tag = s.kind === 'api'
+        ? '<span class="tag">api</span>'
+        : '<span class="tag tag-amber">open ↗</span>';
+      return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
+        '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
+        '<div class="model-card-info">' +
+          '<div class="model-card-name">' + _escHtml(label(s)) + '</div>' +
+          '<div class="model-card-meta">' + _escHtml(hostLabel) +
+            (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
+        '</div>' +
+        '<div class="model-card-right">' + tag + '</div>' +
+      '</a>';
+    }).join('') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Agents — the app's on-demand background jobs; completion polls every 60s
+// ─────────────────────────────────────────────────────────────
+
+function startAgentsPoll() {
+  stopAgentsPoll();
+  agentsTimer = setInterval(loadAgents, 60000);
+}
+
+function stopAgentsPoll() {
+  if (agentsTimer) { clearInterval(agentsTimer); agentsTimer = null; }
+}
+
+async function loadAgents() {
+  const root = document.getElementById('agents-list');
+  if (!root) return;
+  let d;
+  try { d = await apiFetch('/api/agents'); } catch (e) { return; }
+  renderAgents(d.agents || [], root);
+}
+
+function _agentChip(a) {
+  const cls = a.running ? 'run' : (a.status === 'ok' ? 'ok'
+            : (a.status === 'error' ? 'err' : 'idle'));
+  return '<span class="agent-chip ' + cls + '">' + esc(a.running ? 'running' : (a.status || 'idle')) + '</span>';
+}
+
+function _agentHistory(h) {
+  if (!h || !h.length) return '<div class="agent-hist-empty">No runs yet.</div>';
+  const rows = h.slice(0, 5).map(r => {
+    const t = (r.finished_at || r.started_at || '');
+    const stamp = t ? t.replace('T', ' ').slice(0, 19) : '';
+    const dur = (r.duration_s != null) ? ' &middot; ' + r.duration_s + 's' : '';
+    const ok = r.status === 'ok';
+    return '<li class="agent-hist-row">'
+      + '<span class="agent-hist-time">' + esc(stamp) + dur + '</span>'
+      + '<span class="agent-hist-status ' + (ok ? 'ok' : 'err') + '">' + esc(r.status) + '</span>'
+      + '<span class="agent-hist-summary">' + esc(r.summary || '') + '</span>'
+      + '</li>';
+  }).join('');
+  return '<ul class="agent-hist">' + rows + '</ul>';
+}
+
+function renderAgents(list, root) {
+  if (!list.length) { root.innerHTML = '<div class="empty">No agents configured.</div>'; return; }
+  const running = list.filter(a => a.running).length;
+  const badge = document.getElementById('badge-agents');
+  if (badge) badge.textContent = running ? String(running) : '';
+
+  root.innerHTML = list.map(a => {
+    const pct = a.running ? (a.progress || 0) : 0;
+    const bar = a.running
+      ? '<div class="agent-track"><div class="agent-fill" id="agents-fill-' + a.id + '" style="width:' + pct + '%"></div></div>'
+        + '<div class="agent-progress">' + pct + '% &middot; ' + esc(a.label || 'starting') + '</div>'
+      : '';
+    const lastLine = !a.running
+      ? '<div class="agent-last">' + (a.last
+          ? esc(a.last.status || '') + ' &middot; ' + esc(a.last.summary || '')
+          : 'Not run yet.') + '</div>'
+      : '';
+    return '<div class="card agent-card">'
+      + '<div class="agent-head">'
+        + '<div class="agent-titles">'
+          + '<div class="agent-name">' + esc(a.name) + '</div>'
+          + '<div class="agent-desc">' + esc(a.desc) + '</div>'
+        + '</div>'
+        + _agentChip(a)
+        + '<button class="btn btn-primary btn-sm" id="agents-run-' + a.id + '" '
+          + (a.running ? 'disabled' : '') + ' onclick="runAgent(\'' + a.id + '\')">'
+          + (a.running ? 'Running&hellip;' : '\u25B6&nbsp;Run') + '</button>'
+      + '</div>'
+      + bar
+      + lastLine
+      + '<div class="sec-label">Recent runs</div>'
+      + _agentHistory(a.history)
+      + '</div>';
+  }).join('');
+}
+
+async function runAgent(id) {
+  const btn = document.getElementById('agents-run-' + id);
+  if (btn) btn.disabled = true;
+  let r;
+  try { r = await apiFetch('/api/agents/' + id + '/run', 'POST'); }
+  catch (e) {
+    toast(e.message || 'Failed to start agent', 'err');
+    if (btn) btn.disabled = false;
+    return;
+  }
+  toast(r.message || ('Agent ' + id + ' started'));
+  await loadAgents();
+  startAgentsPoll();   // restart the 60s cadence from now
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recommendations
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _SEV = {
+  high:   { label: 'HIGH',   bg: 'rgba(239,68,68,.15)',  fg: '#f87171' },
+  medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
+  low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
+};
+let _lastRecs = [];  // last fired recommendations, for approve/apply lookups by id
+
+async function loadRecommendations() {
+  const root = document.getElementById('recs-root');
+  const meta = document.getElementById('recs-meta');
+  try {
+    const d = await apiFetch('/api/recommendations');
+    const recs = d.recommendations || [];
+    _lastRecs = recs;
+    document.getElementById('badge-recs').textContent = recs.length;
+    const st = d.state || {};
+    meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
+      (st.total_gb ? ' · ' + Math.round(st.available_gb) + ' / ' + Math.round(st.total_gb) +
+        ' GB free · ' + d.profiles_checked + ' profiles checked' : '') +
+      (d.meta && d.meta.last_updated ? ' · KB ' + _escHtml(d.meta.last_updated) : '');
+
+    if (!recs.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">✅</div>' +
+        '<div class="empty-text">No recommendations — your profiles match current Spark best practice.</div></div>';
+      return;
+    }
+    root.innerHTML = recs.map(r => {
+      const sev = _SEV[r.severity] || _SEV.low;
+      const chip = (txt, extra) => '<span style="display:inline-block;padding:2px 8px;border-radius:6px;' +
+        'font-size:11px;font-weight:600;' + (extra || '') + '">' + txt + '</span>';
+      const fired = r.scope === 'global'
+        ? '<div class="model-card-meta" style="margin-top:8px">' + _escHtml(r.detail) + '</div>'
+        : '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">' +
+            r.fired_for.map(h => chip(_escHtml(h.profile.replace(/^start_/, '')) +
+              ' · ' + _escHtml(h.detail),
+              'background:var(--s2);color:var(--muted);font-weight:500')).join('') +
+          '</div>';
+      const src = (r.sources || []).map(s =>
+        '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+        'style="color:var(--blue);text-decoration:none">' +
+        _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
+      ).join(' · ');
+      const rid = (r.id || '').replace(/'/g, "\\'");
+      const actions = [];
+      if (r.kind === 'model' && r.download && r.download.repo_id) {
+        actions.push('<button class="btn btn-sm btn-primary" onclick="approveModel(\'' + rid + '\')">' +
+          '⬇ Approve &amp; download</button>');
+      }
+      if (r.apply && (r.fired_for || []).length) {
+        r.fired_for.forEach(h => {
+          const pid = (h.profile || '').replace(/'/g, "\\'");
+          actions.push('<button class="btn btn-sm" onclick="applyRec(\'' + rid + '\',\'' + pid + '\')">' +
+            '✎ Apply to ' + _escHtml(h.profile.replace(/^start_/, '').replace(/\.sh$/, '')) + '</button>');
+        });
+      }
+      const actionBar = actions.length
+        ? '<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">' + actions.join('') + '</div>' : '';
+      return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+          chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
+          '<span class="model-card-name">' + _escHtml(r.title) + '</span>' +
+          chip(_escHtml(r.kind) + ' · ' + _escHtml(r.confidence || '') + ' conf',
+               'background:var(--s2);color:var(--muted);font-weight:500') +
+        '</div>' +
+        '<div class="model-card-meta" style="margin-top:8px;line-height:1.5">' + _escHtml(r.summary) + '</div>' +
+        '<div style="margin-top:8px;font-size:13px"><strong style="color:var(--text)">Do:</strong> ' +
+          _escHtml(r.action) + '</div>' +
+        fired +
+        (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+        actionBar +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div>' +
+      '<div class="empty-text">Could not load recommendations · ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// Proposed KB updates from the research-refresh job. Review-only: applying stays
+// a deliberate CLI step (research_refresh.py --apply, then formalize matches).
+function renderProposed(summary, proposed) {
+  const panel = document.getElementById('recs-proposed');
+  if (!proposed || !proposed.length) { panel.innerHTML = ''; return; }
+  const rows = proposed.map(p => {
+    const isUpd = p.status === 'update';
+    const tag = (txt, bg, fg) => '<span style="display:inline-block;padding:1px 7px;border-radius:6px;' +
+      'font-size:10px;font-weight:700;background:' + bg + ';color:' + fg + '">' + txt + '</span>';
+    const src = (p.sources || []).map(s =>
+      '<a href="' + _escHtml(s.url).replace(/"/g, '&quot;') + '" target="_blank" rel="noopener" ' +
+      'style="color:var(--blue);text-decoration:none">' + _escHtml(s.note || s.url) + '</a>').join(' · ');
+    return '<div style="padding:10px 0;border-top:1px solid var(--border)">' +
+      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+        tag(isUpd ? 'UPDATE' : 'NEW', isUpd ? 'rgba(59,130,246,.15)' : 'rgba(16,185,129,.15)',
+            isUpd ? '#60a5fa' : '#34d399') +
+        tag(_escHtml(p.severity || '?'), 'var(--s2)', 'var(--muted)') +
+        '<span style="font-weight:600;color:var(--text)">' + _escHtml(p.title || p.id) + '</span>' +
+      '</div>' +
+      '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(p.summary || '') + '</div>' +
+      '<div style="margin-top:6px;font-size:12px"><strong style="color:var(--text)">Match intent:</strong> ' +
+        _escHtml(p.suggested_match || '') + '</div>' +
+      (src ? '<div class="model-card-meta" style="margin-top:6px;font-size:11px">Sources: ' + src + '</div>' : '') +
+    '</div>';
+  }).join('');
+  panel.innerHTML = '<div class="model-card" style="display:block;cursor:default;' +
+    'border-color:var(--blue);background:rgba(59,130,246,.04)">' +
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+      '<span class="model-card-name">🧪 Proposed KB updates · ' + proposed.length + '</span>' +
+      '<span class="model-card-meta" style="font-size:12px">review-only</span>' +
+    '</div>' +
+    (summary ? '<div class="model-card-meta" style="margin-top:6px;line-height:1.5">' + _escHtml(summary) + '</div>' : '') +
+    rows +
+    '<div class="model-card-meta" style="margin-top:12px;font-size:12px">Apply deliberately: ' +
+      '<code>python3 research_refresh.py --apply</code>, then formalize each <code>match.type=="manual"</code> rule.</div>' +
+  '</div>';
+}
+
+async function loadProposed() {
+  try {
+    const d = await apiFetch('/api/recommendations/proposed');
+    renderProposed(d.summary, d.proposed);
+  } catch(e) { /* non-fatal: panel just stays empty */ }
+}
+
+async function refreshKB() {
+  const btn = document.getElementById('recs-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Researching…';
+  toast('Running research refresh — this takes ~1-2 min', '');
+  try {
+    const d = await apiFetch('/api/recommendations/refresh', 'POST');
+    renderProposed(d.summary, d.proposed);
+    const n = (d.proposed || []).length;
+    toast(n ? '✓ ' + n + ' proposal(s) — review below' : 'No new proposals', n ? 'ok' : '');
+  } catch(e) {
+    toast('Refresh failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image drift — read-only. Every row is a statement about upstream, never an
+// action: there is no apply button here by design, because the risky half of an
+// upgrade (forward-only schema migrations) needs a human and a PVC backup.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _DRIFT_LABEL = {
+  outdated: ['Update available', 'var(--warn, #d98324)'],
+  current:  ['Up to date',       'var(--ok, #3fa66a)'],
+  unknown:  ['Unresolved',       'var(--muted)'],
+  partial:  ['Floating tag',     'var(--muted)'],
+  rolling:  ['Rolling tag',      'var(--muted)'],
+  digest:   ['Digest-pinned',    'var(--muted)'],
+};
+
+function renderImageDrift(d) {
+  const root = document.getElementById('updates-root');
+  const meta = document.getElementById('updates-meta');
+  const rows = (d && d.rows) || [];
+
+  if (!rows.length) {
+    root.innerHTML = '<div class="empty">' +
+      (d && d.exists === false
+        ? 'No report yet — press <b>Check now</b>.'
+        : esc((d && (d.errors || [])[0]) || 'No images found.')) + '</div>';
+    meta.textContent = '';
+    document.getElementById('badge-updates').textContent = '—';
+    return;
+  }
+
+  const order = {outdated:0, unknown:1, current:2, partial:3, rolling:4, digest:5};
+  rows.sort((a,b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) ||
+                     a.deployment.localeCompare(b.deployment));
+
+  const outdated = rows.filter(r => r.status === 'outdated').length;
+  document.getElementById('badge-updates').textContent = outdated || '0';
+
+  let html = '<div class="inv-table-wrap" style="border-radius:8px;border:1px solid var(--border)">' +
+             '<table class="inv-table"><thead><tr>' +
+             '<th>Deployment</th><th>Running</th><th>Latest in track</th><th>Status</th>' +
+             '</tr></thead><tbody>';
+  for (const r of rows) {
+    const [label, color] = _DRIFT_LABEL[r.status] || [r.status, 'var(--muted)'];
+    const running = r.tag || (r.image || '').split('@')[1] || '—';
+    let latest = r.latest ? esc(r.latest) : '<span style="color:var(--muted)">—</span>';
+    if (r.latest && r.verified === false) latest += ' <span title="Not present in the registry tag list — confirm before applying">*</span>';
+    html += '<tr><td><b>' + esc(r.deployment) + '</b></td>' +
+            '<td><code>' + esc(running) + '</code></td>' +
+            '<td><code>' + latest + '</code></td>' +
+            '<td style="color:' + color + '">' + esc(label) + '</td></tr>';
+    if (r.note) {
+      html += '<tr><td></td><td colspan="3" class="page-sub" style="padding-top:0">' +
+              esc(r.note) + '</td></tr>';
+    }
+  }
+  html += '</tbody></table></div>';
+
+  const stale = rows.filter(r => r.status === 'unknown').length;
+  html += '<div class="page-sub" style="margin-top:10px">' +
+    'Comparison stays inside each image’s version track, so a major-version move ' +
+    '(Postgres 15→16, Prometheus v2→v3) is deliberately not shown as an update — ' +
+    'those are migrations, not bumps. Floating and digest-pinned tags have nothing to compare against.' +
+    (stale ? ' <b>' + stale + '</b> image(s) could not be resolved upstream.' : '') +
+    '</div>';
+  root.innerHTML = html;
+
+  if (d.checked_at) {
+    const when = new Date(d.checked_at * 1000);
+    meta.textContent = outdated + ' of ' + rows.length + ' image(s) behind upstream · checked ' +
+                       when.toLocaleString();
+  }
+}
+
+async function loadImageDrift() {
+  try {
+    renderImageDrift(await apiFetch('/api/images/drift'));
+  } catch(e) { /* non-fatal: panel shows its empty state */ }
+}
+
+async function refreshImageDrift() {
+  const btn = document.getElementById('updates-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Checking…';
+  try {
+    const d = await apiFetch('/api/images/check', 'POST');
+    renderImageDrift(d);
+    const n = (d.rows || []).filter(r => r.status === 'outdated').length;
+    toast(n ? '✓ ' + n + ' image(s) behind upstream' : '✓ All tracked images current', n ? '' : 'ok');
+  } catch(e) {
+    toast('Image check failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+// Approve a model recommendation → confirm the HF repo, then run the existing
+// download flow (SSE), which auto-wires a vLLM profile on completion.
+function closeRecModal() { const m = document.getElementById('rec-modal'); if (m) m.remove(); }
+
+function approveModel(id) {
+  const r = _lastRecs.find(x => x.id === id);
+  if (!r || !r.download) { toast('No download info for this recommendation', 'err'); return; }
+  window._approveRecId = id;
+  const repo = r.download.repo_id || '';
+  const dir = r.download.local_dir || '';
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:520px;max-width:92vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Approve &amp; download</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">' + _escHtml(r.title) +
+        '. This pulls the model from Hugging Face and auto-creates a vLLM profile when the download finishes.</div>' +
+      '<label style="font-size:11px;color:var(--muted)">HF repo</label>' +
+      '<input class="input" id="rec-dl-repo" value="' + _escHtml(repo).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="owner/model-name" style="width:100%;margin:4px 0 12px">' +
+      '<label style="font-size:11px;color:var(--muted)">Target dir (blank = HF cache)</label>' +
+      '<input class="input" id="rec-dl-dir" value="' + _escHtml(dir).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="~/.cache/huggingface" style="width:100%;margin:4px 0 12px">' +
+      '<div id="rec-dl-progress" style="display:none;margin:8px 0 4px">' +
+        '<div class="prog" style="height:6px;background:var(--s2);border-radius:4px;overflow:hidden">' +
+          '<div id="rec-dl-bar" class="prog-bar" style="height:100%;width:0"></div></div>' +
+        '<pre id="rec-dl-log" style="font-size:11px;color:var(--muted);margin:8px 0 0;white-space:pre-wrap;' +
+          'max-height:160px;overflow:auto"></pre>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
+        '<button class="btn btn-sm" id="rec-dl-close" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-dl-go" onclick="startApproveDownload(\'' +
+          id.replace(/'/g, "\\'") + '\')">Download</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  document.getElementById('rec-dl-repo').focus();
+}
+
+async function startApproveDownload(id) {
+  const repo = document.getElementById('rec-dl-repo').value.trim();
+  const dir = document.getElementById('rec-dl-dir').value.trim();
+  if (!repo) { document.getElementById('rec-dl-repo').focus(); return; }
+  const go = document.getElementById('rec-dl-go');
+  const cancel = document.getElementById('rec-dl-close');
+  const prog = document.getElementById('rec-dl-progress');
+  const bar = document.getElementById('rec-dl-bar');
+  const log = document.getElementById('rec-dl-log');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Downloading…';
+  prog.style.display = 'block';
+  bar.className = 'prog-bar spin';
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
+  let wired = false;
+  try {
+    const r = _lastRecs.find(x => x.id === (window._approveRecId || ''));
+    const dl = (r && r.download) || {};
+    const resp = await fetch('/api/hf/download', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined,
+        ignore_patterns: dl.ignore_patterns, allow_patterns: dl.allow_patterns}),
+    });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch(e) { continue; }
+        if (ev.file_start) {
+          const f = ev.file_start;
+          bar.className = 'prog-bar spin';
+          lines.push('[' + f.idx + '/' + f.total + '] ⤓ ' + f.name + ' (' + f.size_str + ')…');
+        } else if (ev.progress) {
+          const p = ev.progress;
+          bar.className = 'prog-bar'; bar.style.width = p.pct + '%';
+          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file + '  ·  ' +
+            p.pct + '%  ·  ' + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+        } else if (ev.status && typeof ev.status === 'string' && ev.status !== 'complete' && ev.status !== 'error') {
+          lines.push(ev.status);  // "Skipping N files…", "Found N files…"
+        } else if (ev.status === 'complete') {
+          bar.className = 'prog-bar'; bar.style.width = '100%';
+          lines.push('✓ Downloaded → ' + ev.path + (ev.errors > 0 ? '  ⚠ ' + ev.errors + ' error(s)' : ''));
+          toast('✓ Downloaded: ' + repo, 'ok');
+        } else if (ev.auto_profile) {
+          wired = true;
+          const p = ev.auto_profile.profile || {};
+          lines.push('✓ vLLM profile wired: ' + (p.name || p.id || 'profile'));
+          toast('✓ Profile wired — recommendation satisfied', 'ok');
+        } else if (ev.auto_profile_error) {
+          lines.push('⚠ Profile not auto-created: ' + ev.auto_profile_error);
+        } else if (ev.status === 'error') {
+          throw new Error(ev.error || 'download failed');
+        } else if (ev.log) {
+          lines.push(ev.log);
+        }
+        log.textContent = lines.join('\n');
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    go.innerHTML = wired ? '✓ Done' : 'Finished';
+    cancel.textContent = 'Close';
+    loadRecommendations();          // fired model rec should now clear
+    loadEngineProfiles(engines.vllm);
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch(e) {
+    bar.className = 'prog-bar'; bar.style.width = '0';
+    lines.push('✗ ' + e.message);
+    log.textContent = lines.join('\n');
+    toast('Download failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Retry';
+  }
+}
+
+// Apply a config/tuning rec to a flagged profile: fetch a diff preview, then
+// confirm to write the edited start script.
+function _diffHtml(diff) {
+  return (diff || '').split('\n').map(l => {
+    let c = 'var(--muted)';
+    if (l.startsWith('+') && !l.startsWith('+++')) c = '#34d399';
+    else if (l.startsWith('-') && !l.startsWith('---')) c = '#f87171';
+    else if (l.startsWith('@@')) c = 'var(--blue)';
+    return '<span style="color:' + c + '">' + _escHtml(l) + '</span>';
+  }).join('\n');
+}
+
+async function applyRec(id, profile) {
+  toast('Computing diff…', '');
+  let d;
+  try {
+    d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile});
+  } catch(e) { toast('Apply failed: ' + e.message, 'err'); return; }
+  if (!d.changed) { toast('Already applied: ' + (d.note || 'no change'), 'ok'); return; }
+  const short = profile.replace(/^start_/, '').replace(/\.sh$/, '');
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:640px;max-width:94vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Apply to ' + _escHtml(short) + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' + _escHtml(d.note || '') +
+        ' — review the change to the start script, then confirm.</div>' +
+      '<pre style="font-size:11px;line-height:1.45;background:var(--s2);border:1px solid var(--border);' +
+        'border-radius:8px;padding:12px;max-height:340px;overflow:auto;white-space:pre">' + _diffHtml(d.diff) + '</pre>' +
+      '<div id="rec-apply-note" style="font-size:11px;color:var(--muted);margin-top:8px">' +
+        'The profile takes effect the next time you start it.</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+        '<button class="btn btn-sm" id="rec-apply-cancel" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-apply-go" onclick="confirmApplyRec(\'' +
+          id.replace(/'/g, "\\'") + '\',\'' + profile.replace(/'/g, "\\'") + '\')">Apply change</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+}
+
+async function confirmApplyRec(id, profile) {
+  const go = document.getElementById('rec-apply-go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Applying…';
+  try {
+    const d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile, confirm: true});
+    toast('✓ ' + (d.note || 'applied'), 'ok');
+    closeRecModal();
+    loadRecommendations();
+    loadEngineProfiles(engines.vllm);
+  } catch(e) {
+    toast('Apply failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Apply change';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ollama
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadOllamaModels() {
+  const el = document.getElementById('ollama-list');
+  try {
+    const d = await apiFetch('/api/ollama/models');
+    const models = d.models || [];
+    const n = models.length;
+    document.getElementById('badge-ollama').textContent = n;
+    document.getElementById('badge-ollama-inline').textContent = n + ' model' + (n !== 1 ? 's' : '');
+
+    if (!n) {
+      el.innerHTML = '<div class="empty"><div class="empty-icon">🦙</div><div class="empty-text">No models installed. Pull one above.</div></div>';
+      return;
+    }
+
+    el.innerHTML = '<div class="model-grid">' + models.map(m => {
+      const gb = m.size ? (m.size / 1e9).toFixed(1) + ' GB' : '?';
+      const date = m.modified_at ? new Date(m.modified_at).toLocaleDateString() : '';
+      const safeName = esc(m.name.replace(/'/g, "\\'"));
+      return `<div class="model-card">
+        <div class="model-card-info">
+          <div class="model-card-name">${esc(m.name)}</div>
+          <div class="model-card-meta">${gb}${date ? ' · ' + date : ''}</div>
+        </div>
+        <div class="model-card-right">
+          <span class="tag tag-ollama">ollama</span>
+          <button class="btn btn-sm btn-danger" onclick="deleteModel('${safeName}', this)">✕</button>
+        </div>
+      </div>`;
+    }).join('') + '</div>';
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-icon">⚠</div><div class="empty-text">Ollama unreachable · ' + e.message + '</div></div>';
+  }
+}
+
+async function pullModel() {
+  const input = document.getElementById('pull-input');
+  const name = input.value.trim();
+  if (!name) { input.focus(); return; }
+
+  const btn  = document.getElementById('pull-btn');
+  const prog = document.getElementById('pull-progress');
+  const bar  = document.getElementById('pull-bar');
+  const log  = document.getElementById('pull-log');
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Pulling…';
+  prog.classList.add('show');
+  log.textContent = 'Connecting…';
+  bar.className = 'prog-bar spin';
+
+  try {
+    const resp = await fetch('/api/ollama/pull', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({name}),
+    });
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const ev = JSON.parse(line.slice(6));
+          if (ev.done) break;
+          if (ev.error) { toast('Error: ' + ev.error, 'err'); break; }
+          if (ev.total && ev.completed) {
+            const pct = Math.round(ev.completed / ev.total * 100);
+            bar.className = 'prog-bar';
+            bar.style.width = pct + '%';
+            log.textContent = (ev.status || '') + ' — ' + pct + '% (' +
+              (ev.completed/1e6).toFixed(0) + ' / ' + (ev.total/1e6).toFixed(0) + ' MB)';
+          } else if (ev.status) {
+            log.textContent = ev.status;
+          }
+        } catch(e) {}
+      }
+    }
+
+    bar.className = 'prog-bar';
+    bar.style.width = '100%';
+    toast('✓ ' + name + ' ready', 'ok');
+    input.value = '';
+    await loadOllamaModels();
+    setTimeout(() => { prog.classList.remove('show'); bar.style.width = '0'; }, 2000);
+
+  } catch(e) {
+    toast('Pull failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⬇ Pull';
+  }
+}
+
+async function deleteModel(name, btn) {
+  if (!confirm('Delete ' + name + '?\nThis cannot be undone.')) return;
+  btn.disabled = true;
+  btn.innerHTML = '…';
+  try {
+    const r = await fetch('/api/ollama/models/' + encodeURIComponent(name), {method:'DELETE', headers: authHeaders()});
+    if (!r.ok) throw new Error(await r.text());
+    toast('✓ Deleted ' + name, 'ok');
+    loadOllamaModels();
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
+    btn.disabled = false;
+    btn.innerHTML = '✕';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LiteLLM
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadLiteLLMModels() {
+  const el = document.getElementById('litellm-list');
+  try {
+    const d = await apiFetch('/api/litellm/models');
+    const models = d.data || [];
+    document.getElementById('badge-litellm').textContent = models.length;
+    document.getElementById('litellm-route-count').textContent = models.length;
+
+    if (!models.length) {
+      el.innerHTML = '<div class="empty"><div class="empty-text">No routes active</div></div>';
+      return;
+    }
+
+    el.innerHTML = '<div class="model-grid">' + models.map(m => {
+      const isOllama = m.id.toLowerCase().includes('ollama') || m.id.toLowerCase().includes(':');
+      return `<div class="model-card">
+        <div class="model-card-info">
+          <div class="model-card-name">${esc(m.id)}</div>
+        </div>
+        <span class="tag ${isOllama ? 'tag-ollama' : 'tag-sglang'}">${isOllama ? 'ollama' : 'sglang'}</span>
+      </div>`;
+    }).join('') + '</div>';
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">LiteLLM unreachable</div></div>';
+  }
+}
+
+async function loadLiteLLMConfig() {
+  const el = document.getElementById('config-block');
+  try {
+    const d = await apiFetch('/api/litellm/config');
+    el.textContent = d._raw || JSON.stringify(d, null, 2);
+  } catch(e) { el.textContent = 'Could not load config'; }
+}
+
+async function checkWildcard() {
+  try {
+    const d = await apiFetch('/api/litellm/config');
+    const models = d.model_list || [];
+    const has = models.some(m => m.model_name === 'ollama/*');
+    const status = document.getElementById('wc-status');
+    const btn = document.getElementById('wc-btn');
+    if (has) {
+      status.innerHTML = '<div class="wc-active">✓ Wildcard active — all Ollama models auto-exposed at :' + litellmPort + '</div>';
+      btn.textContent = '✓ Applied';
+      btn.disabled = true;
+    } else {
+      status.innerHTML = '<div class="wc-inactive">Not yet applied — each Ollama model requires a manual config entry</div>';
+      btn.textContent = 'Apply Wildcard';
+      btn.disabled = false;
+    }
+  } catch(e) {}
+}
+
+async function applyWildcard() {
+  const btn = document.getElementById('wc-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Applying…';
+  try {
+    const d = await apiFetch('/api/litellm/apply-wildcard', 'POST');
+    toast('✓ Wildcard applied — LiteLLM restarted', 'ok');
+    await checkWildcard();
+    await loadLiteLLMConfig();
+    setTimeout(loadLiteLLMModels, 3500);
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = 'Apply Wildcard';
+  }
+}
+
+async function restartLiteLLM() {
+  toast('Restarting LiteLLM…', null);
+  try {
+    await apiFetch('/api/litellm/restart', 'POST');
+    toast('✓ LiteLLM restarted', 'ok');
+    setTimeout(loadLiteLLMModels, 3500);
+  } catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Warm model resources
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _gb(v) {
+  return (v == null || isNaN(v)) ? '--' : Number(v).toFixed(1) + ' GB';
+}
+
+function _warmEmpty(msg) {
+  return '<div class="empty" style="padding:16px"><div class="empty-text">' + _escHtml(msg) + '</div></div>';
+}
+
+function _warmRow(name, meta, rightHtml) {
+  return '<div class="warm-row"><div><div class="warm-name">' + _escHtml(name) + '</div>'
+    + '<div class="warm-meta">' + _escHtml(meta || '') + '</div></div>'
+    + '<div class="warm-actions">' + (rightHtml || '') + '</div></div>';
+}
+
+async function loadWarmModels() {
+  const setHtml = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  try {
+    const d = await apiFetch('/api/warm-models');
+    const updated = document.getElementById('warm-updated');
+    if (updated) updated.textContent = 'Updated ' + new Date(d.timestamp).toLocaleTimeString();
+
+    const mem = d.memory || {};
+    const usedPct = Math.max(0, Math.min(100, mem.used_pct || 0));
+    document.getElementById('warm-memory-metric').textContent = _gb(mem.used_gb) + ' used';
+    document.getElementById('warm-memory-bar').style.width = usedPct + '%';
+    document.getElementById('warm-memory-sub').textContent = _gb(mem.available_gb) + ' available of ' + _gb(mem.total_gb);
+    const memPill = document.getElementById('warm-memory-pill');
+    memPill.textContent = usedPct.toFixed(1) + '%';
+    memPill.className = 'warm-pill ' + (mem.available_gb < 10 ? 'err' : mem.available_gb < 25 ? 'warn' : 'ok');
+
+    const v = d.vllm || {};
+    const status = v.status || {};
+    const profiles = v.profiles || [];
+    const activeProfile = v.active_profile || null;
+    if (!warmSelectedProfile) warmSelectedProfile = activeProfile || (profiles[0] && profiles[0].id) || null;
+    const activeProfileInfo = profiles.find(p => p.id === activeProfile);
+    const state = status.state || (status.running ? 'serving' : 'stopped');
+    const vPill = document.getElementById('warm-vllm-pill');
+    vPill.textContent = state;
+    vPill.className = 'warm-pill ' + (state === 'serving' ? 'ok' : state === 'loading' ? 'warn' : 'err');
+    const inst = (status.instances || [])[0] || {};
+    setHtml('warm-vllm-active',
+      _warmRow(status.model || 'No served model',
+        [
+          activeProfileInfo ? activeProfileInfo.name : (activeProfile ? activeProfile : 'no matched profile'),
+          inst.name ? inst.name : '',
+          inst.port ? ':' + inst.port : ''
+        ].filter(Boolean).join(' · '),
+        status.running ? '<button class="btn btn-sm btn-danger" onclick="warmStopVLLM()">Stop</button>' : '')
+    );
+
+    setHtml('warm-vllm-profiles', profiles.length ? profiles.map(p => {
+      const isActive = p.id === activeProfile;
+      const isSelected = p.id === warmSelectedProfile;
+      const cls = 'warm-profile' + (isActive ? ' active' : '') + (isSelected ? ' selected' : '');
+      const vram = p.vram_gb != null ? p.vram_gb + ' GB' : '--';
+      return '<div class="' + cls + '" onclick="warmSelectProfile(\'' + p.id.replace(/'/g, "\\'") + '\')">'
+        + '<div class="warm-profile-head"><div class="warm-profile-name">' + _escHtml(p.name || p.id) + '</div>'
+        + '<span class="warm-pill ' + (isActive ? 'ok' : '') + '">' + _escHtml(vram) + '</span></div>'
+        + '<div class="warm-profile-desc">' + _escHtml(p.description || p.id) + '</div>'
+        + (isActive ? '<div class="warm-meta" style="color:var(--green);margin-top:6px">active now</div>' : '')
+        + '</div>';
+    }).join('') : _warmEmpty('No vLLM profiles found'));
+
+    const gpu = d.nvidia || {};
+    const apps = gpu.apps || [];
+    const gpuTotal = document.getElementById('warm-gpu-total');
+    gpuTotal.textContent = apps.length ? _gb((gpu.total_mib || 0) / 1024) : 'none';
+    gpuTotal.className = 'warm-pill ' + (apps.length ? 'warn' : 'ok');
+    setHtml('warm-gpu-apps', apps.length ? apps.map(a =>
+      _warmRow(a.process || ('PID ' + a.pid), 'pid ' + a.pid + (a.cmd ? ' · ' + a.cmd : ''),
+        '<span class="warm-pill warn">' + _escHtml(_gb(a.used_gb)) + '</span>')
+    ).join('') : _warmEmpty(gpu.ok === false ? (gpu.error || 'nvidia-smi unavailable') : 'No GPU compute apps'));
+
+    const ollama = d.ollama || {};
+    const warmModels = ollama.models || [];
+    const ollamaTotal = document.getElementById('warm-ollama-total');
+    ollamaTotal.textContent = warmModels.length + ' warm';
+    ollamaTotal.className = 'warm-pill ' + (warmModels.length ? 'warn' : 'ok');
+    setHtml('warm-ollama-models', warmModels.length ? warmModels.map(m =>
+      _warmRow(m.name || 'unknown', [m.size, m.processor, m.until].filter(Boolean).join(' · '),
+        '<button class="btn btn-sm btn-danger" onclick="warmStopOllama(\'' + (m.name || '').replace(/'/g, "\\'") + '\')">Unload</button>')
+    ).join('') : _warmEmpty(ollama.ok === false ? (ollama.error || 'Ollama unavailable') : 'No warm Ollama models'));
+
+    const containers = (d.docker || {}).containers || [];
+    setHtml('warm-containers', containers.length ? containers.map(c =>
+      _warmRow(c.name || c.id, [c.image, c.status, c.ports].filter(Boolean).join(' · '), '')
+    ).join('') : _warmEmpty((d.docker || {}).ok === false ? ((d.docker || {}).error || 'Docker unavailable') : 'No model containers'));
+
+    const deployments = (d.kubernetes || {}).deployments || [];
+    setHtml('warm-k8s', deployments.length ? deployments.map(dep => {
+      const available = dep.available || 0;
+      const replicas = dep.replicas || 0;
+      const cls = replicas === 0 ? '' : available >= replicas ? 'ok' : 'warn';
+      return _warmRow(dep.name, (dep.images || []).join(' · '),
+        '<span class="warm-pill ' + cls + '">' + available + '/' + replicas + '</span>');
+    }).join('') : _warmEmpty((d.kubernetes || {}).ok === false ? ((d.kubernetes || {}).error || 'kubectl unavailable') : 'No scaled vLLM deployments'));
+  } catch(e) {
+    setHtml('warm-vllm-active', _warmEmpty('Failed to load resources: ' + e.message));
+  }
+}
+
+function warmSelectProfile(id) {
+  warmSelectedProfile = id;
+  document.querySelectorAll('.warm-profile').forEach(el => el.classList.remove('selected'));
+  loadWarmModels();
+}
+
+async function warmStartSelected() {
+  if (!warmSelectedProfile) { toast('Select a vLLM profile first', 'err'); return; }
+  try {
+    await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile});
+    toast('vLLM profile starting', 'ok');
+    setTimeout(loadWarmModels, 2500);
+  } catch(e) {
+    if (String(e.message || '').includes('unified memory') &&
+        confirm(e.message + '\n\nForce start anyway?')) {
+      try {
+        await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile, force: true});
+        toast('vLLM profile force-started', 'ok');
+        setTimeout(loadWarmModels, 2500);
+      } catch(forceErr) {
+        toast('Force start failed: ' + forceErr.message, 'err');
+      }
+    } else {
+      toast('Start failed: ' + e.message, 'err');
+    }
+  }
+}
+
+async function warmStopVLLM() {
+  if (!confirm('Stop vLLM? This will interrupt active inference requests.')) return;
+  try {
+    await apiFetch('/api/vllm/stop', 'POST');
+    toast('vLLM stopped', 'ok');
+    setTimeout(loadWarmModels, 1500);
+  } catch(e) {
+    toast('Stop failed: ' + e.message, 'err');
+  }
+}
+
+async function warmStopOllama(name) {
+  if (!name || !confirm('Unload ' + name + ' from Ollama?')) return;
+  try {
+    await apiFetch('/api/ollama/stop', 'POST', {name});
+    toast('Ollama model unloaded', 'ok');
+    setTimeout(loadWarmModels, 1000);
+  } catch(e) {
+    toast('Unload failed: ' + e.message, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SGLang
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Engine helpers (shared by SGLang + vLLM)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const engines = {
+<!--DGX:ENGINES_JS-->
+};
+
+async function loadEngineStatus(eng) {
+  try {
+    const d = await apiFetch(eng.api + '/status');
+    const led   = document.getElementById(eng.ids.led);
+    const title = document.getElementById(eng.ids.title);
+    const model = document.getElementById(eng.ids.model);
+    const card  = document.getElementById(eng.ids.card);
+    const stop  = document.getElementById(eng.ids.stop);
+    if (!led || !title || !card) return;
+    // Tri-state: a live container ("loading") is distinct from a ready model
+    // ("serving") \u2014 vLLM takes minutes to load weights. Fall back to running.
+    const state = d.state || (d.running ? 'serving' : 'stopped');
+    if (state === 'serving') {
+      led.className = 'engine-led on';
+      title.textContent = eng.name + ' \u2014 Serving';
+      model.textContent = d.model || (eng.webui ? '' : 'Ready');
+      card.classList.add('online');
+      stop.disabled = false;
+      if (eng.webui && eng.ids.webui) {
+        const wb = document.getElementById(eng.ids.webui);
+        if (wb) { wb.style.display = ''; wb.href = _engineBaseUrl(eng.key); }
+      }
+    } else if (state === 'loading') {
+      led.className = 'engine-led loading';
+      title.textContent = eng.name + ' \u2014 Loading\u2026';
+      model.textContent = 'Container up \u2014 loading model weights\u2026';
+      card.classList.add('online');
+      stop.disabled = false;
+      if (eng.webui && eng.ids.webui) {
+        const wb = document.getElementById(eng.ids.webui);
+        if (wb) wb.style.display = 'none';
+      }
+    } else {
+      led.className = 'engine-led';
+      title.textContent = eng.name + ' \u2014 Stopped';
+      model.textContent = '';
+      card.classList.remove('online');
+      stop.disabled = true;
+      if (eng.webui && eng.ids.webui) {
+        const wb = document.getElementById(eng.ids.webui);
+        if (wb) wb.style.display = 'none';
+      }
+    }
+  } catch(e) {}
+}
+
+async function loadEngineProfiles(eng) {
+  const el = document.getElementById(eng.ids.profiles);
+  try {
+    eng.profiles = await apiFetch(eng.api + '/profiles');
+    renderEngineProfiles(eng);
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+  }
+  if (eng.key === 'llamacpp') loadRecipes(eng);
+}
+
+// llama.cpp only. A GGUF repo ships one set of weights at ten quantizations, so the
+// quant/context/speculation choice is a launch *parameter*, not a separate profile —
+// otherwise the profile list becomes ten near-identical rows that drift apart.
+async function loadRecipes(eng) {
+  const bar = document.getElementById(eng.key + '-recipe-bar');
+  const sel = document.getElementById(eng.key + '-recipe');
+  if (!bar || !sel) return;
+  let d;
+  try { d = await apiFetch('/api/llamacpp/recipes'); }
+  catch(e) { bar.style.display = 'none'; return; }
+
+  const names = Object.keys(d.recipes || {});
+  // No recipes configured means the scripts use their own defaults. Showing an empty
+  // dropdown would imply a choice that does not exist.
+  if (!names.length) { bar.style.display = 'none'; eng.recipes = null; return; }
+
+  eng.recipes = d.recipes;
+  if (!eng.selectedRecipe || !eng.recipes[eng.selectedRecipe]) {
+    eng.selectedRecipe = (d.default && eng.recipes[d.default]) ? d.default : names[0];
+  }
+  sel.innerHTML = names.map(n => {
+    const r = eng.recipes[n];
+    return '<option value="' + _escHtml(n) + '"' +
+           (n === eng.selectedRecipe ? ' selected' : '') + '>' +
+           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GB') +
+           '</option>';
+  }).join('');
+  bar.style.display = 'flex';
+  selectRecipe(eng.key, eng.selectedRecipe);
+}
+
+function selectRecipe(key, name) {
+  const eng = engines[key];
+  if (!eng || !eng.recipes || !eng.recipes[name]) return;
+  eng.selectedRecipe = name;
+  const r = eng.recipes[name];
+  const d = document.getElementById(key + '-recipe-desc');
+  if (d) {
+    d.textContent = (r.desc || '') +
+      (r.spec && r.spec !== 'none' ? '  ·  spec: ' + r.spec : '') +
+      (r.vision ? '  ·  vision' : '');
+  }
+}
+
+// Two views over the same list, so the launch list stays uncluttered:
+//   models   — profiles whose weights are on disk; the things you can start.
+//   profiles — every start_*.sh, including ones whose weights are gone. This is
+//              the housekeeping view, and the only place orphans are visible.
+function setProfileView(key, view) {
+  const eng = engines[key];
+  eng.profileView = view;
+  ['models','profiles'].forEach(v => {
+    const b = document.getElementById(key + '-subtab-' + v);
+    if (b) b.classList.toggle('active', v === view);
+  });
+  renderEngineProfiles(eng);
+}
+
+function renderEngineProfiles(eng) {
+  const el = document.getElementById(eng.ids.profiles);
+  const all = eng.profiles || [];
+  const view = eng.profileView || 'models';
+  const profiles = view === 'models' ? all.filter(p => !p.model_missing) : all;
+
+  const note = document.getElementById(eng.key + '-subtab-note');
+  if (note) {
+    const onDisk = {};
+    all.forEach(p => { if (p.model_dir) onDisk[p.model_dir] = p.model_size_gb || 0; });
+    const gb = Object.values(onDisk).reduce((s,v) => s+v, 0);
+    const orphans = all.filter(p => p.model_missing).length;
+    note.textContent = all.length + ' profiles · ' + gb.toFixed(1) + ' GB on disk'
+      + (orphans ? ' · ' + orphans + ' orphaned' : '');
+  }
+
+  if (!all.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles defined</div></div>';
+    return;
+  }
+  if (!profiles.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles with weights on disk</div></div>';
+    return;
+  }
+  // Selection must stay on a visible row, or Start launches something unseen.
+  if (!eng.selectedProfile || !profiles.some(p => p.id === eng.selectedProfile)) {
+    eng.selectedProfile = profiles[0].id;
+  }
+  {
+    const q = s => String(s == null ? '' : s).replace(/'/g, "\\'");
+    el.innerHTML = profiles.map(p => `
+      <div class="profile-item ${eng.selectedProfile === p.id ? 'selected' : ''}"
+           onclick="selectEngineProfile('${eng.key}', '${esc(q(p.id))}', this)">
+        <div class="p-radio"></div>
+        <div class="p-info">
+          <div class="p-name">${esc(p.name)}${p.model_missing
+            ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
+          <div class="p-desc">${esc(p.description)}</div>
+        </div>
+        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
+        <div class="p-actions" onclick="event.stopPropagation()">
+          ${p.model_dir
+            ? `<button class="btn-icon-del" title="Delete model weights from disk${
+                 p.model_size_gb ? ' (' + p.model_size_gb + ' GB)' : ''}"
+                 onclick="deleteProfileWeights('${eng.key}','${esc(q(p.model_dir))}','${esc(q(p.name))}',${p.model_size_gb || 0})">&#9679;</button>`
+            : ''}
+          <button class="btn-icon-del" title="Delete this profile script"
+                  onclick="deleteEngineProfile('${eng.key}','${esc(q(p.id))}','${esc(q(p.name))}')">&#10005;</button>
+        </div>
+        ${eng.key === 'vllm' ? renderProfileSettings(p) : ''}
+      </div>
+    `).join('');
+    // Warning and meta-error text is vendor-supplied (it embeds {value!r} of config
+    // fields), so it is written with textContent, never interpolated into the HTML
+    // above. T-04-07.
+    el.querySelectorAll('.profile-item').forEach((card, i) => {
+      const p = profiles[i];
+      if (!p) return;
+      const errEl = card.querySelector('.p-set-error');
+      if (errEl) errEl.textContent =
+        'Profile header is unreadable: ' + (p.meta_error || 'unknown parse failure');
+      const warnEl = card.querySelector('.p-set-warn');
+      if (warnEl && (p.warnings || []).length) {
+        warnEl.textContent = '⚠ ' + p.warnings.join(' · ');
+      }
+    });
+  }
+}
+
+// Five card states: header-error, recipe-backed, editable, read-only (04-03) and
+// unparseable (04-03). meta_error is checked FIRST and on its own: a corrupt header is a
+// defect, not a fallback (04-CONTEXT.md), so it must never fall through to the legacy
+// rendering that would silently show a launch as ordinary.
+function renderProfileSettings(p) {
+  if (p.meta_error) {
+    return `<div class="p-settings" data-state="header-error" onclick="event.stopPropagation()">
+      <div class="p-set-error"></div>
+      <div class="p-set-note">The script itself is still valid and can be launched, but its
+        generated metadata cannot be read. Regenerate the profile to repair it.</div>
+    </div>`;
+  }
+  const d = p.derived;
+  if (d && d.editable === false) {
+    return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+      <div class="p-set-row">
+        <div class="p-set-field"><label>Context</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="—"></div>
+      </div>
+      <div class="p-set-note">Not adjustable here — ${esc(d.reason || 'the recipe YAML owns these flags')}.</div>
+    </div>`;
+  }
+  // 04-03 fix: classification is authoritative when there is no `# Derived:` header.
+  // `_parse_script_flags` only reads LITERAL numbers, so a recipe wrapper and an
+  // already-parameterized script both report three `unparseable` flags — which is a
+  // statement about the regex, not about the script. Routing either into the legacy
+  // renderer told the truth about the parser and a lie about the file.
+  if (!d && p.classification === 'recipe') {
+    return renderRecipeProfileSettings();
+  }
+  if (!d && p.classification === 'parameterized') {
+    return renderParameterizedProfileSettings(p);
+  }
+  if (!d) return renderLegacyProfileSettings(p);  // 04-03 owns read-only/unparseable.
+  const rec = p.recommended || {};
+  const recUtil = rec.gpu_memory_utilization != null
+    ? `<span class="p-set-rec">recommended ${esc(rec.gpu_memory_utilization)}</span>` : '';
+  const recCtx = rec.max_model_len != null
+    ? `<span class="p-set-rec">recommended ${esc(rec.max_model_len)}</span>` : '';
+  const ceiling = d.declared_max_context != null
+    ? ` Over-requesting is clamped to the KV ceiling (${esc(d.max_fitting_context)}) and the
+        vendor ceiling (${esc(d.declared_max_context)}); the request is discarded, not applied,
+        so a value above those will silently give you less context than you typed.` : '';
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context ${recCtx}</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="${esc(d.max_model_len)}">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util ${recUtil}</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization" placeholder="${esc(d.util)}">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="${esc(d.max_num_seqs)}">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+    </div>
+    <div class="p-set-note">Per-launch only — nothing is written to the script on disk.
+      Leave a box empty to use the derived default shown in grey. Linux page cache is billed
+      against the same budget as gpu-memory-utilization, so reclaim it before judging a
+      utilization recommendation.${ceiling}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// 04-03: a hand-written script has no `# Derived:` header, so its numbers come from
+// `_parse_script_flags` — a regex over the script text. Those values are READ-ONLY:
+// nothing here can override a flag the launcher does not template. A flag the parser
+// could not read as a literal renders the word "unparseable", never a guess.
+const LEGACY_FIELDS = [
+  ['max_model_len', 'Context'],
+  ['util', 'GPU memory util'],
+  ['max_num_seqs', 'Max num seqs'],
+];
+
+// 04-03 fix: a recipe wrapper whose `# Derived:` header is absent. The recipe YAML owns
+// these flags exactly as it does for a header-bearing one, so this reuses the same copy
+// rather than inventing a fourth way to say "not adjustable here".
+function renderRecipeProfileSettings() {
+  return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field"><label>Context</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="&#8212;"></div>
+    </div>
+    <div class="p-set-note">Not adjustable here — the recipe YAML owns these flags.</div>
+  </div>`;
+}
+
+// 04-03 fix: already parameterized, but with no `# Derived:` header — the state every
+// script reaches by going through Parameterize…, since that rewrites flags without
+// generating metadata. Overrides DO work (the script templates all three vars), so the
+// controls are live; what is missing is the derived default, which lives in the script's
+// own `${VAR:-N}` and is deliberately not echoed here — `_parse_script_flags` reads
+// literals only, and a guessed placeholder would be worse than an empty one.
+function renderParameterizedProfileSettings(p) {
+  // The button is offered ONLY when the script names its own source dir. Without that,
+  // `from-hf` would 409 (or worse, silently replace a hand-tuned script), so the note
+  // points at where regeneration actually lives instead of at a control that isn't there.
+  const regen = p.regen_path
+    ? `<button class="btn btn-sm" onclick="regenerateProfile('${
+         esc(String(p.id).replace(/'/g, "\\'"))}','${
+         esc(String(p.regen_path).replace(/'/g, "\\'"))}')">Regenerate metadata</button>`
+    : '';
+  const regenNote = p.regen_path
+    ? ` "Regenerate metadata" rebuilds it from ${esc(p.regen_path)}, keeping the
+        parameterized flags.`
+    : ` This script does not record a source directory — regenerating it would mean
+        replacing it from HF browse → Create vLLM profile, which discards anything
+        hand-written in it.`;
+  // The grey number is the script's own `${VAR:-N}` default, so this card reads like
+  // every other one. A var with no literal default falls back to the em dash rather than
+  // to a guess.
+  const sd = p.script_defaults || {};
+  const ph = k => esc(sd[k] != null ? sd[k] : '—');
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="${ph('max_model_len')}">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization"
+               placeholder="${ph('gpu_memory_utilization')}">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="${ph('max_num_seqs')}">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+      ${regen}
+    </div>
+    <div class="p-set-note">This script is parameterized — per-launch overrides work, and
+      an empty box uses the grey default written into the script itself. No recommendation
+      or KV-ceiling check is available, because those need the model's own config rather
+      than the script text.${regenNote}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+function renderLegacyProfileSettings(p) {
+  const flags = p.flags || {};
+  const unparseable = LEGACY_FIELDS.filter(([k]) => flags[k] === 'unparseable' ||
+                                                    flags[k] == null);
+  const fields = LEGACY_FIELDS.map(([k, label]) => {
+    const raw = flags[k];
+    const bad = (raw === 'unparseable' || raw == null);
+    return `<div class="p-set-field"><label>${esc(label)}</label>
+      <input disabled value="${bad ? 'unparseable' : esc(raw)}"></div>`;
+  }).join('');
+  const note = unparseable.length
+    ? `Read-only. ${unparseable.length} of 3 flags could not be read as a literal number
+       (they may be shell variables or built at runtime), so no value is shown rather than
+       a guessed one. Parameterizing is refused while any flag is unparseable.`
+    : `Read-only — this script hard-codes its flags. "Parameterize" rewrites each value
+       into a <code>\${VAR:-value}</code> placeholder with the SAME number as the default,
+       so behaviour is unchanged and per-launch overrides become possible. You will see a
+       diff before anything is written.`;
+  const action = unparseable.length ? '' :
+    // `q` is block-scoped to the card renderer, so the JS-string escape is inlined
+    // here; esc() then closes the surrounding attribute context.
+    `<button class="btn btn-sm" onclick="parameterizeProfile('${
+       esc(String(p.id == null ? '' : p.id).replace(/'/g, "\\'"))}')">Parameterize…</button>`;
+  return `<div class="p-settings" data-state="${unparseable.length ? 'unparseable' : 'read-only'}"
+        onclick="event.stopPropagation()">
+    <div class="p-set-row">${fields}${action}</div>
+    <div class="p-set-note">${note}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// Preview FIRST, always. The server builds the diff and hands back a sha256 of the file
+// it read; apply sends that hash straight back and the server refuses (409) if the file
+// moved underneath us — ~6 concurrent sessions share this profile directory.
+// Rebuilds the `# Derived:` / `# Recommended:` / `# Warnings:` headers a parameterized
+// script lacks, by regenerating it from the launch dir it names. Only ever called with a
+// `regen_path` the server supplied, so the from-hf 409 guard (target exists with
+// different contents) cannot fire — the script already references that dir.
+async function regenerateProfile(profileId, path) {
+  if (!confirm('Regenerate ' + profileId + '.sh from ' + path + '?\n\n'
+               + 'This rewrites the script from its model directory, restoring the '
+               + 'derived defaults, recommendation and KV-ceiling warnings.')) return;
+  try {
+    await apiFetch('/api/vllm/profiles/from-hf', 'POST', {path: path});
+    toast('✓ Regenerated ' + profileId, 'ok');
+    await loadEngineProfiles(engines.vllm);
+  } catch (e) {
+    toast('Regenerate failed: ' + e.message, 'err');
+  }
+}
+
+async function parameterizeProfile(profileId) {
+  try {
+    const prev = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                                + '/parameterize/preview', 'POST', {});
+    if (!prev.changed) { toast('Already parameterized — nothing to do', 'ok'); return; }
+    const ok = confirm('Rewrite ' + profileId + '.sh?\n\n' + prev.notes.join('\n')
+                       + '\n\n' + prev.diff);
+    if (!ok) return;
+    const res = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                               + '/parameterize/apply', 'POST', {sha256: prev.sha256});
+    toast('✓ Parameterized (backup: ' + res.backup.split('/').pop() + ')', 'ok');
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch (e) {
+    toast('Parameterize failed: ' + e.message, 'err');
+  }
+}
+
+// Page cache counts against the util budget, so a correct recommendation looks broken
+// until it is reclaimed. Same endpoint the Dry Run memory check offers.
+async function reclaimPageCache(btn) {
+  btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+    toast('✓ ' + res.message, 'ok');
+  } catch (e) {
+    toast('Reclaim failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// The request-body builder. Mirrors `_collect_overrides` in app.py: a blank or
+// whitespace-only box means "use the derived default", expressed as the key being ABSENT.
+function collectProfileOverrides() {
+  const panel = document.querySelector('#vllm-profile-list .profile-item.selected .p-settings[data-state="editable"]');
+  if (!panel) return undefined;
+  const out = {};
+  panel.querySelectorAll('input[data-override]').forEach(inp => {
+    const raw = String(inp.value == null ? '' : inp.value).trim();
+    if (!raw) return;
+    const num = Number(raw);
+    out[inp.dataset.override] = Number.isFinite(num) ? num : raw;
+  });
+  return Object.keys(out).length ? out : undefined;
+}
+
+async function deleteEngineProfile(key, id, name) {
+  if (!confirm('Delete the profile "' + name + '"?\n\nThis removes the start script only. Model weights on disk are untouched.')) return;
+  try {
+    await apiFetch(engines[key].api + '/profiles/' + encodeURIComponent(id), 'DELETE');
+    toast('Profile deleted: ' + name, 'ok');
+    if (engines[key].selectedProfile === id) engines[key].selectedProfile = null;
+    await loadEngineProfiles(engines[key]);
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+// Weights deletion goes through the guarded inventory endpoint, so the in-use
+// and profile-cross-reference checks apply here too. The cross-reference will
+// always fire from this page — this profile references the model by definition.
+async function deleteProfileWeights(key, dirPath, name, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete the model weights for "' + name + '"' + size + '?\n\nPermanently removes:\n' + dirPath + '\n\nThe profile is kept and will fail to launch until the weights are re-downloaded.')) return;
+  try {
+    await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+    toast('Weights deleted: ' + name + size, 'ok');
+    await loadEngineProfiles(engines[key]);
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+function selectEngineProfile(key, id, el) {
+  engines[key].selectedProfile = id;
+  const container = document.getElementById(engines[key].ids.profiles);
+  container.querySelectorAll('.profile-item').forEach(p => p.classList.remove('selected'));
+  // Overrides are per-launch and per-profile: carrying a typed context across a selection
+  // change would launch a different model with numbers the user meant for the old one.
+  container.querySelectorAll('.p-settings input[data-override]').forEach(i => { i.value = ''; });
+  el.classList.add('selected');
+}
+
+async function stopEngine(eng) {
+  if (!confirm('Stop ' + eng.name + '? This will interrupt any active inference requests.')) return;
+  const btn = document.getElementById(eng.ids.stop);
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div>';
+  try {
+    const d = await apiFetch(eng.api + '/stop', 'POST');
+    toast(d.ok ? '\u2713 ' + eng.name + ' stopped' : 'Stop may have failed: ' + d.output, d.ok ? 'ok' : 'err');
+    setTimeout(() => { loadEngineStatus(eng); btn.innerHTML = '\u25a0 Stop'; }, 1500);
+  } catch(e) {
+    toast('Error: ' + e.message, 'err');
+    btn.innerHTML = '\u25a0 Stop';
+  }
+}
+
+async function startEngine(eng) {
+  if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
+  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
+  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
+  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
+  // able to block the only GPU. Runs before any button state is touched, so declining leaves
+  // the UI exactly as it was.
+  let forceFromGate = false;
+  if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
+    try {
+      const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+      if (r && r.verdict === 'fail') {
+        const blocking = (r.checks || []).filter(c => c.level === 'fail')
+          .map(c => c.title + (c.detail ? ': ' + c.detail : '')).join('; ');
+        if (!confirm('Preflight found blocking problems:\n\n' + blocking +
+                     '\n\nRun Dry Run to see the details. Force start anyway?')) {
+          toast('Start blocked by preflight: ' + blocking, 'err');
+          return;
+        }
+        forceFromGate = true;
+      }
+    } catch (e) {
+      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+    }
+  }
+  const btn  = document.getElementById(eng.ids.start);
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Launching\u2026';
+  prog.classList.add('show');
+  log.textContent = 'Sending start command\u2026';
+
+  // Live load progress, streamed from `docker logs -f` server-side. Replaces a
+  // 20s status poll that reported "Model loading\u2026" for ten minutes whether the
+  // model was loading or the container had died two seconds in.
+  const beginPoll = (d) => {
+    toast('\u2713 ' + eng.name + ' starting', 'ok');
+    log.textContent = d.message;
+    if (eng.key !== 'vllm') { return legacyPoll(eng, d); }
+    followLoadProgress(eng, d);
+  };
+
+  const startWith = (force) =>
+    apiFetch(eng.api + '/start', 'POST',
+             {profile: eng.selectedProfile, force,
+              overrides: eng.key === 'vllm' ? collectProfileOverrides() : undefined,
+              recipe: eng.key === 'llamacpp' ? eng.selectedRecipe : undefined});
+
+
+  try {
+    beginPoll(await startWith(forceFromGate));
+  } catch(e) {
+    if (String(e.message || '').includes('unified memory') &&
+        confirm(e.message + '\n\nForce start anyway?')) {
+      try {
+        beginPoll(await startWith(true));
+      } catch(forceErr) {
+        toast('Force start failed: ' + forceErr.message, 'err');
+        prog.classList.remove('show');
+      }
+    } else {
+      toast('Start failed: ' + e.message, 'err');
+      prog.classList.remove('show');
+    }
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '\u25b6 Start Selected';
+  }
+}
+
+// The pre-existing status poll, still used by engines with no progress stream.
+function legacyPoll(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  let pollCount = 0;
+  const poll = setInterval(async () => {
+    pollCount++;
+    await loadEngineStatus(eng);
+    const led = document.getElementById(eng.ids.led);
+    if (led.classList.contains('on')) {
+      const modelEl = document.getElementById(eng.ids.model);
+      if (modelEl.textContent && modelEl.textContent !== 'Model loading…') {
+        clearInterval(poll);
+        toast('✓ ' + eng.name + ' is ready!', 'ok');
+        prog.classList.remove('show');
+      } else {
+        log.textContent = d.message + '\n\nContainer running — model still loading…';
+      }
+    } else if (pollCount >= 30) {
+      clearInterval(poll);
+      log.textContent += '\n\n⚠ Timed out after 10 minutes — check logs';
+      toast(eng.name + ' did not start within 10 minutes', 'err');
+    }
+  }, 20000);
+}
+
+function setProgress(eng, pct, phaseLabel, meta) {
+  const bar   = document.getElementById(eng.ids.bar);
+  const phase = document.getElementById(eng.ids.phase);
+  const metaEl = document.getElementById(eng.ids.meta);
+  if (bar) {
+    // A real percentage means a determinate bar; drop the indeterminate sweep.
+    if (typeof pct === 'number') { bar.classList.remove('spin'); bar.style.width = pct + '%'; }
+    else { bar.classList.add('spin'); bar.style.width = ''; }
+  }
+  if (phase && phaseLabel) phase.textContent = phaseLabel;
+  if (metaEl) metaEl.textContent = meta || '';
+}
+
+function followLoadProgress(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  prog.classList.add('show');
+  setProgress(eng, 0, 'Attaching to container log…', '');
+
+  // fresh=1: a launch was just issued, so do not short-circuit on the *previous*
+  // model's /health, and tolerate the container not existing for a moment.
+  const es = new EventSource('/api/vllm/progress?fresh=1');
+  const finish = (ok, msg) => {
+    es.close();
+    loadEngineStatus(eng);
+    toast((ok ? '✓ ' : '✗ ') + msg, ok ? 'ok' : 'err');
+    if (ok) setTimeout(() => prog.classList.remove('show'), 4000);
+  };
+
+  es.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    const mins = e.elapsed_s != null
+      ? Math.floor(e.elapsed_s / 60) + 'm' + String(Math.round(e.elapsed_s % 60)).padStart(2, '0') + 's'
+      : '';
+    const bits = [mins];
+    if (e.weights_gib)   bits.push('weights ' + e.weights_gib + ' GiB');
+    if (e.kv_cache_gib)  bits.push('KV ' + e.kv_cache_gib + ' GiB');
+
+    if (e.status === 'ready') {
+      setProgress(eng, 100, 'Ready', bits.join(' · '));
+      finish(true, eng.name + ' is ready in ' + mins);
+      return;
+    }
+    if (e.status === 'failed') {
+      setProgress(eng, e.percent, 'Load failed', bits.join(' · '));
+      // textContent, never innerHTML — this string is container output.
+      log.textContent = 'LOAD FAILED\n\n' + (e.error || 'unknown cause')
+        + (e.exit_code != null ? '\n\nContainer exit code: ' + e.exit_code : '')
+        + (e.hint ? '\n\n→ ' + e.hint : '');
+      finish(false, eng.name + ' failed to load');
+      return;
+    }
+    setProgress(eng, e.percent, e.label || 'Loading…', bits.join(' · '));
+    if (e.line) log.textContent = e.line;
+  };
+  es.onerror = () => {
+    es.close();
+    log.textContent += '\n\n⚠ Progress stream dropped — falling back to status polling.';
+    legacyPoll(eng, d);
+  };
+}
+
+async function dryRunProfile(eng) {
+  if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  const btn = document.getElementById(eng.ids.dryrun);
+  const out = document.getElementById(eng.ids.preflight);
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Checking…';
+  out.textContent = '';
+  eng._preflightVerdict = null;
+  try {
+    const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+    renderPreflight(out, r);
+    const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    eng._preflightVerdict = r.verdict;
+    toast(t, r.verdict === 'fail' ? 'err' : 'ok');
+  } catch (e) {
+    toast('Dry run failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⚗ Dry Run';
+  }
+}
+
+function renderPreflight(out, r) {
+  const icons = {ok: '✓', warn: '⚠', fail: '✗', skip: '–'};
+  out.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'preflight-head pf-' + r.verdict;
+  head.textContent = icons[r.verdict] + ' ' + r.profile;
+  if (r.budget) {
+    const b = document.createElement('span');
+    b.className = 'preflight-budget';
+    b.textContent = 'util ' + r.budget.util + ' → ' + r.budget.usable_gib
+      + ' GiB usable of a ' + r.budget.budget_gib + ' GiB budget';
+    head.appendChild(b);
+  }
+  out.appendChild(head);
+
+  for (const c of r.checks) {
+    const row = document.createElement('div');
+    row.className = 'preflight-row pf-' + c.level;
+    const t = document.createElement('div');
+    t.className = 'pf-title';
+    t.textContent = (icons[c.level] || '·') + ' ' + c.title;
+    row.appendChild(t);
+    if (c.detail) {
+      const d = document.createElement('div');
+      d.className = 'pf-detail';
+      d.textContent = c.detail;
+      row.appendChild(d);
+    }
+    if (c.fix) {
+      const f = document.createElement('div');
+      f.className = 'pf-fix';
+      f.textContent = c.fix;
+      row.appendChild(f);
+      if (c.check === 'memory') {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-sm';
+        btn.textContent = 'Reclaim page cache';
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+            toast('✓ ' + res.message, 'ok');
+            dryRunProfile(engines.vllm);
+          } catch (e) { toast('Reclaim failed: ' + e.message, 'err'); btn.disabled = false; }
+        };
+        row.appendChild(btn);
+      }
+    }
+    out.appendChild(row);
+  }
+}
+
+// Legacy wrappers (kept for backward compat with docs page references)
+function selectProfile(id, el)     { selectEngineProfile('sglang', id, el); }
+function selectVLLMProfile(id, el) { selectEngineProfile('vllm', id, el); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HF Download
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function hfDownload() {
+  const repo = document.getElementById('hf-repo').value.trim();
+  const dir  = document.getElementById('hf-dir').value.trim();
+  if (!repo) { document.getElementById('hf-repo').focus(); return; }
+
+  const btn  = document.getElementById('hf-btn');
+  const prog = document.getElementById('hf-progress');
+  const bar  = document.getElementById('hf-bar');
+  const log  = document.getElementById('hf-log');
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Downloading…';
+  prog.classList.add('show');
+  bar.className = 'prog-bar spin';
+  bar.style.width = '';
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
+
+  try {
+    const resp = await fetch('/api/hf/download', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined}),
+    });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const ev = JSON.parse(line.slice(6));
+          if (ev.status === 'complete') {
+            bar.className = 'prog-bar';
+            bar.style.width = '100%';
+            const parts = ['✓ Complete → ' + ev.path];
+            if (ev.avg_speed) parts.push('Avg: ' + ev.avg_speed);
+            if (ev.elapsed) parts.push('Time: ' + ev.elapsed);
+            if (ev.errors > 0) parts.push('⚠ ' + ev.errors + ' error(s)');
+            lines.push(parts.join('  ·  '));
+            toast('✓ Downloaded: ' + repo, 'ok');
+          } else if (ev.auto_profile) {
+            const p = ev.auto_profile.profile || {};
+            lines.push('✓ vLLM profile added: ' + (p.name || p.id || 'profile'));
+            toast('✓ vLLM profile added', 'ok');
+            loadUnifiedInventory();
+            loadEngineProfiles(engines.vllm);
+            loadWarmModels();
+          } else if (ev.auto_profile_error) {
+            lines.push('vLLM profile not auto-created: ' + ev.auto_profile_error);
+          } else if (ev.status === 'error') {
+            bar.className = 'prog-bar';
+            bar.style.width = '0';
+            toast('Error: ' + ev.error, 'err');
+            lines.push('✗ ' + ev.error);
+          } else if (ev.progress) {
+            const p = ev.progress;
+            bar.className = 'prog-bar';
+            bar.style.width = p.pct + '%';
+            lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file
+              + '  ·  ' + p.pct + '%  ·  '
+              + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+          } else if (ev.file_start) {
+            const f = ev.file_start;
+            lines.push('[' + f.idx + '/' + f.total + '] ' + f.name + ' (' + f.size_str + ')');
+          } else if (ev.file_error) {
+            lines[lines.length - 1] = '⚠ Failed: ' + ev.file_error.name + ' — ' + ev.file_error.error;
+          } else if (ev.status) {
+            lines.push(ev.status);
+          }
+          log.textContent = lines.join('\n');
+          log.scrollTop = log.scrollHeight;
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    toast('Download failed: ' + e.message, 'err');
+    prog.classList.remove('show');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⬇ Download';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unified Inventory
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _inventoryData = [];
+
+function dtypeClass(dtype) {
+  const m = {
+    'FP32':'inv-fp32','FP16':'inv-fp16','BF16':'inv-bf16',
+    'FP8':'inv-fp8','FP4':'inv-fp4','INT4':'inv-int4','INT8':'inv-int8',
+    'GGUF':'inv-int4',
+  };
+  return m[dtype] || 'inv-unknown';
+}
+function sourceClass(src) {
+  return {'hf_cache':'inv-src-hf','custom_dir':'inv-src-custom','ollama':'inv-src-ollama'}[src] || '';
+}
+function sourceLabel(src) {
+  return {'hf_cache':'HF Cache','custom_dir':'Custom','ollama':'Ollama'}[src] || src;
+}
+function formatClass(fmt) {
+  return {'safetensors':'inv-fmt-safe','gguf':'inv-fmt-gguf','pytorch':'inv-fmt-pt','ollama':'inv-fmt-ollama'}[fmt] || '';
+}
+function formatLabel(fmt) {
+  return {'safetensors':'Safetensors','gguf':'GGUF','pytorch':'PyTorch','ollama':'Ollama','unknown':'—'}[fmt] || fmt;
+}
+
+async function loadUnifiedInventory() {
+  const root = document.getElementById('inv-root');
+  if (!root) return;
+  root.innerHTML = '<div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div><div style="font-size:12px;color:var(--muted)">Scanning model directories...</div></div>';
+  try {
+    const d = await apiFetch('/api/inventory?include_ollama=true');
+    const dirs = d.directories || [];
+    _inventoryData = [];
+    for (const dir of dirs) {
+      for (const m of (dir.models || [])) {
+        _inventoryData.push(m);
+      }
+    }
+    const badge = document.getElementById('badge-inventory');
+    if (badge) badge.textContent = _inventoryData.length || '—';
+    sortAndRender();
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Could not load inventory: ' + e.message + '</div></div>';
+  }
+}
+
+function getFilteredInventory() {
+  const q = (document.getElementById('inv-search')?.value || '').toLowerCase();
+  const src = document.getElementById('inv-filter-source')?.value || '';
+  const fmt = document.getElementById('inv-filter-format')?.value || '';
+  const task = document.getElementById('inv-filter-task')?.value || '';
+  return _inventoryData.filter(m => {
+    if (q && !m.name.toLowerCase().includes(q) && !(m.owner||'').toLowerCase().includes(q) && !(m.full_name||'').toLowerCase().includes(q)) return false;
+    if (src && m.source !== src) return false;
+    if (fmt && m.format !== fmt) return false;
+    if (task && m.task_label !== task) return false;
+    return true;
+  });
+}
+
+function sortAndRender() {
+  const key = document.getElementById('inv-sort')?.value || 'name';
+  _inventoryData.sort((a, b) => {
+    if (key === 'size') return (b.size_gb || 0) - (a.size_gb || 0);
+    if (key === 'params') return (b.params_b || 0) - (a.params_b || 0);
+    return (a.name || '').localeCompare(b.name || '');
+  });
+  filterInventory();
+}
+
+function filterInventory() {
+  const models = getFilteredInventory();
+  renderInventoryTable(models);
+}
+
+function renderInventoryTable(models) {
+  const root = document.getElementById('inv-root');
+  if (!root) return;
+
+  // Stats bar
+  const stats = document.getElementById('inv-stats');
+  if (stats) {
+    const totalSize = models.reduce((s, m) => s + (m.size_gb || 0), 0);
+    const sources = new Set(models.map(m => m.source));
+    stats.innerHTML = '<span>' + models.length + '</span> models &middot; <span>' + totalSize.toFixed(1) + '</span> GB &middot; <span>' + sources.size + '</span> source' + (sources.size !== 1 ? 's' : '');
+  }
+
+  if (!models.length) {
+    root.innerHTML = '<div class="empty" style="border-radius:8px"><div class="empty-icon" style="font-size:24px">&#128237;</div><div class="empty-text">No models match your filters</div></div>';
+    return;
+  }
+
+  let html = '<div class="inv-table-wrap" style="border-radius:8px;border:1px solid var(--border)"><table class="inv-table"><thead><tr>';
+  html += '<th>Model</th><th>Task</th><th>Format</th><th>Dtype</th><th>Params</th><th>Size</th><th>Source</th><th>Script</th><th style="width:150px"></th>';
+  html += '</tr></thead><tbody>';
+
+  for (const m of models) {
+    const params = m.params_b != null ? m.params_b + 'B' : '\u2014';
+    const size = m.size_gb ? m.size_gb + ' GB' : '\u2014';
+    const dc = dtypeClass(m.dtype);
+    let scriptBadge = '<span class="inv-no">\u2014</span>';
+    if (m.has_script && m.script_engine) {
+      const cls = m.script_engine === 'SGLang' ? 'inv-engine-sg' : 'inv-engine-vl';
+      scriptBadge = '<span class="inv-engine ' + cls + '">' + m.script_engine + '</span>';
+    }
+    const delBtn = m.source === 'ollama'
+      ? ''
+      : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + "'," + (m.size_gb || 0) + ')">&#10005;</button>';
+    const canCreateVllm = m.source !== 'ollama' && !m.has_script
+      && (m.format === 'safetensors' || m.format === 'pytorch')
+      && (m.task_label === 'Text Gen' || m.task_label === 'Vision LLM');
+    const createBtn = canCreateVllm
+      ? '<button class="btn btn-sm" style="font-size:10px;padding:3px 8px" onclick="createVLLMProfileFromInventory(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + '\')">Create vLLM</button>'
+      : '';
+
+    html += '<tr>';
+    html += '<td><div class="inv-model-name">' + m.name + '</div>' + (m.owner ? '<div class="inv-owner">' + m.owner + '</div>' : '') + '</td>';
+    html += '<td><span class="inv-task-badge">' + (m.task_label || '\u2014') + '</span></td>';
+    html += '<td><span class="inv-format-badge ' + formatClass(m.format) + '">' + formatLabel(m.format) + '</span></td>';
+    html += '<td><span class="inv-badge ' + dc + '">' + m.dtype + '</span></td>';
+    html += '<td style="font-family:var(--mono);font-size:11px">' + params + '</td>';
+    html += '<td style="font-family:var(--mono);font-size:11px;white-space:nowrap">' + size + '</td>';
+    html += '<td><span class="inv-source-badge ' + sourceClass(m.source) + '">' + sourceLabel(m.source) + '</span></td>';
+    html += '<td>' + scriptBadge + '</td>';
+    html += '<td><div style="display:flex;align-items:center;gap:6px;justify-content:flex-end">' + createBtn + delBtn + '</div></td>';
+    html += '</tr>';
+  }
+
+  html += '</tbody></table></div>';
+  root.innerHTML = html;
+}
+
+async function enrichInventoryMeta() {
+  const toEnrich = _inventoryData.filter(m => m.owner && m.source !== 'ollama');
+  if (!toEnrich.length) { toast('No HF models to enrich', 'err'); return; }
+  toast('Fetching HF metadata for ' + toEnrich.length + ' models...', 'ok');
+  try {
+    const payload = toEnrich.map(m => ({owner: m.owner, name: m.name}));
+    const d = await apiFetch('/api/hf/meta/enrich', 'POST', {models: payload});
+    const results = d.results || {};
+    let count = 0;
+    for (const m of _inventoryData) {
+      const key = m.full_name || (m.owner + '/' + m.name);
+      if (results[key]) {
+        m.pipeline_tag = results[key].pipeline_tag;
+        m.task_label = results[key].task_label || m.task_label;
+        m.hf_downloads = results[key].downloads;
+        m.hf_likes = results[key].likes;
+        count++;
+      }
+    }
+    filterInventory();
+    toast('Enriched ' + count + ' models with HF metadata', 'ok');
+  } catch(e) {
+    toast('Enrich failed: ' + e.message, 'err');
+  }
+}
+
+async function loadCustomDirs() {
+  try {
+    const d = await apiFetch('/api/hf/inventory/dirs');
+    const customDirsEl = document.getElementById('inv-custom-dirs');
+    if (!customDirsEl) return;
+    const customDirs = (d.dirs || []).filter(x => !x.default);
+    if (!customDirs.length) {
+      customDirsEl.innerHTML = '<div style="font-size:12px;color:var(--muted);padding:2px 0">No additional directories added</div>';
+      return;
+    }
+    customDirsEl.innerHTML = customDirs.map(dir => {
+      return '<div class="inv-custom-dir-row">'
+        + '<span class="inv-custom-dir-path">' + dir.path.replace(/^\/home\/[^/]+/, '~') + '</span>'
+        + '<button class="inv-remove-btn" onclick="removeInventoryDir(\'' + dir.path.replace(/'/g,"\\'") + '\')">&#10005; Remove</button>'
+        + '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function addInventoryDir() {
+  const input = document.getElementById('inv-add-dir');
+  const path = input.value.trim();
+  if (!path) { input.focus(); return; }
+  try {
+    await apiFetch('/api/hf/inventory/dirs', 'POST', {path});
+    input.value = '';
+    toast('Directory added', 'ok');
+    await loadCustomDirs();
+    await loadUnifiedInventory();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
+  }
+}
+
+async function removeInventoryDir(path) {
+  try {
+    await fetch('/api/hf/inventory/dirs?' + new URLSearchParams({path}), {method:'DELETE', headers: authHeaders()});
+    toast('Directory removed', 'ok');
+    await loadCustomDirs();
+    await loadUnifiedInventory();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
+  }
+}
+
+async function createVLLMProfileFromInventory(dirPath, modelName) {
+  try {
+    const d = await apiFetch('/api/vllm/profiles/from-hf', 'POST', {path: dirPath, model_name: modelName});
+    const p = d.profile || {};
+    toast('vLLM profile added: ' + (p.name || p.id || modelName), 'ok');
+    await loadUnifiedInventory();
+    if (engines.vllm) {
+      await loadEngineProfiles(engines.vllm);
+    }
+    await loadWarmModels();
+  } catch(e) {
+    toast('Profile creation failed: ' + e.message, 'err');
+  }
+}
+
+async function deleteInventoryModel(dirPath, modelName, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete "' + modelName + '"' + size + ' from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
+  try {
+    await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath});
+    toast('Deleted: ' + modelName + size, 'ok');
+    await loadUnifiedInventory();
+  } catch(e) {
+    // A profile cross-reference is overridable; an in-use container is not.
+    if (/profile script references/.test(e.message)) {
+      if (!confirm(modelName + ' is referenced by a profile script.\n\nDeleting the weights will make that profile fail at next launch.\n\nDelete anyway?')) return;
+      try {
+        await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+        toast('Deleted: ' + modelName + size, 'ok');
+        await loadUnifiedInventory();
+      } catch(e2) {
+        toast('Delete failed: ' + e2.message, 'err');
+      }
+      return;
+    }
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HF Browse
+// ─────────────────────────────────────────────────────────────────────────────
+
+function fmtNum(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+  if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+async function hfbSearch() {
+  const q = document.getElementById('hfb-query')?.value.trim();
+  if (!q) return;
+  const pipeline = document.getElementById('hfb-pipeline')?.value || '';
+  const sort = document.getElementById('hfb-sort')?.value || 'downloads';
+  const root = document.getElementById('hfb-results');
+  root.innerHTML = '<div class="hfb-loading"><div class="spin-icon" style="margin:0 auto 8px"></div>Searching HuggingFace...</div>';
+  try {
+    let url = '/api/hf/search?q=' + encodeURIComponent(q) + '&sort=' + sort + '&limit=20';
+    if (pipeline) url += '&pipeline_tag=' + encodeURIComponent(pipeline);
+    const d = await apiFetch(url);
+    const models = d.models || [];
+    if (!models.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-text">No results found for "' + esc(q) + '"</div></div>';
+      return;
+    }
+    root.innerHTML = models.map(renderHFBCard).join('');
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Search failed: ' + esc(e.message) + '</div></div>';
+  }
+}
+
+function renderHFBCard(m) {
+  const taskBadge = m.task_label && m.task_label !== 'Unknown'
+    ? '<span class="inv-task-badge">' + esc(m.task_label) + '</span>' : '';
+  const fmtTags = [];
+  if (m.has_safetensors) fmtTags.push('<span class="hfb-tag fmt">safetensors</span>');
+  if (m.has_gguf) fmtTags.push('<span class="hfb-tag fmt">gguf</span>');
+  const tags = (m.tags || []).filter(t => t !== 'safetensors' && t !== 'gguf').slice(0, 8)
+    .map(t => '<span class="hfb-tag">' + esc(t) + '</span>').join('');
+  // T-04-10: m.id / m.library_name / m.tags are named by a third party (hf.co).
+  // esc(q(...)) for the onclick attributes: q closes the JS-string context, esc
+  // closes the HTML-attribute context. Neither alone is sufficient.
+  const safeId = esc(String(m.id == null ? '' : m.id).replace(/'/g, "\\'"));
+  const domId = esc(String(m.id == null ? '' : m.id).replace(/\//g, '--'));
+
+  return '<div class="hfb-card" id="hfb-card-' + domId + '">'
+    + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + esc(m.id) + '</div>' + taskBadge + '</div>'
+    + '<div class="hfb-card-meta">'
+    + '<span class="dl">&#11015; ' + fmtNum(m.downloads) + '</span>'
+    + '<span class="lk">&#9829; ' + fmtNum(m.likes) + '</span>'
+    + (m.library_name ? '<span>' + esc(m.library_name) + '</span>' : '')
+    + '</div>'
+    + '<div class="hfb-tags">' + fmtTags.join('') + tags + '</div>'
+    + '<div class="hfb-card-actions">'
+    + '<button class="btn btn-sm btn-primary" onclick="hfbDownload(\'' + safeId + '\')">Download</button>'
+    + '<button class="hfb-expand-toggle" onclick="hfbToggleExpand(\'' + safeId + '\')">&#9660; Files &amp; Variants</button>'
+    + '</div>'
+    + '<div class="hfb-expand" id="hfb-exp-' + domId + '" style="display:none"></div>'
+    + '</div>';
+}
+
+async function hfbToggleExpand(modelId) {
+  const elId = 'hfb-exp-' + modelId.replace(/\//g, '--');
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  if (el.dataset.loaded) return;
+  el.innerHTML = '<div class="hfb-loading">Loading...</div>';
+
+  const parts = modelId.split('/');
+  if (parts.length < 2) { el.innerHTML = '<div class="inv-no">Invalid model ID</div>'; return; }
+  const [owner, name] = parts;
+
+  try {
+    const [filesRes, varRes] = await Promise.all([
+      apiFetch('/api/hf/model/' + owner + '/' + name + '/files'),
+      apiFetch('/api/hf/search/variants?model_id=' + encodeURIComponent(modelId)),
+    ]);
+
+    let html = '<div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.1em">Files (' + (filesRes.total || 0) + ')</div>';
+    html += '<div class="hfb-file-list">';
+    for (const f of (filesRes.files || []).slice(0, 50)) {
+      html += '<div class="hfb-file-row"><span>' + f.name + '</span><span class="size">' + fmtSize(f.size) + '</span></div>';
+    }
+    if ((filesRes.total || 0) > 50) html += '<div style="padding:4px 0;color:var(--muted);font-size:10px">...and ' + (filesRes.total - 50) + ' more files</div>';
+    html += '</div>';
+
+    const variants = varRes.variants || [];
+    if (variants.length) {
+      html += '<div class="hfb-variants"><div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.1em">Quantized Variants</div>';
+      for (const v of variants) {
+        const vSafe = v.id.replace(/'/g, "\\'");
+        html += '<div class="hfb-variant-row">'
+          + '<span class="fmt">' + v.format + '</span>'
+          + '<span style="flex:1;color:var(--text)">' + v.id + '</span>'
+          + '<span style="color:var(--muted);font-size:10px">&#11015; ' + fmtNum(v.downloads) + '</span>'
+          + '<button class="btn btn-sm" style="padding:2px 8px;font-size:10px" onclick="hfbDownload(\'' + vSafe + '\')">Download</button>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+
+    el.innerHTML = html;
+    el.dataset.loaded = '1';
+  } catch(e) {
+    el.innerHTML = '<div style="color:var(--red);font-size:12px">Failed to load: ' + e.message + '</div>';
+  }
+}
+
+function hfbDownload(repoId) {
+  document.getElementById('hf-repo').value = repoId;
+  switchTab('hf');
+  toast('Repo pre-filled: ' + repoId + '. Click Download to start.', 'ok');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug / Logs
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _debugEngineTab = 'sglang';
+const _debugTimers = {};
+
+// Kept as an alias so the warm-models call sites keep reading naturally; there is
+// still exactly one implementation, and it now also escapes " and '.
+function _escHtml(s) { return esc(s); }
+function _fmtUptime(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm ' + Math.floor(sec % 60) + 's';
+}
+
+function loadDebugTab() {
+  loadSystemOverview();
+  loadDebugConfig();
+  loadAppLogs();
+}
+
+async function loadSystemOverview() {
+  const el = document.getElementById('debug-system');
+  if (!el) return;
+  try {
+    const d = await apiFetch('/api/debug/system');
+    let html = '<div class="debug-grid">';
+    html += _statCard('Hostname', d.hostname);
+    html += _statCard('IP Address', d.ip);
+    html += _statCard('Architecture', d.arch);
+    html += _statCard('Memory', d.memory_gb + ' GB');
+    html += _statCard('Python', d.python_version);
+    html += _statCard('Uptime', _fmtUptime(d.uptime_seconds));
+    html += _statCard('App Port', ':' + d.app_port);
+    html += _statCard('API Key', d.api_key_set ? 'Active' : 'Not set', d.api_key_set ? 'warn' : '');
+    html += '</div>';
+
+    // Disk
+    const hfDisk = d.disk?.hf_cache;
+    if (hfDisk && !hfDisk.error) {
+      html += '<div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:10px">'
+        + 'Disk: <span style="color:var(--text)">' + hfDisk.path.replace(/^\/home\/[^/]+/,'~') + '</span>'
+        + ' &mdash; <span style="color:var(--amber)">' + (hfDisk.total_gb - hfDisk.free_gb).toFixed(1) + '</span> / ' + hfDisk.total_gb + ' GB'
+        + ' (' + hfDisk.used_pct + '%)</div>';
+    }
+
+    // Services
+    html += '<div class="debug-grid" style="margin-bottom:10px">';
+    for (const [name, info] of Object.entries(d.services || {})) {
+      const cls = info.healthy ? 'ok' : 'err';
+      const ms = info.response_ms != null ? info.response_ms + 'ms' : 'timeout';
+      html += '<div class="debug-stat">'
+        + '<div class="debug-stat-label">' + name.toUpperCase() + '</div>'
+        + '<div class="debug-stat-value ' + cls + '">' + (info.healthy ? '\u25CF ' + ms : '\u25CB Offline') + '</div>'
+        + '<div style="font-size:10px;color:var(--muted);margin-top:2px">' + _escHtml(info.url) + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+
+    // Permissions
+    const p = d.permissions || {};
+    html += '<div style="font-family:var(--mono);font-size:11px;color:var(--muted)">'
+      + 'Sudo: <span class="' + (p.systemctl ? 'debug-stat-value ok' : 'debug-stat-value err') + '" style="font-size:11px">'
+      + (p.systemctl ? '\u2713' : '\u2717') + ' systemctl</span>'
+      + ' &nbsp; <span class="' + (p.docker ? 'debug-stat-value ok' : 'debug-stat-value err') + '" style="font-size:11px">'
+      + (p.docker ? '\u2713' : '\u2717') + ' docker</span></div>';
+
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">Failed to load system info: ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+function _statCard(label, value, cls) {
+  return '<div class="debug-stat"><div class="debug-stat-label">' + label + '</div>'
+    + '<div class="debug-stat-value' + (cls ? ' ' + cls : '') + '">' + _escHtml(value) + '</div></div>';
+}
+
+async function loadDebugConfig() {
+  try {
+    const d = await apiFetch('/api/debug/config');
+    // App config
+    const appEl = document.getElementById('debug-cfg-app');
+    if (appEl) {
+      let t = 'Port:           ' + d.app.port + '\n'
+        + 'API Key:        ' + (d.app.api_key_set ? 'Active' : 'Not set') + '\n'
+        + 'Config File:    ' + d.app.config_file + '\n'
+        + 'Started:        ' + d.app.start_utc + '\n\n'
+        + '--- Service URLs ---\n';
+      for (const [k, v] of Object.entries(d.services)) {
+        t += (k + ':').padEnd(16) + v + '\n';
+      }
+      t += '\n--- Paths ---\n';
+      for (const [k, v] of Object.entries(d.paths)) {
+        t += (k + ':').padEnd(16) + v + '\n';
+      }
+      appEl.textContent = t;
+    }
+    // LiteLLM config
+    const litEl = document.getElementById('debug-cfg-litellm');
+    if (litEl) litEl.textContent = d.litellm?.raw || 'No LiteLLM config found';
+    // Engine profiles (dynamic)
+    const ep = d.engine_profiles || {};
+    for (const [key, profiles] of Object.entries(ep)) {
+      const el = document.getElementById('debug-cfg-' + key);
+      if (el) el.textContent = profiles?.length ? JSON.stringify(profiles, null, 2) : 'No profiles found';
+    }
+  } catch(e) {}
+}
+
+async function loadAppLogs() {
+  if (activeTab !== 'debug') return;
+  const pane = document.getElementById('app-log-pane');
+  const footer = document.getElementById('app-log-footer');
+  if (!pane) return;
+  const level = document.getElementById('log-level-filter')?.value || '';
+  const search = document.getElementById('log-search')?.value || '';
+  try {
+    let url = '/api/logs/app?limit=200';
+    if (level) url += '&level=' + encodeURIComponent(level);
+    if (search) url += '&search=' + encodeURIComponent(search);
+    const d = await apiFetch(url);
+    const entries = d.entries || [];
+    if (!entries.length) {
+      pane.innerHTML = '<span style="color:var(--muted)">No log entries match your filters.</span>';
+      if (footer) footer.textContent = '0 / ' + d.total + ' entries (buffer: ' + d.buffer_size + ')';
+      return;
+    }
+    // Smart scroll: only auto-scroll if already at bottom
+    const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 30;
+    let html = '';
+    for (const e of entries) {
+      const ts = e.ts.substring(11, 19);
+      html += '<div class="log-entry">'
+        + '<span class="log-ts">' + ts + '</span> '
+        + '<span class="log-level-' + e.level + '">' + e.level.padEnd(7) + '</span> '
+        + '<span class="log-src">' + _escHtml(e.logger) + '</span> '
+        + _escHtml(e.msg)
+        + '</div>';
+    }
+    pane.innerHTML = html;
+    if (atBottom) pane.scrollTop = pane.scrollHeight;
+    if (footer) footer.textContent = entries.length + ' / ' + d.total + ' entries (buffer: ' + d.buffer_size + ')';
+  } catch(e) {
+    pane.innerHTML = '<span style="color:var(--red)">Failed to load logs: ' + _escHtml(e.message) + '</span>';
+  }
+}
+
+async function clearAppLogs() {
+  try {
+    await apiFetch('/api/logs/app', 'DELETE');
+    toast('Log buffer cleared', 'ok');
+    loadAppLogs();
+  } catch(e) {
+    toast('Failed: ' + e.message, 'err');
+  }
+}
+
+function _setupAutoRefresh(cbId, fn, ms) {
+  const cb = document.getElementById(cbId);
+  if (!cb) return;
+  if (cb.checked) {
+    if (!_debugTimers[cbId]) _debugTimers[cbId] = setInterval(fn, ms);
+  } else {
+    clearInterval(_debugTimers[cbId]);
+    delete _debugTimers[cbId];
+  }
+}
+
+async function loadEngineLog() {
+  if (activeTab !== 'debug') return;
+  const pane = document.getElementById('engine-log-pane');
+  const footer = document.getElementById('engine-log-footer');
+  if (!pane) return;
+  const search = document.getElementById('engine-log-search')?.value || '';
+  try {
+    let url = '/api/logs/engine/' + _debugEngineTab + '?lines=150';
+    if (search) url += '&search=' + encodeURIComponent(search);
+    const d = await apiFetch(url);
+    if (!d.file) {
+      pane.innerHTML = '<span style="color:var(--muted)">No log files found for ' + _debugEngineTab + '.</span>';
+      if (footer) footer.textContent = '';
+      return;
+    }
+    const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 30;
+    pane.innerHTML = d.lines.map(l => '<div class="log-entry">' + _escHtml(l) + '</div>').join('');
+    if (atBottom) pane.scrollTop = pane.scrollHeight;
+    if (footer) {
+      const shortFile = d.file.replace(/^\/tmp\//, '/tmp/');
+      footer.textContent = shortFile + ' \u00B7 ' + d.total_lines + ' total lines'
+        + (d.available_files.length > 1 ? ' \u00B7 ' + d.available_files.length + ' log files' : '');
+    }
+  } catch(e) {
+    pane.innerHTML = '<span style="color:var(--red)">Failed: ' + _escHtml(e.message) + '</span>';
+  }
+}
+
+function switchEngineLog(engine) {
+  _debugEngineTab = engine;
+  for (const key of Object.keys(engines)) {
+    const tab = document.getElementById('eng-tab-' + key);
+    if (tab) tab.classList.toggle('active', engine === key);
+  }
+  loadEngineLog();
+}
+
+async function loadLiteLLMLogs() {
+  if (activeTab !== 'debug') return;
+  const pane = document.getElementById('litellm-log-pane');
+  const footer = document.getElementById('litellm-log-footer');
+  if (!pane) return;
+  const search = document.getElementById('litellm-log-search')?.value || '';
+  try {
+    let url = '/api/logs/litellm?lines=100';
+    if (search) url += '&search=' + encodeURIComponent(search);
+    const d = await apiFetch(url);
+    if (!d.available) {
+      pane.innerHTML = '<span style="color:var(--amber)">' + _escHtml(d.error || 'journalctl not available') + '</span>';
+      if (footer) footer.textContent = '';
+      return;
+    }
+    if (!d.lines.length) {
+      pane.innerHTML = '<span style="color:var(--muted)">No log entries found.</span>';
+      if (footer) footer.textContent = '';
+      return;
+    }
+    const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 30;
+    pane.innerHTML = d.lines.map(l => '<div class="log-entry">' + _escHtml(l) + '</div>').join('');
+    if (atBottom) pane.scrollTop = pane.scrollHeight;
+    if (footer) footer.textContent = d.lines.length + ' lines';
+  } catch(e) {
+    pane.innerHTML = '<span style="color:var(--red)">Failed: ' + _escHtml(e.message) + '</span>';
+  }
+}
+
+async function loadDockerState() {
+  const el = document.getElementById('docker-state-content');
+  if (!el) return;
+  try {
+    const d = await apiFetch('/api/debug/docker');
+    if (!d.available) {
+      el.innerHTML = '<div class="empty"><div class="empty-text">Docker not available: ' + _escHtml(d.error || '') + '</div></div>';
+      return;
+    }
+    if (!d.containers.length) {
+      el.innerHTML = '<div class="empty"><div class="empty-text">No running containers.</div></div>';
+      return;
+    }
+    let html = '<table class="docker-table"><thead><tr>'
+      + '<th>ID</th><th>Name</th><th>Image</th><th>Status</th><th>Ports</th>'
+      + '</tr></thead><tbody>';
+    for (const c of d.containers) {
+      html += '<tr><td>' + _escHtml(c.id) + '</td><td>' + _escHtml(c.name) + '</td>'
+        + '<td>' + _escHtml(c.image) + '</td><td>' + _escHtml(c.status) + '</td>'
+        + '<td style="font-size:10px">' + _escHtml(c.ports) + '</td></tr>';
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">Failed: ' + _escHtml(e.message) + '</div></div>';
+  }
+}
+
+// Wire up auto-refresh checkboxes
+document.addEventListener('DOMContentLoaded', function() {
+  document.getElementById('log-auto-refresh')?.addEventListener('change', function() {
+    _setupAutoRefresh('log-auto-refresh', loadAppLogs, 3000);
+  });
+  document.getElementById('engine-auto-refresh')?.addEventListener('change', function() {
+    _setupAutoRefresh('engine-auto-refresh', loadEngineLog, 3000);
+  });
+  document.getElementById('litellm-auto-refresh')?.addEventListener('change', function() {
+    _setupAutoRefresh('litellm-auto-refresh', loadLiteLLMLogs, 5000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utils
+// ─────────────────────────────────────────────────────────────────────────────
+
+function authHeaders() {
+  const h = {'Content-Type': 'application/json'};
+  const k = localStorage.getItem('dgx_api_key');
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return h;
+}
+
+async function apiFetch(url, method = 'GET', body = null) {
+  const opts = {method, headers: authHeaders()};
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  if (r.status === 401) {
+    showAuthModal();
+    throw new Error('Authentication required');
+  }
+  if (!r.ok) {
+    let msg = r.statusText;
+    try { const d = await r.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+    throw new Error(msg);
+  }
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    const txt = await r.text();
+    try { return JSON.parse(txt); } catch(e) { throw new Error('Server returned non-JSON response'); }
+  }
+  return r.json();
+}
+
+function showAuthModal() {
+  if (document.getElementById('auth-modal')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'auth-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:380px;max-width:90vw">
+      <div style="font-size:15px;font-weight:700;margin-bottom:4px">API Key Required</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:16px">This instance has an API key configured. Enter it to continue.</div>
+      <input class="input" id="auth-key-input" type="password" placeholder="Enter API key" style="width:100%;margin-bottom:12px"
+        onkeydown="if(event.key==='Enter')submitAuthKey()">
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-sm" onclick="document.getElementById('auth-modal').remove()">Cancel</button>
+        <button class="btn btn-primary btn-sm" onclick="submitAuthKey()">Unlock</button>
+      </div>
+      <div id="auth-error" style="font-size:11px;color:var(--red);margin-top:8px"></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  document.getElementById('auth-key-input').focus();
+}
+
+async function submitAuthKey() {
+  const input = document.getElementById('auth-key-input');
+  const key = input.value.trim();
+  if (!key) return;
+  try {
+    const r = await fetch('/api/auth/check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key}
+    });
+    const d = await r.json();
+    if (d.ok) {
+      localStorage.setItem('dgx_api_key', key);
+      document.getElementById('auth-modal').remove();
+      toast('Authenticated');
+    } else {
+      document.getElementById('auth-error').textContent = 'Invalid key';
+    }
+  } catch(e) {
+    document.getElementById('auth-error').textContent = 'Connection error';
+  }
+}
+
+function toast(msg, type) {
+  const root = document.getElementById('toast-root');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (type || '');
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = 'opacity .3s';
+    el.style.opacity = '0';
+    setTimeout(() => el.remove(), 320);
+  }, 3500);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settings
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadConfig() {
+  try {
+    const d = await apiFetch('/api/config');
+    document.getElementById('svc-ollama-url').value = d.services.ollama_base || '';
+    document.getElementById('svc-litellm-url').value = d.services.litellm_base || '';
+    // Populate engine URL inputs dynamically
+    for (const [key, eng] of Object.entries(engines)) {
+      const el = document.getElementById('svc-' + key + '-url');
+      if (el) {
+        // Find config key by looking for matching key in services
+        const cfgKey = Object.keys(d.services).find(k => k === key + '_base') || key + '_base';
+        el.value = d.services[cfgKey] || '';
+      }
+    }
+    const authSt = document.getElementById('auth-status');
+    if (d.app && d.app.api_key_set) {
+      authSt.className = 'svc-status ok';
+      authSt.textContent = 'Key active';
+    } else {
+      authSt.className = 'svc-status';
+      authSt.textContent = 'Open (no key)';
+    }
+  } catch(e) {}
+}
+
+async function testService(type) {
+  const input = document.getElementById('svc-' + type + '-url');
+  const status = document.getElementById('svc-' + type + '-status');
+  const url = input.value.trim();
+  if (!url) { status.className = 'svc-status err'; status.textContent = 'No URL'; return; }
+  status.className = 'svc-status testing';
+  status.textContent = 'Testing\u2026';
+  try {
+    const r = await fetch('/api/test-service', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({url, type})
+    });
+    if (r.status === 401) { showAuthModal(); status.className = 'svc-status err'; status.textContent = '\u2717 Auth required'; return; }
+    const d = await r.json();
+    if (d.ok) {
+      status.className = 'svc-status ok';
+      status.textContent = '\u2713 ' + d.latency_ms + 'ms';
+    } else {
+      status.className = 'svc-status err';
+      status.textContent = '\u2717 ' + (d.error || 'Failed');
+    }
+  } catch(e) {
+    status.className = 'svc-status err';
+    status.textContent = '\u2717 Error';
+  }
+}
+
+async function testAllServices() {
+  const types = ['ollama', 'litellm', ...Object.keys(engines)];
+  await Promise.all(types.map(s => testService(s)));
+}
+
+async function saveConfig() {
+  const services = {
+    ollama_base:  document.getElementById('svc-ollama-url').value.trim(),
+    litellm_base: document.getElementById('svc-litellm-url').value.trim(),
+  };
+  // Collect engine URLs dynamically
+  for (const key of Object.keys(engines)) {
+    const el = document.getElementById('svc-' + key + '-url');
+    if (el) services[key + '_base'] = el.value.trim();
+  }
+  const msg = document.getElementById('settings-msg');
+  try {
+    const r = await fetch('/api/config', {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({services})
+    });
+    if (r.status === 401) { showAuthModal(); return; }
+    const d = await r.json();
+    if (d.ok) {
+      toast('Configuration saved');
+      msg.style.color = 'var(--green)';
+      msg.textContent = 'Saved \u2014 changes are live';
+      setTimeout(() => { msg.textContent = ''; }, 3000);
+      // Refresh status and nodeinfo with new URLs
+      pollStatus();
+      loadNodeInfo();
+    } else {
+      msg.style.color = 'var(--red)';
+      msg.textContent = 'Save failed';
+    }
+  } catch(e) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = 'Save failed: ' + e.message;
+  }
+}
+
+async function saveApiKey() {
+  const input = document.getElementById('svc-api-key');
+  const key = input.value.trim();
+  if (!key) { toast('Enter a key first', 'err'); return; }
+  try {
+    await apiFetch('/api/config', 'PUT', {api_key: key});
+    localStorage.setItem('dgx_api_key', key);
+    input.value = '';
+    toast('API key set');
+    loadConfig();
+  } catch(e) {
+    toast('Failed to set key: ' + e.message, 'err');
+  }
+}
+
+async function clearApiKey() {
+  try {
+    await apiFetch('/api/config', 'PUT', {api_key: ''});
+    localStorage.removeItem('dgx_api_key');
+    document.getElementById('svc-api-key').value = '';
+    toast('API key cleared \u2014 open access');
+    loadConfig();
+  } catch(e) {
+    toast('Failed to clear key: ' + e.message, 'err');
+  }
+}
+</script>
+</body>
+</html>
