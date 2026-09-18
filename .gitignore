@@ -5,6 +5,7 @@ config.json
 custom_dirs.json
 hf_meta_cache.json
 alert_state.json
+agent_runs.json
 
 # Research-refresh working + review artifacts (recommendations.json IS tracked)
 recommendations.proposed.json
@@ -18,6 +19,7 @@ backup/
 
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 

@@ -1,5 +1,6 @@
 """Shared fixtures — import the app module and isolate mutable alert state."""
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -27,6 +28,22 @@ def isolate_alert_state(tmp_path, monkeypatch):
     """Keep alert cooldown state out of the repo and reset it per test."""
     monkeypatch.setattr(appmod, "_ALERT_STATE_FILE", tmp_path / "alert_state.json")
     monkeypatch.setattr(appmod, "_last_alert_sent", {})
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_agent_history(tmp_path, monkeypatch):
+    """Keep the agent run-history store out of the repo; reset state + locks per test.
+
+    Locks are re-created so an `asyncio.Lock` never outlives the event loop it was
+    bound to (each asyncio test runs on a fresh loop).
+    """
+    monkeypatch.setattr(appmod, "_AGENT_RUNS_FILE", tmp_path / "agent_runs.json")
+    monkeypatch.setattr(appmod, "_agent_history", [])
+    appmod._agent_tasks.clear()
+    for agent in appmod._AGENTS.values():
+        agent["lock"] = asyncio.Lock()
+        agent["state"] = appmod._new_agent_state()
     yield
 
 

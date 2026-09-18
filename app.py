@@ -21,6 +21,7 @@ import subprocess
 import sys
 import shutil
 import time as _time
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -2217,6 +2218,12 @@ _PROPOSED_FILE = _APP_DIR / "recommendations.proposed.json"
 _refresh_lock = asyncio.Lock()
 
 
+async def _core_research(progress_cb=None) -> dict:
+    """Run the research-refresh job (blocking) and return its result dict."""
+    import research_refresh
+    return await asyncio.to_thread(research_refresh.research, progress_cb)
+
+
 @app.get("/api/recommendations/proposed")
 async def get_proposed_recommendations():
     """Return the last proposals (recommendations.proposed.json), if any."""
@@ -2236,7 +2243,7 @@ async def refresh_recommendations():
         import research_refresh
         _logger.info("Research-refresh requested (engine=%s)", research_refresh.ENGINE)
         try:
-            result = await asyncio.to_thread(research_refresh.research)
+            result = await _core_research()
         except Exception as e:
             _logger.error("Research-refresh failed: %s", e)
             raise HTTPException(500, f"Refresh failed: {e}")
@@ -2526,18 +2533,29 @@ async def _alert_loop():
             _logger.error("Alert check failed: %s", e)
 
 
-@app.post("/api/alerts/check", dependencies=[Depends(verify_auth)])
-async def run_alert_check():
-    """Manual alert check — returns active alerts; sends to Discord if configured."""
+async def _core_alert_check(progress_cb=None) -> dict:
+    """Run the alert threshold checks and route them to channels (force send)."""
+    if progress_cb:
+        progress_cb(0.15, "Collecting health signals")
     alerts = await _collect_alerts()
+    if progress_cb:
+        progress_cb(0.7, "Notifying channels")
     sent = await asyncio.to_thread(_send_alerts, alerts, True)
     channels = _configured_alert_channels()
+    if progress_cb:
+        progress_cb(1.0, "Done")
     return {
         "alerts": alerts,
         "sent": sent,
         "channels": sorted(channels),
         "webhook_configured": "discord" in channels,
     }
+
+
+@app.post("/api/alerts/check", dependencies=[Depends(verify_auth)])
+async def run_alert_check():
+    """Manual alert check — returns active alerts; sends to Discord if configured."""
+    return await _core_alert_check()
 
 
 # ── Image drift ───────────────────────────────────────────────────────────────
@@ -2548,6 +2566,16 @@ async def run_alert_check():
 # litellm ran 47 minor versions behind for months with nothing reporting it.
 
 _image_check_lock = asyncio.Lock()
+
+
+async def _core_image_check(progress_cb=None) -> dict:
+    """Re-run the drift check (blocking) and route findings to alerts."""
+    import image_updates
+    report = await asyncio.to_thread(
+        lambda: image_updates.check(progress_cb=progress_cb))
+    alerts = image_updates.to_alerts(report)
+    sent = await asyncio.to_thread(_send_alerts, alerts, False)
+    return {**report, "alerts": alerts, "sent": sent}
 
 
 @app.get("/api/images/drift")
@@ -2568,18 +2596,198 @@ async def run_image_check():
     if _image_check_lock.locked():
         raise HTTPException(409, "An image check is already running")
     async with _image_check_lock:
-        import image_updates
         try:
-            report = await asyncio.to_thread(image_updates.check)
+            result = await _core_image_check()
         except Exception as e:
             _logger.error("Image drift check failed: %s", e)
             raise HTTPException(500, f"Image check failed: {e}")
-        alerts = image_updates.to_alerts(report)
-        sent = await asyncio.to_thread(_send_alerts, alerts, False)
-        outdated = [r for r in report.get("rows", []) if r.get("status") == "outdated"]
+        outdated = [r for r in result.get("rows", []) if r.get("status") == "outdated"]
         _logger.info("Image drift check: %d outdated, %d alert(s) sent",
-                     len(outdated), len(sent))
-        return {**report, "alerts": alerts, "sent": sent}
+                     len(outdated), len(result.get("sent", [])))
+        return result
+
+
+# ── Agents ────────────────────────────────────────────────────────────────────
+# Unified front-end for the app's on-demand background jobs. Each agent runs as a
+# fire-and-forget asyncio task so a slow job (research ~1-2 min) never blocks the
+# HTTP request; the UI polls GET /api/agents to read percentage completion and the
+# recent-run history. History persists to agent_runs.json (runtime data, gitignored).
+# Adding an agent = one entry in _AGENTS + a branch in _agent_core.
+
+_AGENT_RUNS_FILE = _APP_DIR / "agent_runs.json"
+_AGENT_HISTORY_CAP = 50
+
+
+def _agent_history_file_load() -> list:
+    try:
+        data = json.loads(_AGENT_RUNS_FILE.read_text())
+        runs = data.get("runs") if isinstance(data, dict) else data
+        return [r for r in (runs or []) if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+_agent_history: list = _agent_history_file_load()
+
+
+def _agent_history_save() -> None:
+    try:
+        tmp = _AGENT_RUNS_FILE.with_name(_AGENT_RUNS_FILE.name + ".tmp")
+        tmp.write_text(json.dumps({"runs": _agent_history}, indent=2))
+        os.replace(tmp, _AGENT_RUNS_FILE)
+    except Exception as e:
+        _logger.warning("Failed to persist agent run history: %s", e)
+
+
+def _new_agent_state() -> dict:
+    return {"status": "idle", "run_id": None, "started_at": None,
+            "finished_at": None, "duration_s": None, "progress": 0,
+            "label": "", "summary": ""}
+
+
+_AGENTS: dict = {
+    "alert-check": {
+        "name": "Alert check",
+        "desc": "Memory + serving-endpoint health; notify channels on active alerts.",
+        "lock": asyncio.Lock(), "state": _new_agent_state(),
+    },
+    "image-drift": {
+        "name": "Image drift",
+        "desc": "Compare running container images against their upstream releases.",
+        "lock": _image_check_lock, "state": _new_agent_state(),
+    },
+    "research-refresh": {
+        "name": "KB research refresh",
+        "desc": "Fetch curated sources and synthesize proposed recommendation updates.",
+        "lock": _refresh_lock, "state": _new_agent_state(),
+    },
+}
+
+_agent_tasks: set = set()
+
+
+async def _agent_core(agent_id: str, progress_cb) -> dict:
+    if agent_id == "alert-check":
+        return await _core_alert_check(progress_cb)
+    if agent_id == "image-drift":
+        return await _core_image_check(progress_cb)
+    if agent_id == "research-refresh":
+        return await _core_research(progress_cb)
+    raise ValueError(f"Unknown agent '{agent_id}'")
+
+
+def _agent_summary(agent_id: str, result: dict) -> str:
+    if agent_id == "alert-check":
+        alerts = result.get("alerts") or []
+        if not alerts:
+            return "No alerts — all checks passed."
+        return (f"{len(alerts)} alert(s): "
+                + "; ".join(a.get("type", "?") for a in alerts))
+    if agent_id == "image-drift":
+        if not result.get("ok", True):
+            errs = result.get("errors") or ["unknown error"]
+            return "Check failed: " + "; ".join(str(e) for e in errs)
+        rows = result.get("rows") or []
+        if not rows:
+            return "No container images found to check."
+        outdated = [r for r in rows if r.get("status") == "outdated"]
+        return f"{len(outdated)} outdated of {len(rows)} image(s) checked."
+    if agent_id == "research-refresh":
+        props = result.get("proposed") or []
+        base = (result.get("summary") or "").strip()
+        return f"{len(props)} proposal(s). {base}".strip()
+    return ""
+
+
+def _agent_record(agent_id: str, st: dict) -> None:
+    rec = {
+        "agent": agent_id,
+        "run_id": st.get("run_id"),
+        "started_at": st.get("started_at"),
+        "finished_at": st.get("finished_at"),
+        "duration_s": st.get("duration_s"),
+        "status": st.get("status"),
+        "summary": st.get("summary", ""),
+    }
+    _agent_history.insert(0, rec)
+    del _agent_history[_AGENT_HISTORY_CAP:]
+    _agent_history_save()
+
+
+async def _run_agent(agent_id: str) -> None:
+    agent = _AGENTS[agent_id]
+    st = agent["state"]
+    iso = lambda: datetime.now(timezone.utc).isoformat()
+    if st["status"] != "running":          # direct call (tests) — begin the run
+        st.update(status="running", run_id=uuid.uuid4().hex[:12], started_at=iso(),
+                  finished_at=None, duration_s=None, progress=0,
+                  label="Starting", summary="")
+    t0 = _time.monotonic()
+
+    def cb(frac, label):
+        try:
+            st.update(progress=max(0, min(100, int(float(frac) * 100))),
+                      label=str(label))
+        except Exception:
+            pass
+
+    try:
+        async with agent["lock"]:
+            result = await _agent_core(agent_id, cb)
+        st.update(status="ok", progress=100, label="Done",
+                  summary=_agent_summary(agent_id, result))
+    except asyncio.CancelledError:
+        st.update(status="error", label="Cancelled", summary="run cancelled")
+        raise
+    except Exception as e:
+        _logger.error("Agent '%s' failed: %s", agent_id, e)
+        st.update(status="error", label="Failed", summary=str(e))
+    st["finished_at"] = iso()
+    st["duration_s"] = round(_time.monotonic() - t0, 1)
+    _agent_record(agent_id, st)
+
+
+@app.get("/api/agents")
+async def list_agents():
+    out = []
+    for aid, agent in _AGENTS.items():
+        st = agent["state"]
+        hist = [h for h in _agent_history if h.get("agent") == aid]
+        out.append({
+            "id": aid,
+            "name": agent["name"],
+            "desc": agent["desc"],
+            "running": st["status"] == "running",
+            "status": st["status"],
+            "progress": st["progress"],
+            "label": st["label"],
+            "run_id": st.get("run_id"),
+            "last": hist[0] if hist else None,
+            "history": hist[:10],
+        })
+    return {"agents": out,
+            "server_time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.post("/api/agents/{agent_id}/run", dependencies=[Depends(verify_auth)])
+async def run_agent_endpoint(agent_id: str):
+    if agent_id not in _AGENTS:
+        raise HTTPException(404, f"Unknown agent '{agent_id}'")
+    agent = _AGENTS[agent_id]
+    if agent["state"]["status"] == "running":
+        raise HTTPException(409, f"{agent['name']} is already running")
+    # Mark running synchronously so a fast poll sees the run before the task starts;
+    # _run_agent keeps the existing run_id/started_at in that case.
+    run_id = uuid.uuid4().hex[:12]
+    agent["state"].update(status="running", run_id=run_id,
+                          started_at=datetime.now(timezone.utc).isoformat(),
+                          finished_at=None, duration_s=None, progress=0,
+                          label="Starting", summary="")
+    task = asyncio.create_task(_run_agent(agent_id))
+    _agent_tasks.add(task)
+    task.add_done_callback(_agent_tasks.discard)
+    return {"ok": True, "agent": agent_id, "run_id": run_id,
+            "message": f"{agent['name']} started"}
 
 
 # ── Ollama ────────────────────────────────────────────────────────────────────
@@ -6353,6 +6561,39 @@ a.model-card:hover{border-color:var(--amber)}
 .site-dot.ok{background:var(--green);border-color:var(--green);box-shadow:0 0 5px var(--green)}
 .site-dot.err{background:var(--red);border-color:var(--red)}
 
+/* ── Agents (on-demand background jobs) ── */
+.agent-head{display:flex;align-items:flex-start;gap:12px}
+.agent-titles{flex:1;min-width:0}
+.agent-name{font-size:13px;font-weight:600}
+.agent-desc{font-size:11px;color:var(--muted);line-height:1.5;margin-top:3px}
+.agent-chip{
+  display:inline-flex;align-items:center;gap:6px;flex-shrink:0;
+  font-family:var(--mono);font-size:10px;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;
+  padding:3px 9px;border-radius:20px;border:1px solid var(--border);
+  color:var(--muted);
+}
+.agent-chip::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--s3)}
+.agent-chip.run{color:var(--amber)}
+.agent-chip.run::before{background:var(--amber);box-shadow:0 0 5px var(--amber);animation:agpulse 1.1s ease-in-out infinite}
+.agent-chip.ok{color:var(--green)}
+.agent-chip.ok::before{background:var(--green);box-shadow:0 0 5px var(--green)}
+.agent-chip.err{color:var(--red)}
+.agent-chip.err::before{background:var(--red);box-shadow:0 0 5px var(--red)}
+.agent-track{height:5px;background:var(--s3);border-radius:3px;overflow:hidden;margin:14px 0 6px}
+.agent-fill{height:100%;background:var(--amber);border-radius:3px;transition:width .5s}
+.agent-progress{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.agent-last{font-size:12px;color:var(--text);margin-top:12px;line-height:1.5}
+.agent-hist{list-style:none;margin:8px 0 0;padding:0}
+.agent-hist-row{display:flex;gap:10px;align-items:baseline;font-size:11px;padding:5px 0;border-top:1px solid var(--border)}
+.agent-hist-time{font-family:var(--mono);color:var(--muted);white-space:nowrap;flex-shrink:0}
+.agent-hist-status{font-family:var(--mono);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em;flex-shrink:0;min-width:46px}
+.agent-hist-status.ok{color:var(--green)}
+.agent-hist-status.err{color:var(--red)}
+.agent-hist-summary{color:var(--text);line-height:1.4;min-width:0}
+.agent-hist-empty{font-size:11px;color:var(--muted);font-family:var(--mono);margin-top:8px}
+@keyframes agpulse{0%,100%{opacity:1}50%{opacity:.35}}
+
 /* ── Tags ── */
 .tag{
   display:inline-block;padding:2px 7px;
@@ -6960,6 +7201,10 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-item" id="nav-sites" onclick="switchTab('sites')">
       <span class="nav-icon">&#128202;</span>Dashboards
     </div>
+    <div class="nav-item" id="nav-agents" onclick="switchTab('agents')">
+      <span class="nav-icon">&#129302;</span>Agents
+      <span class="nav-badge" id="badge-agents"></span>
+    </div>
     <div class="nav-section-label">Models</div>
     <div class="nav-item active" id="nav-ollama" onclick="switchTab('ollama')">
       <span class="nav-icon">🦙</span>Ollama
@@ -7531,6 +7776,20 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <!-- ─── AGENTS ─── -->
+    <div class="tab" id="tab-agents">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Agents</div>
+          <div class="page-sub">The background jobs this app runs on demand. Start one and it reports completion here; recent runs and their summaries are kept below.</div>
+        </div>
+        <div class="page-sub" style="white-space:nowrap">refreshes every 60s while open</div>
+      </div>
+      <div id="agents-list">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
     <!-- ─── RECOMMENDATIONS ─── -->
     <div class="tab" id="tab-recs">
       <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
@@ -7589,6 +7848,7 @@ let activeTab = 'vllm';
 let selectedProfile = null;
 let selectedVLLMProfile = null;
 let statusTimer = null;
+let agentsTimer = null;
 let litellmPort = '';
 let ollamaBase = '';
 let warmSelectedProfile = null;
@@ -7703,7 +7963,8 @@ async function loadNodeInfo() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function switchTab(name) {
-  // Clear debug auto-refresh timers when navigating away
+  // Clear background timers when navigating away
+  stopAgentsPoll();
   Object.keys(_debugTimers).forEach(k => { clearInterval(_debugTimers[k]); delete _debugTimers[k]; });
   ['log-auto-refresh','engine-auto-refresh','litellm-auto-refresh'].forEach(id => {
     const cb = document.getElementById(id); if (cb) cb.checked = false;
@@ -7723,6 +7984,7 @@ function switchTab(name) {
   else if (name === 'sites') { loadSites(); }
   else if (name === 'recs') { loadRecommendations(); loadProposed(); }
   else if (name === 'updates') { loadImageDrift(); }
+  else if (name === 'agents') { loadAgents(); startAgentsPoll(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7868,6 +8130,100 @@ function renderSites() {
     }).join('') + '</div>';
   }
   root.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Agents — the app's on-demand background jobs; completion polls every 60s
+// ─────────────────────────────────────────────────────────────
+
+function startAgentsPoll() {
+  stopAgentsPoll();
+  agentsTimer = setInterval(loadAgents, 60000);
+}
+
+function stopAgentsPoll() {
+  if (agentsTimer) { clearInterval(agentsTimer); agentsTimer = null; }
+}
+
+async function loadAgents() {
+  const root = document.getElementById('agents-list');
+  if (!root) return;
+  let d;
+  try { d = await apiFetch('/api/agents'); } catch (e) { return; }
+  renderAgents(d.agents || [], root);
+}
+
+function _agentChip(a) {
+  const cls = a.running ? 'run' : (a.status === 'ok' ? 'ok'
+            : (a.status === 'error' ? 'err' : 'idle'));
+  return '<span class="agent-chip ' + cls + '">' + esc(a.running ? 'running' : (a.status || 'idle')) + '</span>';
+}
+
+function _agentHistory(h) {
+  if (!h || !h.length) return '<div class="agent-hist-empty">No runs yet.</div>';
+  const rows = h.slice(0, 5).map(r => {
+    const t = (r.finished_at || r.started_at || '');
+    const stamp = t ? t.replace('T', ' ').slice(0, 19) : '';
+    const dur = (r.duration_s != null) ? ' &middot; ' + r.duration_s + 's' : '';
+    const ok = r.status === 'ok';
+    return '<li class="agent-hist-row">'
+      + '<span class="agent-hist-time">' + esc(stamp) + dur + '</span>'
+      + '<span class="agent-hist-status ' + (ok ? 'ok' : 'err') + '">' + esc(r.status) + '</span>'
+      + '<span class="agent-hist-summary">' + esc(r.summary || '') + '</span>'
+      + '</li>';
+  }).join('');
+  return '<ul class="agent-hist">' + rows + '</ul>';
+}
+
+function renderAgents(list, root) {
+  if (!list.length) { root.innerHTML = '<div class="empty">No agents configured.</div>'; return; }
+  const running = list.filter(a => a.running).length;
+  const badge = document.getElementById('badge-agents');
+  if (badge) badge.textContent = running ? String(running) : '';
+
+  root.innerHTML = list.map(a => {
+    const pct = a.running ? (a.progress || 0) : 0;
+    const bar = a.running
+      ? '<div class="agent-track"><div class="agent-fill" id="agents-fill-' + a.id + '" style="width:' + pct + '%"></div></div>'
+        + '<div class="agent-progress">' + pct + '% &middot; ' + esc(a.label || 'starting') + '</div>'
+      : '';
+    const lastLine = !a.running
+      ? '<div class="agent-last">' + (a.last
+          ? esc(a.last.status || '') + ' &middot; ' + esc(a.last.summary || '')
+          : 'Not run yet.') + '</div>'
+      : '';
+    return '<div class="card agent-card">'
+      + '<div class="agent-head">'
+        + '<div class="agent-titles">'
+          + '<div class="agent-name">' + esc(a.name) + '</div>'
+          + '<div class="agent-desc">' + esc(a.desc) + '</div>'
+        + '</div>'
+        + _agentChip(a)
+        + '<button class="btn btn-primary btn-sm" id="agents-run-' + a.id + '" '
+          + (a.running ? 'disabled' : '') + ' onclick="runAgent(\'' + a.id + '\')">'
+          + (a.running ? 'Running&hellip;' : '\u25B6&nbsp;Run') + '</button>'
+      + '</div>'
+      + bar
+      + lastLine
+      + '<div class="sec-label">Recent runs</div>'
+      + _agentHistory(a.history)
+      + '</div>';
+  }).join('');
+}
+
+async function runAgent(id) {
+  const btn = document.getElementById('agents-run-' + id);
+  if (btn) btn.disabled = true;
+  let r;
+  try { r = await apiFetch('/api/agents/' + id + '/run', 'POST'); }
+  catch (e) {
+    toast(e.message || 'Failed to start agent', 'err');
+    if (btn) btn.disabled = false;
+    return;
+  }
+  toast(r.message || ('Agent ' + id + ' started'));
+  await loadAgents();
+  startAgentsPoll();   // restart the 60s cadence from now
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
