@@ -379,3 +379,18 @@ async def test_discover_sites_survives_missing_kubectl(monkeypatch):
     d = await appmod._discover_sites("h")
     assert [s["name"] for s in d["sites"]] == ["Spark Dashboard"]
     assert d["discovery"]["kubernetes"] == {"ok": False, "error": "kubectl: not found"}
+
+
+# ── Homelab tab ──────────────────────────────────────────────────────────────
+
+def test_homelab_default_nodes_listed_with_both_ips():
+    nodes = {n["name"]: n for n in _client().get("/api/homelab").json()["nodes"]}
+    assert set(nodes) == {"controlplane", "gb10", "dailydriver", "raspberrypi"}
+    assert all(n["local_ip"] and n["tailscale_ip"] for n in nodes.values())
+
+
+def test_homelab_config_override_and_optional_tailscale_ip(monkeypatch):
+    monkeypatch.setattr(appmod, "_HOMELAB_NODES", [
+        {"name": "nas", "local_ip": "192.0.2.9"}, {"role": "nameless, dropped"}])
+    assert _client().get("/api/homelab").json()["nodes"] == [
+        {"name": "nas", "role": "", "local_ip": "192.0.2.9", "tailscale_ip": ""}]

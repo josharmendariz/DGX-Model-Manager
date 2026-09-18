@@ -2055,6 +2055,35 @@ async def get_sites(request: Request, refresh: int = 0):
     return payload
 
 
+# ── Homelab ─────────────────────────────────────────────────────────────────
+# The System > Homelab tab: one row per machine with its LAN and Tailscale
+# address. A static inventory, not discovery — override it with a top-level
+# "homelab": {"nodes": [...]} in config.json. tailscale_ip is optional: a node
+# that is not on the tailnet just leaves it out.
+
+_HOMELAB_DEFAULT_NODES = [
+    {"name": "controlplane", "role": "k3s control plane",
+     "local_ip": "192.168.68.73", "tailscale_ip": "100.92.70.98"},
+    {"name": "gb10", "role": "DGX Spark (inference)",
+     "local_ip": "192.168.68.67", "tailscale_ip": "100.115.54.83"},
+    {"name": "dailydriver", "role": "Daily-driver PC",
+     "local_ip": "192.168.68.56", "tailscale_ip": "100.127.206.11"},
+    {"name": "raspberrypi", "role": "Helix",
+     "local_ip": "192.168.68.72", "tailscale_ip": "100.126.244.108"},
+]
+_HOMELAB_NODES = (_app_config.get("homelab") or {}).get("nodes") or _HOMELAB_DEFAULT_NODES
+
+
+@app.get("/api/homelab")
+async def get_homelab():
+    nodes = [
+        {"name": n["name"], "role": n.get("role") or "",
+         "local_ip": n.get("local_ip") or "", "tailscale_ip": n.get("tailscale_ip") or ""}
+        for n in _HOMELAB_NODES if isinstance(n, dict) and n.get("name")
+    ]
+    return {"nodes": nodes}
+
+
 # ── Recommendations ─────────────────────────────────────────────────────────
 # Layer-2 recommender: diffs the curated Spark-specific KB (recommendations.json)
 # against installed vLLM profiles + live memory state. Each KB entry carries a

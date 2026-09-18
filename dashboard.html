@@ -950,6 +950,9 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
     <div class="nav-item" id="nav-warm" onclick="switchTab('warm')">
       <span class="nav-icon">&#9729;</span>Warm Models
     </div>
+    <div class="nav-item" id="nav-homelab" onclick="switchTab('homelab')">
+      <span class="nav-icon">&#127968;</span>Homelab
+    </div>
     <div class="nav-item" id="nav-settings" onclick="switchTab('settings')">
       <span class="nav-icon">&#9881;</span>Settings
     </div>
@@ -1411,6 +1414,17 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <!-- ─── HOMELAB ─── -->
+    <div class="tab" id="tab-homelab">
+      <div class="page-hdr">
+        <div class="page-title">Homelab</div>
+        <div class="page-sub">Every node with its LAN and Tailscale address. Edit the list via <code>homelab.nodes</code> in <code>config.json</code>.</div>
+      </div>
+      <div id="homelab-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
     <!-- ─── AGENTS ─── -->
     <div class="tab" id="tab-agents">
       <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
@@ -1617,6 +1631,7 @@ function switchTab(name) {
   else if (name === 'settings') { loadConfig(); }
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
+  else if (name === 'homelab') { loadHomelab(); }
   else if (name === 'recs') { loadRecommendations(); loadProposed(); }
   else if (name === 'updates') { loadImageDrift(); }
   else if (name === 'agents') { loadAgents(); startAgentsPoll(); }
@@ -1689,6 +1704,28 @@ function setPill(id, ok, label) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let _lastSites = null;
+
+async function loadHomelab() {
+  const root = document.getElementById('homelab-root');
+  try {
+    const d = await apiFetch('/api/homelab');
+    if (!d.nodes.length) {
+      root.innerHTML = '<div class="empty"><div class="empty-icon">&#127968;</div>' +
+        '<div class="empty-text">No nodes configured</div></div>';
+      return;
+    }
+    const ip = v => v ? '<span class="inv-model-name">' + esc(v) + '</span>'
+                      : '<span class="inv-owner">&mdash;</span>';
+    root.innerHTML = '<div class="inv-table-wrap" style="border-top:1px solid var(--border);border-radius:8px">' +
+      '<table class="inv-table"><thead><tr><th>Node</th><th>Role</th><th>Local IP</th><th>Tailscale IP</th></tr></thead><tbody>' +
+      d.nodes.map(n => '<tr><td><span class="inv-model-name">' + esc(n.name) + '</span></td>' +
+        '<td>' + esc(n.role) + '</td><td>' + ip(n.local_ip) + '</td><td>' + ip(n.tailscale_ip) + '</td></tr>').join('') +
+      '</tbody></table></div>';
+  } catch(e) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
+      '<div class="empty-text">Could not load homelab &middot; ' + esc(e.message) + '</div></div>';
+  }
+}
 
 async function loadSites(rescan) {
   const root = document.getElementById('sites-root');
