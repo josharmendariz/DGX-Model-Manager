@@ -260,6 +260,9 @@ _EXPECTED_CLASSES = {
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-14b.sh": "generated",
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-32b.sh": "generated",
     "start_hf_lyf_qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-nvfp4.sh": "generated",
+    # Hand-written wrapper around a third-party serve.sh; no generated-by marker,
+    # no placeholder, no recipe call.
+    "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh": "legacy",
     "start_hf_openai_gpt-oss-120b.sh": "legacy",
     "start_hf_qwen2.5-14b-instruct-gptq-int8.sh": "generated",
     # Rewritten by parameterize/apply during the 04-03 live checkpoint (2026-08-21,
@@ -267,8 +270,13 @@ _EXPECTED_CLASSES = {
     # written; the .sh.bak beside each still holds the pre-rewrite text.
     "start_hf_qwen3-vl-4b-fp8.sh": "parameterized",
     "start_hf_qwen_qwen3-14b.sh": "legacy",
-    "start_hf_qwen_qwen3.6-35b-a3b-fp8.sh": "recipe",
     "start_hf_qwen_qwen3-8b.sh": "parameterized",
+    "start_hf_qwen_qwen3.6-35b-a3b-fp8.sh": "recipe",
+    # Hand-written, but uses ${VLLM_MAX_MODEL_LEN...} env-var-default syntax — the
+    # placeholder marker alone is the evidence, so this is `parameterized` by the
+    # same design as start_hf_qwen_qwen3-8b.sh above, not `legacy`.
+    "start_hf_qwen_qwen3.8-27b-fp8-mtp.sh": "parameterized",
+    "start_hf_unsloth_qwen3.8-27b-nvfp4-mtp.sh": "parameterized",
     "start_nemotron_nano.sh": "legacy",
     "start_nemotron_super.sh": "legacy",
     "start_qwen3_coder_next.sh": "legacy",
