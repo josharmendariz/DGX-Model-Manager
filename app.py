@@ -138,17 +138,22 @@ _litellm_k8s = _app_config.get("litellm_k8s", {})
 # "url" pin something discovery cannot see (a UI on another host).
 #   {"name": "...", "desc": "...", "group": "...", "port": 3000}  — resolved
 #   against app.sites_base (falls back to app.host, then the request host), or
-#   {"name": "...", "url": "http://other-host:1234"}              — verbatim.
+#   {"name": "...", "url": "http://other-host:1234"}              — verbatim, or
+#   {"name": "...", "host": "controlplane", "port": 8787}  — port on a named
+#     host from the top-level "hosts" map (name → hostname/IP).
 # Optional "scheme" (default "http") applies to port-based entries. A missing
 # or empty array is normal — discovery still fills the tab.
 _SITES = _app_config.get("sites") or []
 _SITES_BASE = _app_config.get("app", {}).get("sites_base", "")
+_SITES_HOSTS = _app_config.get("hosts") or {}
 
 # Discovery knobs, all optional (config.json "sites_discovery"):
 #   enabled       turn auto-discovery off and fall back to the "sites" array
 #   kubernetes    probe NodePort services via kubectl (skipped if it fails)
 #   ttl_s         cache lifetime; the tab re-probes ~40 ports per refresh
 #   probe_timeout_s / exclude_ports / include_ports
+#   exclude_services  suppress a k8s service by "namespace/name" (or bare
+#                 name) — survives a NodePort reassignment, unlike a port
 _SITES_DISCOVERY = _app_config.get("sites_discovery") or {}
 
 # ─── Engine Registry ─────────────────────────────────────────────────────────
@@ -1754,10 +1759,19 @@ _SITES_LOCK = asyncio.Lock()
 
 def _resolve_site_url(site: dict, request_host: str) -> str:
     """Resolve one sites entry to a full URL — verbatim "url" wins, otherwise
-    scheme://base:port where base is app.sites_base → app.host → request host."""
+    scheme://base:port where base is the entry's "host" → app.sites_base →
+    app.host → request host, each run through the "hosts" alias map."""
     if site.get("url"):
         return site["url"]
-    host = _SITES_BASE or APP_HOST
+    named = site.get("host")
+    if named and named not in _SITES_HOSTS:
+        # An unmapped "host" still works as a literal hostname, but the key
+        # exists for aliases — an unrecognised one is usually a typo or a
+        # machine nobody added to the map.
+        _logger.warning("Site %r uses unknown host alias %r — using it literally",
+                        site.get("name", ""), named)
+    host = named or _SITES_BASE or APP_HOST
+    host = _SITES_HOSTS.get(host, host)
     if not host or host == "0.0.0.0":
         host = request_host or "127.0.0.1"
     return f"{site.get('scheme', 'http')}://{host}:{site.get('port')}"
@@ -1833,6 +1847,7 @@ def _build_candidates(listeners: list[dict], nodeports: list[dict]) -> dict:
     """
     excluded = _DISCOVERY_SKIP_PORTS | set(_SITES_DISCOVERY.get("exclude_ports") or [])
     forced = set(_SITES_DISCOVERY.get("include_ports") or [])
+    excluded_svcs = set(_SITES_DISCOVERY.get("exclude_services") or [])
     include_loopback = bool(_SITES_DISCOVERY.get("include_loopback"))
     cands: dict[int, dict] = {}
     for row in listeners:
@@ -1853,6 +1868,12 @@ def _build_candidates(listeners: list[dict], nodeports: list[dict]) -> dict:
     for row in nodeports:
         port = row["port"]
         if port in excluded and port not in forced:
+            continue
+        # Pop, don't skip: on a k3s node the NodePort is a real listener too, so
+        # the pass above already made a candidate for it. Skipping the k8s row
+        # would leave that one behind as an unlabelled duplicate card.
+        if f"{row['namespace']}/{row['svc']}" in excluded_svcs or row["svc"] in excluded_svcs:
+            cands.pop(port, None)
             continue
         c = cands.setdefault(port, {"port": port, "source": "k8s", "proc": "",
                                     "svc": "", "namespace": "", "bind_addr": ""})
@@ -1926,10 +1947,13 @@ async def _discover_sites(request_host: str) -> dict:
     for s in _SITES:
         if not isinstance(s, dict) or not s.get("name"):
             continue
-        if s.get("port"):
-            overlay[int(s["port"])] = s
-        elif s.get("url"):
+        # A "host" entry names another machine, so its port number says nothing
+        # about *this* box — overlaying it would hijack whatever happens to
+        # listen on the same port locally. Always pin and probe it separately.
+        if s.get("url") or s.get("host"):
             pinned.append(s)
+        elif s.get("port"):
+            overlay[int(s["port"])] = s
 
     listeners = {"ok": False, "rows": [], "error": "discovery disabled"}
     nodeports = {"ok": False, "rows": [], "error": "disabled"}

@@ -107,12 +107,18 @@
     "ttl_s": 30,
     "probe_timeout_s": 2.0,
     "include_loopback": false,
+    "_comment_exclude_services": "exclude_services suppresses a Kubernetes-discovered card by \"namespace/name\" (or a bare name, matching in any namespace) instead of by port number, so it survives a NodePort reassignment and does not blacklist an unrelated future service that happens to reuse that port.",
     "exclude_ports": [],
-    "include_ports": []
+    "include_ports": [],
+    "exclude_services": []
+  },
+  "hosts": {
+    "_comment": "Optional \u2014 name the machines you link to from the Dashboards tab once, so a sites entry can say \"host\": \"controlplane\" instead of repeating an IP everywhere it's used. Values are a hostname or IP only (no scheme, no port).",
+    "controlplane": "100.92.70.98"
   },
   "sites": [
     {
-      "_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see \u2014 a UI on another host. Ports resolve against app.sites_base \u2192 app.host \u2192 the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."
+      "_comment": "Optional overlay on discovery, not the list itself. An entry with a port renames/describes/groups that discovered port (curation beats the page's <title>). An entry with a verbatim url pins something discovery cannot see \u2014 a UI on another host. An entry with a host names a machine from the top-level hosts map and is always pinned, never overlaid, because its port belongs to that machine and not to this one. Ports resolve against the entry's host \u2192 app.sites_base \u2192 app.host \u2192 the request host; scheme defaults to http. Configured entries stay visible even when down, so a dashboard you care about never silently disappears."
     },
     {
       "name": "Grafana",
@@ -125,6 +131,13 @@
       "url": "https://otherhost.example:8443",
       "group": "Ops",
       "desc": "Dashboard on a different host"
+    },
+    {
+      "name": "Cluster Console",
+      "host": "controlplane",
+      "port": 8787,
+      "group": "Ops",
+      "desc": "Runs on the control-plane node, not this box"
     }
   ]
 }

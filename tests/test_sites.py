@@ -87,6 +87,28 @@ def test_sites_base_override_and_scheme(monkeypatch):
     assert _client().get("/api/sites").json()["sites"][0]["url"] == "https://myhost.example:8443"
 
 
+def test_sites_named_host_resolves_through_hosts_map(monkeypatch):
+    monkeypatch.setattr(appmod, "_SITES",
+                        [{"name": "Console", "host": "controlplane", "port": 8787}])
+    monkeypatch.setattr(appmod, "_SITES_HOSTS", {"controlplane": "192.0.2.50"})
+    monkeypatch.setattr(appmod, "_SITES_BASE", "gb10")
+    _stub_reachable(monkeypatch, True)
+    site = _client().get("/api/sites").json()["sites"][0]
+    # the entry's host beats sites_base, and the alias resolves to its IP
+    assert site["url"] == "http://192.0.2.50:8787"
+
+
+def test_sites_unmapped_host_used_literally_but_warns(monkeypatch, caplog):
+    monkeypatch.setattr(appmod, "_SITES",
+                        [{"name": "Console", "host": "otherbox.lan", "port": 8787}])
+    monkeypatch.setattr(appmod, "_SITES_HOSTS", {"controlplane": "192.0.2.50"})
+    _stub_reachable(monkeypatch, True)
+    with caplog.at_level("WARNING"):
+        site = _client().get("/api/sites").json()["sites"][0]
+    assert site["url"] == "http://otherbox.lan:8787"
+    assert "otherbox.lan" in caplog.text
+
+
 def test_sites_skips_malformed_entries(monkeypatch):
     monkeypatch.setattr(appmod, "_SITES", [
         {"_comment": "doc entry from config.example.json"},
@@ -171,6 +193,22 @@ def test_build_candidates_prefers_wildcard_bind(monkeypatch):
     rows = [{"addr": "192.0.2.5", "port": 8080, "proc": "a"},
             {"addr": "0.0.0.0", "port": 8080, "proc": ""}]
     assert appmod._build_candidates(rows, [])[8080]["bind_addr"] == ""
+
+
+def test_build_candidates_exclude_services_drops_the_listener_too(monkeypatch):
+    """A NodePort on a k3s node is also a real listener, so excluding the
+    service has to remove the candidate, not just the k8s-sourced half of it."""
+    monkeypatch.setattr(appmod, "_SITES_DISCOVERY",
+                        {"exclude_services": ["llm-inference/openwebui"]})
+    cands = appmod._build_candidates(
+        [{"addr": "0.0.0.0", "port": 30080, "proc": "k3s-server"}],
+        [{"port": 30080, "svc": "openwebui", "namespace": "llm-inference"}])
+    assert 30080 not in cands
+    # a bare service name matches in any namespace
+    monkeypatch.setattr(appmod, "_SITES_DISCOVERY", {"exclude_services": ["openwebui"]})
+    assert appmod._build_candidates(
+        [{"addr": "0.0.0.0", "port": 30080, "proc": "k3s-server"}],
+        [{"port": 30080, "svc": "openwebui", "namespace": "llm-inference"}]) == {}
 
 
 def test_build_candidates_merges_k8s_metadata(monkeypatch):
@@ -298,6 +336,30 @@ async def test_discover_sites_merges_overlay_and_drops_dead_ports(monkeypatch):
     assert d["discovery"] == {"enabled": True, "host": {"ok": True, "error": ""},
                               "kubernetes": {"ok": True, "error": ""},
                               "candidates": 5, "ui": 3, "api": 1}
+
+
+@pytest.mark.asyncio
+async def test_discover_sites_host_entry_never_overlays_a_local_port(monkeypatch):
+    """A remote card and a local listener can share a port number without the
+    remote one hijacking the local one's name and link."""
+    monkeypatch.setattr(appmod, "_SITES_DISCOVERY", {"enabled": True, "kubernetes": False})
+    monkeypatch.setattr(appmod, "_SITES_BASE", "gb10")
+    monkeypatch.setattr(appmod, "_SITES_HOSTS", {"controlplane": "192.0.2.50"})
+    monkeypatch.setattr(appmod, "_SITES", [
+        {"name": "Cluster Console", "host": "controlplane", "port": 8787, "group": "Ops"}])
+
+    async def listeners():
+        return {"ok": True, "error": "", "rows": [
+            {"addr": "0.0.0.0", "port": 8787, "proc": "someapp"}]}
+
+    monkeypatch.setattr(appmod, "_discover_listeners", listeners)
+    _stub_probes(monkeypatch, {8787: ("ui", "Local Thing")})
+    _stub_reachable(monkeypatch, True)
+
+    sites = {s["name"]: s for s in (await appmod._discover_sites("req-host"))["sites"]}
+    assert set(sites) == {"Local Thing", "Cluster Console"}
+    assert sites["Local Thing"]["url"] == "http://gb10:8787"
+    assert sites["Cluster Console"]["url"] == "http://192.0.2.50:8787"
 
 
 @pytest.mark.asyncio
