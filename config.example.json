@@ -69,6 +69,14 @@
     "vllm_scripts": "DGX-Model-Manager/profiles/vLLM",
     "llamacpp_scripts": "DGX-Model-Manager/profiles/llama.cpp"
   },
+  "litellm_k8s": {
+    "_comment": "Optional \u2014 describes a LiteLLM that runs in Kubernetes off a configmap instead of a systemd unit. With enabled true, a config change syncs paths.litellm_config into the configmap and rolls the deployment, because the pod mounts the configmap read-only and a file write alone is invisible to the cluster. All keys optional \u2014 omit the section (or set enabled false) to restart the systemd unit instead; namespace defaults to \"default\", configmap to \"litellm-config\", configmap_key to \"config.yaml\", deployment to \"litellm\".",
+    "enabled": true,
+    "namespace": "llm-inference",
+    "configmap": "litellm-config",
+    "configmap_key": "config.yaml",
+    "deployment": "litellm"
+  },
   "alerts": {
     "_comment": "All keys optional \u2014 omit this section entirely to keep defaults. webhook_url falls back to the DISCORD_WEBHOOK_URL env var; interval_s falls back to ALERT_CHECK_INTERVAL.",
     "enabled": true,
