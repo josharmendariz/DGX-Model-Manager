@@ -138,6 +138,9 @@ def test_alerts_check_endpoint(mock_channel, monkeypatch):
 
     monkeypatch.setattr(appmod, "_collect_alerts", stub_collect)
     monkeypatch.setattr(appmod, "_API_KEY_HASH", "")
+    # Keyless access is only permitted on a loopback bind; see tests/test_auth.py. This
+    # test is about the alerts payload, so pin the host rather than exercise auth here.
+    monkeypatch.setattr(appmod, "APP_HOST", "127.0.0.1")
     client = TestClient(appmod.app)  # no lifespan needed for this endpoint
     r = client.post("/api/alerts/check")
     assert r.status_code == 200

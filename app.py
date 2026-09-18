@@ -6,6 +6,8 @@ Run via systemd: model-manager.service
 """
 
 import asyncio
+import difflib
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -13,6 +15,7 @@ import logging
 import os
 import platform
 import re as _re
+import shlex
 import socket
 import subprocess
 import sys
@@ -127,15 +130,25 @@ HF_CACHE_DIR      = Path(os.path.expanduser(_paths.get("hf_cache", "~/.cache/hug
 #                   "deployment": "litellm"}
 _litellm_k8s = _app_config.get("litellm_k8s", {})
 
-# Dashboards — optional "sites" array in config.json listing other web UIs on
-# this box, rendered as link cards in the Dashboards tab. Each entry:
+# Dashboards — the tab lists every web UI actually running on this box, found
+# by discovery (host TCP listeners + Kubernetes NodePorts, see _discover_sites).
+# The "sites" array in config.json is an *overlay*, not the list: entries with a
+# "port" rename/describe/group a discovered port, and entries with a verbatim
+# "url" pin something discovery cannot see (a UI on another host).
 #   {"name": "...", "desc": "...", "group": "...", "port": 3000}  — resolved
 #   against app.sites_base (falls back to app.host, then the request host), or
 #   {"name": "...", "url": "http://other-host:1234"}              — verbatim.
 # Optional "scheme" (default "http") applies to port-based entries. A missing
-# or empty array simply renders the tab's empty-state — never an error.
+# or empty array is normal — discovery still fills the tab.
 _SITES = _app_config.get("sites") or []
 _SITES_BASE = _app_config.get("app", {}).get("sites_base", "")
+
+# Discovery knobs, all optional (config.json "sites_discovery"):
+#   enabled       turn auto-discovery off and fall back to the "sites" array
+#   kubernetes    probe NodePort services via kubectl (skipped if it fails)
+#   ttl_s         cache lifetime; the tab re-probes ~40 ports per refresh
+#   probe_timeout_s / exclude_ports / include_ports
+_SITES_DISCOVERY = _app_config.get("sites_discovery") or {}
 
 # ─── Engine Registry ─────────────────────────────────────────────────────────
 # Data-driven engine definitions — add a new engine by adding an entry here.
@@ -217,9 +230,44 @@ for _ek, _ev in _ENGINES.items():
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def _auth_open_unauthenticated() -> bool:
+    """True when no key is set AND we are bound somewhere other than loopback.
+
+    Reads the module globals at call time rather than caching: PUT /api/config mutates
+    _API_KEY_HASH through a `global` statement, and the next request must see it.
+    """
+    return not _API_KEY_HASH and APP_HOST not in _LOOPBACK_HOSTS
+
+
 async def verify_auth(request: Request):
-    """Check API key on mutating endpoints. No-op when no key is configured."""
+    """Check the API key on mutating endpoints. Four states:
+
+      1. Key set + valid Bearer header      → allow.
+      2. Key set + missing/wrong header     → 401.
+      3. No key, bound to loopback          → allow (local-only deployments are fine).
+      4. No key, bound to a real interface  → 503, unless MODEL_MANAGER_ALLOW_UNAUTH is
+         set, in which case allow but log every unauthenticated mutation. Never silent.
+
+    Bootstrap consequence of state 4: with the 503 active, PUT /api/config cannot install
+    the first API key from a remote host. That is intentional — an endpoint that lets an
+    unauthenticated caller set the credential is not a fix. Bootstrap by setting
+    app.api_key in config.json, or by reaching the UI over loopback.
+    """
     if not _API_KEY_HASH:
+        if not _auth_open_unauthenticated():
+            return  # loopback-only deployment
+        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+            raise HTTPException(
+                503,
+                f"Refusing to serve a mutating request: bound to {APP_HOST} with no API "
+                "key configured. Set app.api_key in config.json (or via the UI over "
+                "loopback), or set MODEL_MANAGER_ALLOW_UNAUTH=1 to accept the risk.")
+        _logger.warning("UNAUTHENTICATED mutating request allowed by "
+                        "MODEL_MANAGER_ALLOW_UNAUTH: %s %s",
+                        request.method, request.url.path)
         return
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
@@ -283,6 +331,13 @@ class PullRequest(BaseModel):
 class EngineStartRequest(BaseModel):
     profile: str
     force: bool = False
+    # llama.cpp only: names an entry in config.json llamacpp.recipes. One profile script
+    # covers the whole quant ladder, so the quant/ctx/spec choice is a request parameter
+    # rather than a script per combination.
+    recipe: Optional[str] = None
+    # vLLM only: per-launch tuning knobs. Transient by design — nothing is written to
+    # the script on disk, so an override cannot outlive the launch that asked for it.
+    overrides: Optional[dict] = None
 
 class OllamaStopRequest(BaseModel):
     name: str
@@ -294,6 +349,13 @@ class CreateVLLMProfileRequest(BaseModel):
 class HFDownloadRequest(BaseModel):
     repo_id: str
     local_dir: Optional[str] = None
+    ignore_patterns: Optional[list[str]] = None
+    allow_patterns: Optional[list[str]] = None
+
+class ApplyRecRequest(BaseModel):
+    id: str
+    profile: str
+    confirm: bool = False
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -370,6 +432,23 @@ async def _restart_litellm_backend() -> tuple[bool, str]:
     return True, "systemd unit restarted"
 
 
+def _regen_source_dir(text: str) -> str | None:
+    """The `# Auto-generated … from:` launch dir, read from text we already hold.
+
+    Deliberately string-only: `_parse_script_meta` sits on the hot list path and must not
+    stat the filesystem (T-04-08), so this does NOT check that the directory still
+    exists. A vanished dir surfaces as an error from `from-hf` at click time rather than
+    as a stat per profile per list render.
+    """
+    lines = (text or "").splitlines()[:20]
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(_GENERATED_FROM_MARKER):
+            if idx + 1 < len(lines) and lines[idx + 1].startswith("# "):
+                candidate = lines[idx + 1][2:].strip()
+                return candidate or None
+    return None
+
+
 def _parse_script_meta(script_path: Path) -> dict:
     """Derive profile metadata from a start_*.sh script.
 
@@ -381,8 +460,29 @@ def _parse_script_meta(script_path: Path) -> dict:
     """
     name = description = None
     vram_gb = None
+    derived = recommended = generated_at = None
+    warnings: list = []
+    meta_error = None
+
+    def _json_header(prefix: str, raw: str):
+        """Parse one JSON header. An unparseable header is a DEFECT, not a fallback
+        (04-CONTEXT.md locked decision) — it must be visible, never swallowed."""
+        nonlocal meta_error
+        try:
+            return json.loads(raw)
+        except Exception as exc:
+            if meta_error is None:
+                meta_error = f"{prefix} header is not valid JSON: {exc}"
+            return None
+
+    text = ""
     try:
-        for line in script_path.read_text().splitlines()[:20]:
+        text = script_path.read_text()
+    except Exception:
+        pass
+
+    try:
+        for line in text.splitlines()[:20]:
             line = line.strip()
             if line.startswith("# Name:"):
                 name = line[7:].strip()
@@ -393,6 +493,22 @@ def _parse_script_meta(script_path: Path) -> dict:
                     vram_gb = int(line[7:].strip().upper().rstrip("GB").strip())
                 except Exception:
                     pass
+            elif line.startswith("# Derived:"):
+                parsed = _json_header("# Derived:", line[10:].strip())
+                derived = parsed if isinstance(parsed, dict) else derived
+                if parsed is not None and not isinstance(parsed, dict) and meta_error is None:
+                    meta_error = "# Derived: header is not a JSON object"
+            elif line.startswith("# Recommended:"):
+                parsed = _json_header("# Recommended:", line[14:].strip())
+                recommended = parsed if isinstance(parsed, dict) else recommended
+            elif line.startswith("# Warnings:"):
+                parsed = _json_header("# Warnings:", line[11:].strip())
+                if isinstance(parsed, list):
+                    warnings = [str(w) for w in parsed]
+                elif parsed is not None and meta_error is None:
+                    meta_error = "# Warnings: header is not a JSON array"
+            elif line.startswith("# Generated:"):
+                generated_at = line[12:].strip() or None
     except Exception:
         pass
 
@@ -408,6 +524,27 @@ def _parse_script_meta(script_path: Path) -> dict:
         "script":      str(script_path),
         "description": description or f"Script: {script_path.name}",
         "vram_gb":     vram_gb,
+        # 04-02 (Option A): everything the profile card needs comes from the script
+        # text itself. Deliberately NO filesystem or config.json read here — this
+        # function sits on `_scan_profiles`, the hot list path (threat T-04-08).
+        "derived":       derived,
+        "recommended":   recommended,
+        "warnings":      warnings,
+        "generated_at":  generated_at,
+        "meta_error":    meta_error,
+        # 04-03: the card picks a state from `classification`; `flags` gives a
+        # legacy script parsed values to render read-only (or `unparseable`).
+        "classification": _classify_script(text),
+        "flags":          _parse_script_flags(text),
+        # 04-03 follow-up: the launch dir to regenerate FROM, or None when regenerating
+        # would not be safe. `from-hf` refuses (409) when the target script does not
+        # already reference the dir, which is exactly the hand-written case — and there
+        # a "Regenerate" button would offer to discard tuning it cannot reproduce. So
+        # the affordance is only offered where the script names its own source.
+        "regen_path":     _regen_source_dir(text),
+        # Placeholder-only: the defaults baked into `${VLLM_X:-N}`. See
+        # `_parse_templated_defaults` for why this is not folded into `flags`.
+        "script_defaults": _parse_templated_defaults(text),
     }
 
 
@@ -577,6 +714,37 @@ def _check_script_xref(model_name: str, all_profiles: list) -> tuple[bool, Optio
     return False, None
 
 
+def _script_model_dir(script_path: str, model_dirs: list[Path]) -> Optional[Path]:
+    """Inverse of _check_script_xref: which model directory does this script launch?
+
+    Matches on the cache directory name (models--owner--name) and on the bare
+    owner/name, since hand-written profiles reference a resolved snapshot path
+    rather than a repo id. Returns the longest match: `Qwen3-8B` is a substring
+    of `Qwen3-8B-FP8`, and the shorter name would otherwise win arbitrarily.
+    """
+    try:
+        content = _script_content_cache.get(script_path)
+        if content is None:
+            content = Path(script_path).read_text().lower()
+            _script_content_cache[script_path] = content
+    except Exception:
+        return None
+
+    best: Optional[Path] = None
+    for d in model_dirs:
+        stem = d.name
+        # A short name is not evidence: generic path components match everything.
+        if len(stem) < 8:
+            continue
+        needles = [stem.lower()]
+        if stem.startswith("models--"):
+            needles.append(stem[8:].replace("--", "/").lower())
+        if any(n in content for n in needles):
+            if best is None or len(d.name) > len(best.name):
+                best = d
+    return best
+
+
 _DTYPE_MAP = {"float32": "FP32", "float16": "FP16", "bfloat16": "BF16",
               "float8":  "FP8",  "float4":  "FP4"}
 _BYTES_PER_DTYPE = {"FP32": 4, "FP16": 2, "BF16": 2, "FP8": 1,
@@ -686,6 +854,348 @@ def _infer_from_config(config: dict, name_hints: dict) -> dict:
 
     return {"dtype": dtype, "is_moe": is_moe, "is_reasoning": is_reasoning,
             "modalities": modalities, "arch_str": arch_str}
+
+
+# ── Derived launch spec: attention topology and KV sizing ────────────────────
+# Layer types that hold NO KV cache at all: their state is a fixed-size recurrent tensor,
+# independent of context length. Mis-filing one of these as attention is what produces the
+# 4-11x overestimate the naive num_hidden_layers count gives on every hybrid model here.
+_KV_STATELESS_LAYER_TYPES = frozenset({"linear_attention", "mamba", "recurrent"})
+# Nemotron's hybrid_override_pattern alphabet: M = Mamba, E = MLP/expert, * = attention.
+# Only '*' carries KV, so len(pattern) - count('*') is a stateless count, NOT a sliding one.
+_PATTERN_FULL_CHAR = "*"
+_PATTERN_STATELESS_CHARS = frozenset({"M", "E"})
+
+
+def _as_int(value, default: int = 0) -> int:
+    """Coerce a vendor-authored config value to int, falling back instead of raising."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_attention_topology(config: dict) -> dict:
+    """Classify a model's layers into full / bounded / stateless KV from its parsed config.
+
+    WHY this exists: a naive `num_hidden_layers` KV estimate overestimates by 4-11x on every
+    hybrid model on this box, because most of their layers hold no KV cache at all. A
+    recommender without this classification refuses context that is actually free — an
+    88-layer Nemotron carries only 8 attention layers, and a 40-layer Qwen3.6 only 10.
+
+    There are THREE KV classes, not two:
+      full      — grows with context: bytes/token x max_model_len
+      bounded   — capped by a sliding window: bytes/token x sliding_window
+      stateless — zero, a fixed recurrent state (linear_attention, Mamba/expert layers)
+
+    Precedence chain, first hit wins, verified against all 17 configs present here:
+      layer_types -> hybrid_override_pattern -> full_attention_interval ->
+      sliding_window AND use_sliding_window -> dense.
+    The order matters and is not cosmetic: Qwen3.6 and qwen3-next declare BOTH `layer_types`
+    and `full_attention_interval`, and only agree by arithmetic luck (48 // 4 == 12).
+
+    Two traps this deliberately guards:
+      1. An unrecognized layer type is counted as FULL attention and reported in `warnings`,
+         never silently dropped to zero. Over-reserving memory is recoverable; under-reserving
+         OOMs at model load, and it is a silent wrong answer rather than a crash.
+      2. `sliding_window` is only honoured when `use_sliding_window` is also truthy. Five of
+         the seventeen models here declare a window while having the flag false; reading the
+         window alone would collapse a 17.2 GB dense KV estimate to near zero.
+
+    Pure: dict in, dict out. No filesystem, network, kernel meminfo or vLLM. Pool size and
+    weights are the caller's parameters, not lookups — the whole phase must be verifiable
+    with vLLM down.
+
+    Returns {num_hidden_layers, full_attention_layers, bounded_kv_layers, stateless_layers,
+    sliding_window, source_field, warnings}. `sliding_window` is the window that applies to
+    the bounded layers, or None when no layer is bounded — a dense model's vestigial window is
+    deliberately not reported, so a caller cannot multiply by it.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    # VL and nested-text models carry the transformer fields under text_config; read there.
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    declared = _as_int(t.get("num_hidden_layers"))
+    warns: list[str] = []
+    seen_unknown: set[str] = set()
+
+    def _warn_unknown(label: str) -> None:
+        # One warning per distinct unknown type: a 40-layer model of unknown layers should
+        # produce one actionable line, not forty.
+        if label in seen_unknown:
+            return
+        seen_unknown.add(label)
+        warns.append(f"unknown layer type: {label!r} — counted as full attention")
+
+    def _result(source: str, total: int, full: int, bounded: int, stateless: int,
+                window) -> dict:
+        return {
+            "num_hidden_layers": total,
+            "full_attention_layers": full,
+            "bounded_kv_layers": bounded,
+            "stateless_layers": stateless,
+            "sliding_window": window if bounded > 0 else None,
+            "source_field": source,
+            "warnings": warns,
+        }
+
+    # 1. Explicit per-layer list (Qwen3.6, qwen3-next, gpt-oss).
+    layer_types = t.get("layer_types")
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        full = bounded = stateless = 0
+        for entry in layer_types:
+            name = str(entry)
+            if name == "full_attention":
+                full += 1
+            elif "sliding" in name:
+                bounded += 1
+            elif name in _KV_STATELESS_LAYER_TYPES:
+                stateless += 1
+            else:
+                _warn_unknown(name)
+                full += 1
+        return _result("layer_types", declared or len(layer_types), full, bounded, stateless,
+                       _as_int(t.get("sliding_window")) or None)
+
+    # 2. Nemotron-style pattern string.
+    pattern = t.get("hybrid_override_pattern")
+    if isinstance(pattern, str) and pattern:
+        full = stateless = 0
+        for ch in pattern:
+            if ch == _PATTERN_FULL_CHAR:
+                full += 1
+            elif ch in _PATTERN_STATELESS_CHARS:
+                stateless += 1
+            else:
+                _warn_unknown(ch)
+                full += 1
+        return _result("hybrid_override_pattern", declared or len(pattern), full, 0, stateless,
+                       None)
+
+    # 3. Every Nth layer is attention; the rest hold no KV.
+    interval = _as_int(t.get("full_attention_interval"))
+    if interval > 0:
+        full = declared // interval
+        return _result("full_attention_interval", declared, full, 0, declared - full, None)
+
+    # 4. Uniformly windowed — only when the model actually enables the window.
+    window = _as_int(t.get("sliding_window"))
+    if window > 0 and t.get("use_sliding_window"):
+        return _result("sliding_window", declared, 0, declared, 0, window)
+
+    # 5. Dense fallback: every layer is full attention.
+    return _result("dense", declared, declared, 0, 0, None)
+
+
+def _kv_bytes_per_token(config: dict, kv_dtype_bytes: int = 1) -> dict:
+    """Size one model's KV cache from its parsed config, split by how it scales with context.
+
+    per_layer_bytes      = 2 (K and V) x num_key_value_heads x head_dim x kv_dtype_bytes
+    full_bytes_per_token = full_attention_layers x per_layer_bytes
+    bounded_bytes_total  = bounded_kv_layers x per_layer_bytes x sliding_window
+
+    Note the deliberate asymmetry in those last two, because it is easy to misuse: the first
+    is a RATE and the caller multiplies it by max_model_len; the second is already a TOTAL and
+    must not be. A windowed layer holds `sliding_window` tokens whether the context is 8k or
+    262k, so growing the context does not grow its cost. Stateless layers contribute nothing
+    at all — they are excluded by construction in `_resolve_attention_topology`, not by
+    falling through an unmatched branch, which is the bug that made the prototype accidentally
+    correct.
+
+    `head_dim` falls back to `hidden_size // num_attention_heads` (13 of the 17 models on this
+    box derive it that way; only the hybrid Qwen/Nemotron families declare it). The division
+    is guarded: a config with zero or no attention heads yields a head_dim of 0 rather than a
+    ZeroDivisionError, because these dicts come from vendor-authored files that this codebase
+    does not control (T-02-04).
+
+    Pure: dict in, dict out. No filesystem, network, kernel meminfo or vLLM — pool size,
+    weight size and context length are the caller's parameters.
+
+    Returns {topology, num_key_value_heads, head_dim, head_dim_source, per_layer_bytes,
+    full_bytes_per_token, bounded_bytes_total}.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    topology = _resolve_attention_topology(cfg)
+
+    attention_heads = _as_int(t.get("num_attention_heads"))
+    # Grouped-query attention shrinks the KV width; without it the KV head count is the
+    # attention head count.
+    kv_heads = _as_int(t.get("num_key_value_heads")) or attention_heads
+
+    head_dim = _as_int(t.get("head_dim"))
+    if head_dim > 0:
+        head_dim_source = "explicit"
+    else:
+        head_dim_source = "hidden_size//num_attention_heads"
+        head_dim = _as_int(t.get("hidden_size")) // attention_heads if attention_heads > 0 else 0
+
+    per_layer_bytes = 2 * kv_heads * head_dim * _as_int(kv_dtype_bytes)
+
+    return {
+        "topology": topology,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        "head_dim_source": head_dim_source,
+        "per_layer_bytes": per_layer_bytes,
+        "full_bytes_per_token": topology["full_attention_layers"] * per_layer_bytes,
+        "bounded_bytes_total": (topology["bounded_kv_layers"] * per_layer_bytes
+                                * (topology["sliding_window"] or 0)),
+    }
+
+
+def _kv_budget_gb(util: float, pool_gb: float, weights_gb: float,
+                  overhead_gb: float = 6.0, resident_gb: float = 0.0) -> float:
+    """How many GB of KV cache actually fit at a given --gpu-memory-utilization.
+
+    WHY `resident_gb` exists — do not delete it as padding: on this GB10 the driver reports
+    MemFree, not MemAvailable, so every byte the page cache is holding is charged against
+    `--gpu-memory-utilization` even though the kernel would evict it on demand. This was
+    measured, not assumed: at an unchanged, hand-validated 0.55 on Qwen3.6, the engine had
+    25.97 GiB of KV after dropping caches and only 0.19 GiB with ~25 GB still cached, and it
+    refused to start while blaming max_model_len. A budget that assumes the whole pool share
+    is free will therefore recommend a utilization that works on a freshly-booted box and
+    fails on a working one.
+
+    The result is clamped at 0.0: a budget smaller than the model is "no room", never a
+    negative number a caller might add to something.
+
+    Pure: scalars in, scalar out. Pool size, weight size and resident bytes are the caller's
+    parameters — reading them here would make the whole phase unverifiable with vLLM down.
+    """
+    return max(0.0, pool_gb * util - resident_gb - weights_gb - overhead_gb)
+
+
+def _derive_launch_spec(config: dict, weights_gb: float = 0.0, pool_gb: float = 121.0,
+                        kv_dtype_bytes: int = 1, overhead_gb: float = 6.0,
+                        util_margin: float = 0.04, resident_gb: float = 0.0,
+                        requested_context: Optional[int] = None,
+                        util_floor: float = 0.10, util_cap: float = 0.95) -> dict:
+    """Turn one parsed config.json into the launch numbers vLLM should be started with.
+
+    This is the public entry point of the derived-spec work: layer classification, KV bytes
+    per token, the largest context that fits, and the `--gpu-memory-utilization` to request.
+
+        recommended_util = (weights + KV + overhead + resident) / pool + margin
+
+    calibrated against a number a human already measured by hand: qwen3-next-80b-a3b-nvfp4 was
+    tuned to 0.55 on this box, and this arithmetic independently derives 0.54. That agreement
+    is the evidence the whole approach is sound — if it ever breaks, the formula is wrong, not
+    the hand-measured recipe.
+
+    The margin (default 0.04) covers allocator fragmentation and the fact that the pool is
+    unified with the OS, so the derived need is a floor rather than an exact requirement.
+    The 6 GB default overhead covers CUDA context, captured graphs and activations.
+
+    Every vendor-authored and caller-supplied number is treated as untrusted: non-numeric and
+    negative scalars are coerced to 0.0 and NAMED in `warnings` rather than silently zeroed,
+    and both divisions are guarded, so a malformed config yields a clamped answer with a trail
+    instead of a traceback. `recommended_util` is clamped into [util_floor, util_cap] because
+    its consumer hands it to a real launch: an absurd config must not be able to request more
+    memory than the box has.
+
+    Warnings collected by the topology resolver are propagated rather than dropped — an
+    unrecognized layer type over-reserves memory, and that decision has to stay visible at the
+    only layer a caller sees.
+
+    Pure: a dict and scalars in, a dict out. No filesystem, network, kernel meminfo or vLLM.
+
+    Returns the sixteen keys documented in the phase interface, notably `max_model_len` (never
+    above the model's declared maximum nor above what fits), `kv_gb` at that length, and
+    `recommended_util`.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    inner = cfg.get("text_config")
+    t = inner if isinstance(inner, dict) and inner else cfg
+
+    sizing = _kv_bytes_per_token(cfg, kv_dtype_bytes)
+    topology = sizing["topology"]
+    warnings: list[str] = list(topology.get("warnings") or [])
+
+    def _scalar(value, field: str) -> float:
+        """Coerce one caller-supplied GB figure, naming a bad value instead of hiding it."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            warnings.append(f"non-numeric {field}: {value!r} — treated as 0.0")
+            return 0.0
+        if number != number or number in (float("inf"), float("-inf")):
+            warnings.append(f"non-finite {field}: {value!r} — treated as 0.0")
+            return 0.0
+        if number < 0:
+            warnings.append(f"negative {field}: {number} — floored at 0.0")
+            return 0.0
+        return number
+
+    weights_gb = _scalar(weights_gb, "weights_gb")
+    pool_gb = _scalar(pool_gb, "pool_gb")
+    overhead_gb = _scalar(overhead_gb, "overhead_gb")
+    resident_gb = _scalar(resident_gb, "resident_gb")
+
+    kv_rate = sizing["full_bytes_per_token"]      # a RATE: multiply by context
+    bounded_total = sizing["bounded_bytes_total"]  # already a TOTAL: do not
+    declared_max_context = _as_int(t.get("max_position_embeddings"))
+
+    # ── Largest context that fits, at the most aggressive utilization allowed ──
+    if pool_gb <= 0:
+        warnings.append(f"invalid pool_gb: {pool_gb} — no budget can be sized")
+        max_fitting_context = 0
+    elif kv_rate <= 0:
+        # Nothing grows with context: an all-stateless (or empty) model is limited by what it
+        # was trained for, not by memory.
+        warnings.append("no full-attention layers; context is not KV-bounded")
+        max_fitting_context = declared_max_context
+    else:
+        budget_bytes = _kv_budget_gb(util_cap, pool_gb, weights_gb, overhead_gb,
+                                     resident_gb) * 1e9
+        max_fitting_context = max(0, int((budget_bytes - bounded_total) // kv_rate))
+
+    max_model_len = min(declared_max_context or max_fitting_context, max_fitting_context)
+
+    if declared_max_context and max_fitting_context < declared_max_context:
+        warnings.append(
+            f"budget-limited context: {max_fitting_context} tokens fit, "
+            f"model declares {declared_max_context}"
+        )
+
+    if requested_context is not None:
+        requested = max(0, _as_int(requested_context))
+        if requested > max_model_len:
+            warnings.append(
+                f"requested context {requested} exceeds the usable {max_model_len}"
+            )
+        elif requested > 0:
+            max_model_len = requested
+
+    kv_gb = (kv_rate * max_model_len + bounded_total) / 1e9
+
+    if pool_gb <= 0:
+        recommended_util = util_cap
+    else:
+        raw = (weights_gb + kv_gb + overhead_gb + resident_gb) / pool_gb + util_margin
+        recommended_util = round(min(util_cap, max(util_floor, round(raw, 2))), 2)
+
+    return {
+        "topology": topology,
+        "num_hidden_layers": topology["num_hidden_layers"],
+        "full_attention_layers": topology["full_attention_layers"],
+        "bounded_kv_layers": topology["bounded_kv_layers"],
+        "stateless_layers": topology["stateless_layers"],
+        "source_field": topology["source_field"],
+        "kv_bytes_per_token": kv_rate,
+        "bounded_bytes_total": bounded_total,
+        "declared_max_context": declared_max_context,
+        "max_fitting_context": max_fitting_context,
+        "max_model_len": max_model_len,
+        "kv_gb": kv_gb,
+        "weights_gb": weights_gb,
+        "overhead_gb": overhead_gb,
+        "recommended_util": recommended_util,
+        "warnings": warnings,
+    }
 
 
 def _parse_hf_model_dir(model_dir: Path, all_profiles: list = None) -> dict:
@@ -825,9 +1335,12 @@ def _parse_flat_model_dir(model_dir: Path, all_profiles: list = None) -> dict:
 
 
 def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
-    """Scan a directory for models. Returns {path, is_hf_cache, models}."""
+    """Scan a directory for models. Returns {path, is_hf_cache, models, scan_error}."""
     models = []
     is_hf_cache = False
+    # A dir that will not parse is a DEFECT, not an empty result — dropping it
+    # silently makes a model vanish from the UI with nothing to explain it.
+    failed: list[str] = []
 
     if not directory.exists():
         return {"path": str(directory), "is_hf_cache": False, "models": [], "error": "Directory not found"}
@@ -839,15 +1352,17 @@ def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
         for d in hf_dirs:
             try:
                 models.append(_parse_hf_model_dir(d, all_profiles))
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(d.name)
+                _logger.warning("Could not parse model dir %s: %s", d, e)
     # Also scan flat model dirs (subdirs with config.json) even alongside HF cache dirs
     for d in sorted(directory.iterdir()):
         if d.is_dir() and not d.name.startswith("models--") and (d / "config.json").exists():
             try:
                 models.append(_parse_flat_model_dir(d, all_profiles))
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append(d.name)
+                _logger.warning("Could not parse model dir %s: %s", d, e)
 
     # Deduplicate: if same full_name appears from both HF cache and flat dir, keep HF cache version
     seen: dict[str, int] = {}
@@ -864,7 +1379,12 @@ def _scan_directory(directory: Path, all_profiles: list = None) -> dict:
             deduped.append(m)
     models = deduped
 
-    return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models}
+    scan_error = None
+    if failed:
+        scan_error = f"{len(failed)} model dir(s) failed to parse: {', '.join(failed)}"
+
+    return {"path": str(directory), "is_hf_cache": is_hf_cache, "models": models,
+            "scan_error": scan_error}
 
 # ─── HF Metadata cache ──────────────────────────────────────────────────────
 
@@ -1204,8 +1724,31 @@ async def get_nodeinfo():
     }
 
 # ── Dashboards ────────────────────────────────────────────────────────────────
-# Read-only listing of other web UIs on this box (config.json "sites" array),
-# consumed by the Dashboards tab. Unauthenticated by design, like /api/status.
+# Live inventory of the web UIs running on this box, consumed by the Dashboards
+# tab. Unauthenticated by design, like /api/status.
+#
+# Discovery is two cheap listings — `ss` for host TCP listeners and `kubectl`
+# for NodePort services — followed by one HTTP GET per candidate. The GET is
+# what does the real filtering: a port earns a card only by answering with an
+# HTML page. That separates dashboards from the many API/metrics ports on this
+# host (vLLM, Ollama, node-exporter, traefik) without maintaining a port list,
+# and the page's <title> supplies a name for anything the config doesn't cover.
+# Ports that answer non-HTML are kept as kind="api" so the UI can offer them
+# behind a toggle rather than hiding a running service outright.
+
+_TITLE_RE = _re.compile(r"<title[^>]*>(.*?)</title>", _re.I | _re.S)
+
+# Listeners that are never a dashboard and would waste a probe. Everything else
+# has to prove itself by responding — this stays short on purpose.
+_DISCOVERY_SKIP_PORTS = {22, 53, 111, 631, 6443, 10250}
+
+# Titles too generic to name a card by — the framework's default, not the app's.
+# When one of these comes back, fall through to the k8s service / process name.
+_GENERIC_TITLES = {"streamlit", "dashboard", "home", "index", "login", "sign in",
+                   "react app", "vite app", "document", "untitled"}
+
+_SITES_CACHE: dict = {"at": 0.0, "payload": None}
+_SITES_LOCK = asyncio.Lock()
 
 
 def _resolve_site_url(site: dict, request_host: str) -> str:
@@ -1217,6 +1760,246 @@ def _resolve_site_url(site: dict, request_host: str) -> str:
     if not host or host == "0.0.0.0":
         host = request_host or "127.0.0.1"
     return f"{site.get('scheme', 'http')}://{host}:{site.get('port')}"
+
+
+def _is_loopback(addr: str) -> bool:
+    a = addr.split("%")[0]
+    return a.startswith("127.") or a == "::1"
+
+
+def _is_wildcard(addr: str) -> bool:
+    return addr in ("0.0.0.0", "::", "*", "")
+
+
+def _parse_ss_listeners(text: str) -> list[dict]:
+    """Parse `ss -tlnpH` rows into {addr, port, proc}. Local address is field 4;
+    IPv6 arrives bracketed ([::]:8123) and wildcard binds as *:9090, both of
+    which normalise to a wildcard addr. Process names are only visible for our
+    own UID — root-owned listeners legitimately come back with proc="".
+    """
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr, _, port = parts[3].rpartition(":")
+        if not port.isdigit():
+            continue
+        addr = addr.strip("[]")
+        m = _re.search(r'\(\("([^"]+)"', line)
+        rows.append({"addr": "0.0.0.0" if _is_wildcard(addr) else addr,
+                     "port": int(port), "proc": m.group(1) if m else ""})
+    return rows
+
+
+def _parse_nodeport_services(payload: dict) -> list[dict]:
+    """Flatten `kubectl get svc -A -o json` down to NodePort exposures."""
+    out = []
+    for item in payload.get("items", []) or []:
+        meta = item.get("metadata", {})
+        for port in item.get("spec", {}).get("ports", []) or []:
+            if port.get("nodePort"):
+                out.append({"port": int(port["nodePort"]),
+                            "svc": meta.get("name", ""),
+                            "namespace": meta.get("namespace", "")})
+    return out
+
+
+async def _discover_listeners() -> dict:
+    r = await _run("ss", "-tlnpH", timeout=5)
+    if r.returncode != 0:
+        return {"ok": False, "rows": [], "error": (r.stderr or r.stdout).strip() or "ss failed"}
+    return {"ok": True, "rows": _parse_ss_listeners(r.stdout), "error": ""}
+
+
+async def _discover_nodeports() -> dict:
+    r = await _run("kubectl", "get", "svc", "-A", "-o", "json", timeout=8)
+    if r.returncode != 0:
+        return {"ok": False, "rows": [], "error": (r.stderr or r.stdout).strip() or "kubectl failed"}
+    try:
+        return {"ok": True, "rows": _parse_nodeport_services(json.loads(r.stdout)), "error": ""}
+    except Exception as e:
+        return {"ok": False, "rows": [], "error": str(e)}
+
+
+def _build_candidates(listeners: list[dict], nodeports: list[dict]) -> dict:
+    """Collapse both discovery sources into one candidate per port.
+
+    probe_host is where *we* reach it (a wildcard bind is probed on loopback);
+    bind_addr is what the browser must use — a service bound only to the tailnet
+    address, like this app itself, is unreachable at 127.0.0.1 and its card has
+    to link to that address rather than to the configured site base.
+    """
+    excluded = _DISCOVERY_SKIP_PORTS | set(_SITES_DISCOVERY.get("exclude_ports") or [])
+    forced = set(_SITES_DISCOVERY.get("include_ports") or [])
+    include_loopback = bool(_SITES_DISCOVERY.get("include_loopback"))
+    cands: dict[int, dict] = {}
+    for row in listeners:
+        port, addr = row["port"], row["addr"]
+        if port in excluded and port not in forced:
+            continue
+        if _is_loopback(addr) and not include_loopback and port not in forced:
+            continue
+        c = cands.setdefault(port, {"port": port, "source": "host", "proc": "",
+                                    "svc": "", "namespace": "", "bind_addr": ""})
+        c["proc"] = c["proc"] or row["proc"]
+        # A wildcard bind is the more permissive one — prefer it over an
+        # address-specific row for the same port.
+        if _is_wildcard(addr):
+            c["bind_addr"] = ""
+        elif not c["bind_addr"]:
+            c["bind_addr"] = addr
+    for row in nodeports:
+        port = row["port"]
+        if port in excluded and port not in forced:
+            continue
+        c = cands.setdefault(port, {"port": port, "source": "k8s", "proc": "",
+                                    "svc": "", "namespace": "", "bind_addr": ""})
+        c["source"] = "k8s"
+        c["svc"], c["namespace"] = row["svc"], row["namespace"]
+    for c in cands.values():
+        c["probe_host"] = c["bind_addr"] or "127.0.0.1"
+    return cands
+
+
+async def _probe_site(url: str, timeout: float) -> dict:
+    """One classified GET. "ui" = answered with HTML, i.e. a page a human can
+    open; "api" = answered with JSON/plain text; "down" = nothing there.
+    Redirects are followed (Grafana lands on /login) and auth walls still count
+    as a UI — Headlamp and Hermes both gate their pages behind one.
+    """
+    if _http is None:
+        return {"kind": "down", "status": 0, "title": "", "url": url}
+    try:
+        r = await _http.get(url, timeout=timeout, follow_redirects=True)
+    except Exception:
+        # A plain-HTTP GET against a TLS port fails at the protocol level; the
+        # one retry is what keeps HTTPS-only UIs from reading as dead.
+        if url.startswith("http://"):
+            try:
+                r = await _http.get("https://" + url[7:], timeout=timeout, follow_redirects=True)
+                url = "https://" + url[7:]
+            except Exception:
+                return {"kind": "down", "status": 0, "title": "", "url": url}
+        else:
+            return {"kind": "down", "status": 0, "title": "", "url": url}
+    if r.status_code >= 400 and r.status_code not in (401, 403):
+        return {"kind": "down", "status": r.status_code, "title": "", "url": url}
+    ctype = r.headers.get("content-type", "").lower()
+    if "html" not in ctype:
+        return {"kind": "api", "status": r.status_code, "title": "", "url": url}
+    title = ""
+    try:
+        m = _TITLE_RE.search(r.text[:8192])
+        if m:
+            title = _re.sub(r"\s+", " ", m.group(1)).strip()[:60]
+    except Exception:
+        pass
+    return {"kind": "ui", "status": r.status_code, "title": title, "url": url}
+
+
+def _discovered_name(cand: dict, title: str) -> str:
+    """Name a card from the best evidence available: the page's own <title>,
+    else the k8s service, else the listening process, else the bare port."""
+    clean = title.strip()
+    if clean and clean.lower() not in _GENERIC_TITLES \
+            and not clean.lower().startswith("directory listing"):
+        return clean
+    if cand.get("svc"):
+        return _re.sub(r"-(svc|service)$", "", cand["svc"])
+    if cand.get("proc"):
+        return cand["proc"]
+    return f"Port {cand['port']}"
+
+
+async def _discover_sites(request_host: str) -> dict:
+    """Full inventory: discovered UIs merged with the config.json overlay.
+
+    Overlay entries matched by port win on name/desc/group (curation beats a
+    <title>); config entries with a verbatim url, or whose port is not listening,
+    are still listed so a known-but-down dashboard stays visible instead of
+    silently vanishing.
+    """
+    overlay = {}
+    pinned = []
+    for s in _SITES:
+        if not isinstance(s, dict) or not s.get("name"):
+            continue
+        if s.get("port"):
+            overlay[int(s["port"])] = s
+        elif s.get("url"):
+            pinned.append(s)
+
+    listeners = {"ok": False, "rows": [], "error": "discovery disabled"}
+    nodeports = {"ok": False, "rows": [], "error": "disabled"}
+    if _SITES_DISCOVERY.get("enabled", True):
+        listeners = await _discover_listeners()
+        if _SITES_DISCOVERY.get("kubernetes", True):
+            nodeports = await _discover_nodeports()
+
+    cands = _build_candidates(listeners["rows"], nodeports["rows"])
+    base_host = _SITES_BASE or APP_HOST
+    if not base_host or base_host == "0.0.0.0":
+        base_host = request_host or "127.0.0.1"
+    timeout = float(_SITES_DISCOVERY.get("probe_timeout_s", 2.0))
+
+    ordered = sorted(cands.values(), key=lambda c: c["port"])
+    probes = await asyncio.gather(*(
+        _probe_site(f"http://{c['probe_host']}:{c['port']}/", timeout) for c in ordered
+    ))
+
+    sites, seen_ports = [], set()
+    for cand, probe in zip(ordered, probes):
+        if probe["kind"] == "down":
+            continue
+        port = cand["port"]
+        seen_ports.add(port)
+        conf = overlay.get(port, {})
+        link_host = cand["bind_addr"] or base_host
+        scheme = "https" if probe["url"].startswith("https://") else conf.get("scheme", "http")
+        detail = (f"{cand['namespace']}/{cand['svc']}" if cand.get("svc")
+                  else (cand.get("proc") or ""))
+        sites.append({
+            "name": conf.get("name") or _discovered_name(cand, probe["title"]),
+            "desc": conf.get("desc", "") or detail,
+            "group": conf.get("group", "") or ("Kubernetes" if cand["source"] == "k8s" else "Host"),
+            "url": conf.get("url") or f"{scheme}://{link_host}:{port}",
+            "reachable": True,
+            "port": port,
+            "kind": probe["kind"],
+            "source": "config" if conf else cand["source"],
+            "detail": detail,
+        })
+
+    # Tallied before the overlay leftovers are appended — these numbers describe
+    # the sweep, and a pinned remote UI was never part of it.
+    counts = {"ui": sum(1 for s in sites if s["kind"] == "ui"),
+              "api": sum(1 for s in sites if s["kind"] == "api")}
+
+    # Configured entries discovery couldn't confirm — a remote pin, or a
+    # dashboard that is currently down. Probed individually so the dot is honest.
+    leftovers = pinned + [s for p, s in overlay.items() if p not in seen_ports]
+    if leftovers:
+        urls = [_resolve_site_url(s, request_host) for s in leftovers]
+        checks = await asyncio.gather(*(_site_reachable(u) for u in urls))
+        for s, url, ok in zip(leftovers, urls, checks):
+            sites.append({
+                "name": s["name"], "desc": s.get("desc", ""),
+                "group": s.get("group", "") or "Other", "url": url,
+                "reachable": ok, "port": s.get("port"), "kind": "ui",
+                "source": "config", "detail": "",
+            })
+
+    return {
+        "sites": sites,
+        "discovery": {
+            "enabled": bool(_SITES_DISCOVERY.get("enabled", True)),
+            "host": {"ok": listeners["ok"], "error": listeners["error"]},
+            "kubernetes": {"ok": nodeports["ok"], "error": nodeports["error"]},
+            "candidates": len(cands),
+            **counts,
+        },
+    }
 
 
 async def _site_reachable(url: str) -> bool:
@@ -1232,23 +2015,19 @@ async def _site_reachable(url: str) -> bool:
 
 
 @app.get("/api/sites")
-async def get_sites(request: Request):
-    resolved = []
-    for s in _SITES:
-        if not isinstance(s, dict) or not s.get("name"):
-            continue
-        if not s.get("url") and not s.get("port"):
-            continue
-        resolved.append({
-            "name": s["name"],
-            "desc": s.get("desc", ""),
-            "group": s.get("group", ""),
-            "url": _resolve_site_url(s, request.url.hostname or ""),
-        })
-    checks = await asyncio.gather(*(_site_reachable(e["url"]) for e in resolved))
-    for entry, ok in zip(resolved, checks):
-        entry["reachable"] = ok
-    return {"sites": resolved}
+async def get_sites(request: Request, refresh: int = 0):
+    """Cached because a full sweep is ~40 HTTP probes; switching tabs shouldn't
+    pay for that. The lock collapses concurrent callers onto one sweep."""
+    ttl = float(_SITES_DISCOVERY.get("ttl_s", 30))
+    async with _SITES_LOCK:
+        age = _time.monotonic() - _SITES_CACHE["at"]
+        if refresh or _SITES_CACHE["payload"] is None or age > ttl:
+            _SITES_CACHE["payload"] = await _discover_sites(request.url.hostname or "")
+            _SITES_CACHE["at"] = _time.monotonic()
+            age = 0.0
+    payload = dict(_SITES_CACHE["payload"])
+    payload["cached_age_s"] = round(age, 1)
+    return payload
 
 
 # ── Recommendations ─────────────────────────────────────────────────────────
@@ -1257,6 +2036,7 @@ async def get_sites(request: Request):
 # `match` rule; only fired recommendations are returned, ranked by severity.
 
 _RECOMMENDATIONS_FILE = _APP_DIR / "recommendations.json"
+_MODEL_CAPABILITIES_FILE = _APP_DIR / "model_capabilities.json"
 _REC_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1266,6 +2046,78 @@ def _load_recommendations() -> dict:
     except Exception as e:
         _logger.warning("Could not load recommendations.json: %s", e)
         return {"meta": {}, "recommendations": []}
+
+
+def _load_model_capabilities() -> dict:
+    try:
+        return json.loads(_MODEL_CAPABILITIES_FILE.read_text())
+    except Exception as e:
+        _logger.warning("Could not load model_capabilities.json: %s", e)
+        return {"meta": {}, "models": []}
+
+
+_PARSER_NAME_RE = _re.compile(r"^[a-z0-9_.-]{1,64}$")
+_PARSER_EMISSION_CONFIDENCE = {
+    "recipe-proven", "template-identical-to-recipe-proven",
+}
+
+
+def _capability_entry(info: dict) -> dict | None:
+    capabilities = _load_model_capabilities()
+    rows = capabilities.get("models", []) if isinstance(capabilities, dict) else []
+    if not isinstance(rows, list):
+        return None
+
+    name = info.get("name")
+    name_key = name.casefold() if isinstance(name, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (name_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == name_key
+                        for match in matches)):
+            return row
+
+    architectures = info.get("architectures", [])
+    architecture = (architectures[0]
+                    if isinstance(architectures, list) and architectures else None)
+    architecture_key = architecture.casefold() if isinstance(architecture, str) else ""
+    for row in rows:
+        matches = row.get("matches", []) if isinstance(row, dict) else []
+        if (architecture_key and isinstance(matches, list)
+                and any(isinstance(match, str) and match.casefold() == architecture_key
+                        for match in matches)):
+            return row
+    return None
+
+
+def _capability_emission_details(
+        entry: dict | None) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if not isinstance(entry, dict):
+        return None, None, ()
+
+    warnings = []
+    values = []
+    for field in ("tool_call_parser", "reasoning_parser"):
+        value = entry.get(field)
+        if value is not None and (not isinstance(value, str)
+                                  or not _PARSER_NAME_RE.match(value)):
+            warnings.append(
+                f"capability map {field} is invalid; expected "
+                "lowercase letters, digits, dot, underscore or hyphen (max 64)")
+            value = None
+        values.append(value)
+
+    explicit_emit = entry.get("emit")
+    emittable = (explicit_emit if isinstance(explicit_emit, bool)
+                 else entry.get("confidence") in _PARSER_EMISSION_CONFIDENCE)
+    if not emittable:
+        return None, None, tuple(warnings)
+    return values[0], values[1], tuple(warnings)
+
+
+def _capability_emission(entry: dict | None) -> tuple[str | None, str | None]:
+    tool_parser, reasoning_parser, _warnings = _capability_emission_details(entry)
+    return tool_parser, reasoning_parser
 
 
 def _profile_script_text(profile: dict) -> str:
@@ -1331,7 +2183,7 @@ async def get_recommendations():
         match = rec.get("match", {})
         base = {k: rec[k] for k in
                 ("id", "kind", "severity", "title", "summary", "action",
-                 "sources", "confidence") if k in rec}
+                 "sources", "confidence", "download", "apply") if k in rec}
         if match.get("type") == "model_absent":
             signals = match.get("signals", [])
             if not any(s.lower() in haystack for s in signals):
@@ -1392,6 +2244,92 @@ async def refresh_recommendations():
         _logger.info("Research-refresh produced %d proposal(s)", len(props))
         return {"ok": True, "engine": research_refresh.ENGINE,
                 "summary": result.get("summary", ""), "proposed": props}
+
+
+def _apply_rec_edit(spec: dict, text: str) -> tuple[str, bool, str]:
+    """Apply a recommendation's `apply` spec to a profile script's text.
+
+    Returns (new_text, changed, note). Edits anchor on the `--model` line
+    (present in every vLLM start script and always continued with a trailing
+    backslash), so inserts stay inside the docker-run argument block.
+    """
+    typ = spec.get("type")
+    trailing_nl = "\n" if text.endswith("\n") else ""
+    if typ == "add_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag:
+            raise HTTPException(400, "apply.add_flag requires 'flag'")
+        token = flag.split("=", 1)[0]
+        if token in text:
+            return text, False, f"{token} already present"
+        lines = text.splitlines()
+        for i, ln in enumerate(lines):
+            if _re.match(r"\s*--model\b", ln):
+                indent = ln[:len(ln) - len(ln.lstrip())]
+                lines.insert(i + 1, f"{indent}{flag} \\")
+                return "\n".join(lines) + trailing_nl, True, f"added {flag}"
+        raise HTTPException(422, "No --model line to anchor the flag")
+    if typ == "remove_flag":
+        flag = str(spec.get("flag", "")).strip()
+        if not flag or flag not in text:
+            return text, False, f"{flag or 'flag'} not present"
+        out = []
+        for ln in text.splitlines():
+            if ln.strip() in (flag, flag + " \\"):
+                continue  # flag owned the whole line — drop it
+            if flag in ln:
+                ln = _re.sub(r"\s*" + _re.escape(flag) + r"\b", "", ln)
+            out.append(ln)
+        return "\n".join(out) + trailing_nl, True, f"removed {flag}"
+    if typ == "set_flag":
+        flag = str(spec.get("flag", "")).strip()
+        value = str(spec.get("value", "")).strip()
+        if not flag or not value:
+            raise HTTPException(400, "apply.set_flag requires 'flag' and 'value'")
+        pat = _re.compile(_re.escape(flag) + r"\s+(\S+)")
+        m = pat.search(text)
+        if not m:
+            raise HTTPException(422, f"{flag} not found in profile")
+        if m.group(1) == value:
+            return text, False, f"{flag} already {value}"
+        return pat.sub(f"{flag} {value}", text, count=1), True, f"{flag} -> {value}"
+    raise HTTPException(400, f"Unknown apply.type '{typ}'")
+
+
+@app.post("/api/recommendations/apply", dependencies=[Depends(verify_auth)])
+async def apply_recommendation(req: ApplyRecRequest):
+    """Apply a config/tuning rec's edit to a flagged profile script.
+
+    Two-phase: without `confirm` it returns a unified diff for preview; with
+    `confirm` it writes the script atomically (tmp + os.replace, mode 0755)."""
+    kb = _load_recommendations()
+    rec = next((r for r in kb.get("recommendations", []) if r.get("id") == req.id), None)
+    if not rec:
+        raise HTTPException(404, f"No recommendation '{req.id}'")
+    spec = rec.get("apply")
+    if not spec:
+        raise HTTPException(400, f"Recommendation '{req.id}' has no apply action")
+    prof = next((p for p in _scan_profiles("vllm") if p["id"] == req.profile), None)
+    if not prof:
+        raise HTTPException(404, f"No vLLM profile '{req.profile}'")
+    path = Path(prof["script"])
+    old = path.read_text()
+    new, changed, note = _apply_rec_edit(spec, old)
+    if not changed:
+        return {"changed": False, "note": note, "profile": req.profile}
+    diff = "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path.name, tofile=path.name + " (proposed)"))
+    if not req.confirm:
+        return {"changed": True, "confirm_required": True,
+                "note": note, "diff": diff, "profile": req.profile}
+    tmp = path.with_suffix(path.suffix + ".apply.tmp")
+    tmp.write_text(new)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    _logger.info("Applied rec %s to %s (%s)", req.id, path.name, note)
+    return {"changed": True, "applied": True, "note": note,
+            "diff": diff, "profile": req.profile}
 
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
@@ -1601,6 +2539,49 @@ async def run_alert_check():
         "webhook_configured": "discord" in channels,
     }
 
+
+# ── Image drift ───────────────────────────────────────────────────────────────
+#
+# Detection only. The checker cannot mutate the cluster (tests assert it holds
+# no kubectl write verbs); applying an upgrade is the manual procedure in
+# ai-infra/k8s/inference/UPGRADING.md. The gap this closes is purely knowing --
+# litellm ran 47 minor versions behind for months with nothing reporting it.
+
+_image_check_lock = asyncio.Lock()
+
+
+@app.get("/api/images/drift")
+async def get_image_drift():
+    """Last drift report from disk. No network, safe to poll from the UI."""
+    import image_updates
+    return await asyncio.to_thread(image_updates.load_report)
+
+
+@app.post("/api/images/check", dependencies=[Depends(verify_auth)])
+async def run_image_check():
+    """Re-run the drift check against upstream, then route findings to alerts.
+
+    Alerts are keyed on `image_update:<deployment>:<version>`, which is also the
+    cooldown key in _send_alerts, so each new release notifies once and then
+    stays quiet across restarts.
+    """
+    if _image_check_lock.locked():
+        raise HTTPException(409, "An image check is already running")
+    async with _image_check_lock:
+        import image_updates
+        try:
+            report = await asyncio.to_thread(image_updates.check)
+        except Exception as e:
+            _logger.error("Image drift check failed: %s", e)
+            raise HTTPException(500, f"Image check failed: {e}")
+        alerts = image_updates.to_alerts(report)
+        sent = await asyncio.to_thread(_send_alerts, alerts, False)
+        outdated = [r for r in report.get("rows", []) if r.get("status") == "outdated"]
+        _logger.info("Image drift check: %d outdated, %d alert(s) sent",
+                     len(outdated), len(sent))
+        return {**report, "alerts": alerts, "sent": sent}
+
+
 # ── Ollama ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/scriptdirs")
@@ -1738,11 +2719,24 @@ async def restart_litellm():
 
 # ── Shared engine helpers ─────────────────────────────────────────────────────
 
-async def _find_container_by_port(port: int) -> Optional[str]:
-    """Return the container ID listening on the given host port, or None."""
+async def _find_container_by_port(port: int, docker_filter: str | None = None) -> Optional[str]:
+    """Return the container ID listening on the given host port, or None.
+
+    `--filter publish=` only matches *published* port mappings, so a container
+    run with `--network host` (which is how vLLM runs on the GB10) is invisible
+    to it despite genuinely owning the port. Fall back to a name filter.
+    """
     result = await _run("docker", "ps", "--filter", f"publish={port}", "--format", "{{.ID}}", timeout=5)
     lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
-    return lines[0].strip() if lines else None
+    if lines:
+        return lines[0].strip()
+    if docker_filter:
+        result = await _run("docker", "ps", "--filter", f"name={docker_filter}",
+                            "--format", "{{.ID}}", timeout=5)
+        lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
+        if lines:
+            return lines[0].strip()
+    return None
 
 
 async def _docker_stop(container_id: str) -> tuple[bool, str]:
@@ -1862,13 +2856,13 @@ def _extract_port(url: str) -> int:
     raise ValueError(f"Cannot extract port from URL: {url}")
 
 
-async def _engine_stop(base_url: str, engine_name: str) -> dict:
+async def _engine_stop(base_url: str, engine_name: str, docker_filter: str | None = None) -> dict:
     """Stop the Docker container for an engine by its configured port."""
     try:
         port = _extract_port(base_url)
     except ValueError:
         raise HTTPException(400, f"Invalid {engine_name} URL — cannot determine port from '{base_url}'")
-    cid = await _find_container_by_port(port)
+    cid = await _find_container_by_port(port, docker_filter)
     if not cid:
         raise HTTPException(404, f"No container found listening on {engine_name} port — already stopped?")
     ok, output = await _docker_stop(cid)
@@ -2026,19 +3020,381 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
             f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
+def _launch_argv(script: str, safe_id: str) -> list[str]:
+    """Wrap a profile launch so it OUTLIVES this service.
+
+    DMM runs as a systemd --user unit, and a profile script spawned with plain Popen
+    lands in dgx-model-manager.service's cgroup. systemd's default
+    KillMode=control-group then takes every one of those children down on `systemctl
+    --user restart dgx-model-manager` — including a `docker run` client in the
+    foreground, which stops the container it is attached to. Observed 2026-08-18: a
+    routine restart to pick up new code stopped a vllm_node that had been serving for
+    25 hours (clean exit 0, ~4 min outage). start_new_session=True does NOT help; it
+    detaches the session, not the cgroup.
+
+    `systemd-run --user --scope` puts the launch in its own transient scope, a sibling
+    of this service rather than a child, so a restart or crash-loop of DMM cannot reach
+    it. Verified: the scope's cgroup is .../app.slice/<unit>.scope.
+
+    Falls back to a bare `bash` when systemd-run is unavailable (non-systemd host, no
+    session bus). That restores the old fragile behavior rather than failing the launch
+    — a manager that cannot start a model is worse than one whose restarts are unsafe.
+    """
+    if not shutil.which("systemd-run"):
+        _logger.warning("systemd-run not found — launching in DMM's own cgroup; a DMM "
+                        "restart will kill this engine")
+        return ["bash", script]
+    # Unit names must be unique per launch: a lingering scope from a previous start of
+    # the same profile would otherwise collide and fail the launch.
+    unit = f"dmm-{safe_id}-{int(_time.time())}"[:200]
+    return [
+        "systemd-run", "--user", "--scope", "--quiet",
+        # --collect reaps the scope if the script exits non-zero; without it a failed
+        # launch leaves a dead unit that blocks nothing but clutters `systemctl --user`.
+        "--collect", f"--unit={unit}",
+        "bash", script,
+    ]
+
+
+def _llamacpp_recipes() -> dict:
+    """The llama.cpp quant ladder from config.json, or {} if unconfigured.
+
+    Read live rather than cached at import: editing config.json is how the ladder is
+    tuned, and a restart-to-see-it loop is how stale recipes get launched by mistake.
+    """
+    try:
+        cfg = json.loads(_CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+    return cfg.get("llamacpp", {}).get("recipes", {}) or {}
+
+
+def _override_int(lo: int, hi: int | None = None):
+    def _check(value):
+        if isinstance(value, bool) or not isinstance(value, (int, str, float)):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}")
+        try:
+            ival = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}, "
+                                     f"got {value!r}")
+        if ival < lo or (hi is not None and ival > hi):
+            raise HTTPException(400, f"expected an integer in {lo}..{hi or '∞'}, got {ival}")
+        return str(ival)
+    return _check
+
+
+def _override_float(lo: float, hi: float):
+    def _check(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}")
+        try:
+            fval = float(str(value).strip())
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}, got {value!r}")
+        if not (lo <= fval <= hi):
+            raise HTTPException(400, f"expected a number in {lo}..{hi}, got {fval}")
+        return repr(fval)
+    return _check
+
+
+# Allow-list of NAMES, never a prefix match and never pass-through: these values arrive in
+# an HTTP body and land in a bash script's environment, then in docker argv. The bounds
+# reuse `_derive_launch_spec`'s own util_floor/util_cap rather than inventing new numbers —
+# two sources of truth for the same clamp is how they drift apart.
+_UTIL_FLOOR = 0.10
+_UTIL_CAP = 0.95
+_OVERRIDE_ENV: dict[str, tuple[str, object]] = {
+    "max_model_len": ("VLLM_MAX_MODEL_LEN", _override_int(1)),
+    "gpu_memory_utilization": ("VLLM_GPU_MEMORY_UTILIZATION",
+                               _override_float(_UTIL_FLOOR, _UTIL_CAP)),
+    "max_num_seqs": ("VLLM_MAX_NUM_SEQS", _override_int(1, 256)),
+}
+
+
+def _collect_overrides(raw: dict | None) -> dict:
+    """Drop the fields the user left blank. The pure request-body builder.
+
+    The profile card sends one input per override; an empty or whitespace-only box means
+    "use the derived default", which must be expressed as the key being ABSENT, not as an
+    empty string (an empty string is a validation error, and the derived default lives in
+    the script's own `${VAR:-N}` placeholder). The browser applies the same rule before
+    sending; this is the server-side half of the pair, so a hand-rolled client cannot make
+    a blank field mean something different.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        out[key] = value.strip() if isinstance(value, str) else value
+    return out
+
+
+def _resolve_overrides(overrides: dict | None) -> dict[str, str]:
+    """Validate an untrusted override map into env-ready strings, or raise 400."""
+    if isinstance(overrides, dict):
+        overrides = _collect_overrides(overrides)
+    if not overrides:
+        return {}
+    if not isinstance(overrides, dict):
+        raise HTTPException(400, "overrides must be an object")
+    accepted = ", ".join(sorted(_OVERRIDE_ENV))
+    resolved: dict[str, str] = {}
+    for key, value in overrides.items():
+        if key not in _OVERRIDE_ENV:
+            raise HTTPException(400, f"Unknown override '{key}'; accepted: {accepted}")
+        if value is None:
+            continue
+        env_name, validator = _OVERRIDE_ENV[key]
+        try:
+            resolved[env_name] = validator(value)
+        except HTTPException as exc:
+            raise HTTPException(400, f"Invalid override '{key}': {exc.detail}")
+    return resolved
+
+
+_GENERATED_FROM_MARKER = "# Auto-generated by DGX Model Manager from:"
+
+# ─── Legacy-script flag parsing (04-03) ───────────────────────────────────────
+# Deliberately NOT a bash parser (04-RESEARCH §"Don't Hand-Roll"): a regex that
+# only recognises a literal numeric token, and reports `unparseable` for
+# everything else. Guessing at `--max-model-len "$CTX"` would render a number the
+# script does not actually use, which is worse than admitting we cannot tell.
+UNPARSEABLE = "unparseable"
+
+_FLAG_KEYS = {
+    "--max-model-len": "max_model_len",
+    "--gpu-memory-utilization": "util",
+    "--max-num-seqs": "max_num_seqs",
+}
+
+# `--flag N`, `--flag=N` or `--flag "N"`. The value group is captured loosely and
+# validated afterwards so a non-numeric token is *seen* (and marked unparseable)
+# rather than silently skipped, which would look identical to "flag absent".
+_FLAG_RE = _re.compile(
+    r"(?<![\w-])(--max-model-len|--gpu-memory-utilization|--max-num-seqs)"
+    r"(?:\s*=\s*|\s+)(\S+)"
+)
+_NUM_RE = _re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+
+
+def _parse_script_flags(text: str) -> dict:
+    """Extract the three launch flags from arbitrary script text.
+
+    Returns `{max_model_len, util, max_num_seqs}` where each value is an int, a
+    float, or the string `UNPARSEABLE`. A flag is unparseable when it is absent,
+    when its token is not a bare literal number (`$VAR`, `$(...)`, an array
+    element, a quoted expansion), or when it appears twice with different values.
+    """
+    seen: dict[str, list] = {key: [] for key in _FLAG_KEYS.values()}
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("#"):
+            continue
+        for flag, token in _FLAG_RE.findall(line):
+            key = _FLAG_KEYS[flag]
+            token = token.strip().strip("\"'")
+            if not _NUM_RE.match(token):
+                seen[key].append(UNPARSEABLE)
+                continue
+            seen[key].append(float(token) if "." in token else int(token))
+
+    out = {}
+    for key, values in seen.items():
+        if not values or UNPARSEABLE in values or len(set(values)) > 1:
+            out[key] = UNPARSEABLE
+        else:
+            out[key] = values[0]
+    return out
+
+
+# The default baked into a `${VLLM_X:-N}` placeholder. Kept SEPARATE from
+# `_parse_script_flags`: there, `${VAR:-N}` is correctly `unparseable`, because that
+# verdict drives classification and the read-only branch, and the flag genuinely is not a
+# literal. But the number is right there in the text, and a parameterized card was showing
+# the word "script default" — truncated to "script defau" by a 110px input — where every
+# other card shows a grey number. Placeholders only; nothing here feeds classification.
+_TEMPLATED_DEFAULT_RE = _re.compile(r"\$\{(VLLM_[A-Z0-9_]+):-([0-9]+(?:\.[0-9]+)?)\}")
+
+# env var → the `data-override` name the card uses, so the two cannot drift apart.
+_ENV_TO_OVERRIDE_KEY = {env: key for key, (env, _v) in _OVERRIDE_ENV.items()}
+
+
+def _parse_templated_defaults(text: str) -> dict:
+    """`{override_key: number}` for each `${VLLM_X:-N}` with a literal default.
+
+    Only the three keys the card can override are reported, and a var whose default is
+    absent or non-numeric (`${VLLM_MAX_MODEL_LEN:-$CTX}`) is simply omitted — an absent
+    placeholder is honest, a guessed one is not.
+    """
+    out: dict = {}
+    for raw_line in (text or "").splitlines():
+        if raw_line.strip().startswith("#"):
+            continue
+        for env_name, token in _TEMPLATED_DEFAULT_RE.findall(raw_line):
+            key = _ENV_TO_OVERRIDE_KEY.get(env_name)
+            if key is None:
+                continue
+            value = float(token) if "." in token else int(token)
+            # A var templated twice with different defaults is ambiguous; show neither.
+            if key in out and out[key] != value:
+                out[key] = None
+            else:
+                out.setdefault(key, value)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+_PLACEHOLDER_MARKER = "${VLLM_MAX_MODEL_LEN"
+
+
+def _classify_script(text: str) -> str:
+    """One of `parameterized`, `generated`, `recipe`, `legacy`.
+
+    Order matters: a parameterized script is also a generated one, and a
+    recipe-backed generated script carries the marker too — so the placeholder
+    test runs first and the recipe test is only reached by non-placeholder text.
+    """
+    text = text or ""
+    has_marker = _GENERATED_FROM_MARKER in text
+    # The placeholder alone is the evidence — requiring the generated-by marker too made
+    # `parameterize/apply` on a HAND-WRITTEN script (the exact case the feature exists
+    # for) leave it classified `legacy` with three now-`unparseable` flags: no values, no
+    # Parameterize button, a note claiming parameterizing is refused. A dead end reachable
+    # by using the feature as designed. Seen live on start_hf_qwen_qwen3-8b.sh 2026-08-21.
+    if _PLACEHOLDER_MARKER in text:
+        return "parameterized"
+    if _PF_RECIPE_RE.search(text):
+        return "recipe"
+    if has_marker:
+        return "generated"
+    return "legacy"
+
+
+def _profile_source_dir(script: str) -> Path | None:
+    """The launch dir a generated profile was built from, per its own header.
+
+    The header is the only link back to config.json: profiles are scanned as scripts,
+    not as models. Hand-written scripts carry no marker and return None.
+    """
+    try:
+        lines = Path(script).read_text().splitlines()[:20]
+    except Exception:
+        return None
+    for idx, line in enumerate(lines):
+        if line.strip().startswith(_GENERATED_FROM_MARKER):
+            if idx + 1 < len(lines) and lines[idx + 1].startswith("# "):
+                candidate = Path(os.path.expanduser(lines[idx + 1][2:].strip()))
+                return candidate if candidate.is_dir() else None
+    return None
+
+
+def _overridden_vram_gb(profile: dict, override_env: dict[str, str],
+                        force: bool) -> float | None:
+    """Footprint of an OVERRIDDEN launch, or None when nothing footprint-affecting changed.
+
+    Admitting an overridden launch against the script header's static `# VRAM:` comment
+    is the same trap the llama.cpp recipe ladder already sprang: the header describes the
+    launch the generator intended, not the one being asked for.
+    """
+    ctx = override_env.get("VLLM_MAX_MODEL_LEN")
+    util = override_env.get("VLLM_GPU_MEMORY_UTILIZATION")
+    if ctx is None and util is None:
+        return None
+
+    launch_dir = _profile_source_dir(profile.get("script", ""))
+    config = None
+    if launch_dir is not None:
+        try:
+            parsed = json.loads((launch_dir / "config.json").read_text())
+            config = parsed if isinstance(parsed, dict) else None
+        except Exception:
+            config = None
+    if config is None:
+        # Never silently fall back to the stale header: an unverifiable override is
+        # exactly the case where admission matters most.
+        if not force:
+            raise HTTPException(
+                400, "Cannot verify this override against the model config "
+                     f"({profile.get('id')}): no readable config.json for the profile. "
+                     "Re-send with force=true to launch unchecked.")
+        _logger.warning("override footprint underived for '%s' — forced launch",
+                        profile.get("id"))
+        return None
+
+    pool_gb = 121.0
+    if util is not None:
+        # vLLM reserves this share of the pool up front, whatever the KV math says.
+        return round(pool_gb * float(util), 1)
+
+    info = None
+    try:
+        info = _profile_model_info(launch_dir, None)
+    except Exception:
+        info = None
+    weights_gb = float((info or {}).get("size_gb") or 0.0)
+    kv_dtype = _kv_dtype_from_config(config)
+    spec = _derive_launch_spec(
+        config, weights_gb=weights_gb, pool_gb=pool_gb,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2,
+        requested_context=int(ctx))
+    for warning in spec.get("warnings") or []:
+        _logger.info("override derive warning for '%s': %s", profile.get("id"), warning)
+    return round(spec["weights_gb"] + spec["kv_gb"] + spec["overhead_gb"], 1)
+
+
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
-                        engine_key: str | None = None, force: bool = False) -> dict:
+                        engine_key: str | None = None, force: bool = False,
+                        recipe: str | None = None,
+                        overrides: dict | None = None) -> dict:
     """Start a Docker engine by launching the selected profile script."""
     profiles = scan_fn()
     profile = next((p for p in profiles if p["id"] == req_profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req_profile}' not found")
+    # Resolve the recipe BEFORE admission: the script header declares one nominal
+    # footprint, but the ladder spans 17 GB (tiny) to 60 GB (longctx). Admitting on the
+    # header would wave through a launch three times its declared size.
+    known_recipes = _llamacpp_recipes() if recipe else {}
+    if recipe:
+        if recipe not in known_recipes:
+            raise HTTPException(400, f"Unknown recipe '{recipe}'; "
+                                     f"have: {', '.join(known_recipes) or 'none'}")
+        r_vram = known_recipes[recipe].get("vram_gb")
+        if r_vram is not None:
+            profile = {**profile, "vram_gb": r_vram}
+
+    # Same ordering rule as the recipe block: an override that raises the real footprint
+    # must be admitted against that footprint, not the script header's static comment.
+    override_env = _resolve_overrides(overrides)
+    if override_env:
+        _over_vram = _overridden_vram_gb(profile, override_env, force)
+        if _over_vram is not None:
+            profile = {**profile, "vram_gb": _over_vram}
+
     await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
     script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
         raise HTTPException(400, f"Script not found: {script}")
     safe_id = _re.sub(r"[^a-zA-Z0-9._-]", "_", req_profile)
     log_path = f"/tmp/{engine_name.lower()}_{safe_id}.log"
+
+    # Recipe reaches the script as an env var. Already allow-listed against the configured
+    # map above — it arrives in an HTTP body and lands in a bash script's environment, so
+    # a known-names check is the only acceptable filter.
+    env = os.environ.copy()
+    if recipe:
+        env["RECIPE"] = recipe
+        _logger.info("%s recipe '%s' -> %s", engine_name, recipe, known_recipes[recipe])
+    if override_env:
+        # `systemd-run --user --scope` inherits Popen(env=), so there is one transport
+        # here, not two; no --setenv= enumeration in _launch_argv.
+        env.update(override_env)
+        _logger.info("%s launch overrides: %s", engine_name, override_env)
+
     _logger.info("%s starting profile '%s' — script: %s", engine_name, profile["name"], script)
     try:
         _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -2047,12 +3403,834 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(_fd, "w") as logf:
         subprocess.Popen(
-            ["bash", script],
+            _launch_argv(script, safe_id),
             stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
     _logger.info("%s launched — logs at %s", engine_name, log_path)
-    return {"ok": True, "message": f"Launched {profile['name']} — logs at {log_path}"}
+    label = f"{profile['name']} [{recipe}]" if recipe else profile["name"]
+    return {"ok": True, "message": f"Launched {label} — logs at {log_path}"}
+
+
+# ── Unified-memory visibility ─────────────────────────────────────────────────
+# On GB10 the GPU and system RAM are one pool, and CUDA's mem_get_info reports
+# *free* memory — NOT MemAvailable. Page cache is reclaimable by the kernel but
+# CUDA counts it as unavailable, so vLLM's budget is
+#
+#     usable = MemTotal * gpu_memory_utilization - (MemTotal - MemFree)
+#
+# Reading a 37 GB safetensors set fills the page cache, and that cache is then
+# charged against the very budget that has to hold those weights. Observed
+# 2026-08-04 on Qwen3.6-35B-A3B-FP8 at an unchanged util of 0.55:
+#
+#     buff/cache ~25 GB  ->  Available KV cache memory  0.19 GiB  (refused to start)
+#     buff/cache  ~2 GB  ->  Available KV cache memory 25.97 GiB  (ready in 165s)
+#
+# This is why admission based on MemAvailable (see _get_available_memory_gb) can
+# pass while the launch still dies in engine init: MemAvailable counts the page
+# cache as free, and CUDA does not.
+
+_MEM_RECLAIM_WARN_GIB = 8      # page cache above this measurably shrinks the budget
+_MEM_RECLAIM_FAIL_GIB = 20     # at this point a full-context launch will very likely fail
+_DROP_CACHES_CMD = "sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+
+
+def _cuda_visible_memory() -> dict:
+    """MemTotal/MemFree/reclaimable in GiB, from CUDA's point of view.
+
+    Deliberately reports MemFree rather than MemAvailable: the gap between them
+    is exactly the page cache that vLLM cannot use but is still billed for.
+    """
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                vals[k] = int(v.split()[0])
+    except Exception as e:
+        return {"error": str(e)}
+    gib = lambda kb: kb / 1024 / 1024
+    total = gib(vals.get("MemTotal", 0))
+    free = gib(vals.get("MemFree", 0))
+    reclaimable = gib(vals.get("Cached", 0) + vals.get("Buffers", 0)
+                      - vals.get("Shmem", 0))
+    return {
+        "total_gib": round(total, 1),
+        "free_gib": round(free, 1),
+        "available_gib": round(gib(vals.get("MemAvailable", 0)), 1),
+        "reclaimable_gib": round(max(reclaimable, 0.0), 1),
+        "cuda_unavailable_gib": round(max(total - free, 0.0), 1),
+    }
+
+
+def _vllm_budget_gib(util: float, mem: dict) -> dict:
+    """What vLLM will actually have to work with at `util`, and what a cache drop buys."""
+    total = mem.get("total_gib", 0.0)
+    unavailable = mem.get("cuda_unavailable_gib", 0.0)
+    reclaimable = mem.get("reclaimable_gib", 0.0)
+    budget = total * util
+    return {
+        "util": util,
+        "budget_gib": round(budget, 1),
+        "charged_gib": round(unavailable, 1),
+        "usable_gib": round(budget - unavailable, 1),
+        "usable_after_reclaim_gib": round(budget - max(unavailable - reclaimable, 0.0), 1),
+    }
+
+
+# ── vLLM load-progress parsing ────────────────────────────────────────────────
+# Phase weights are wall-clock share of a measured cold start, not equal slices:
+# on this box weight load is ~30s of a ~165s start while torch.compile plus graph
+# capture is ~65s, so an evenly-weighted bar would sit at "loading weights" and
+# then jump. Percentages are the value at which the phase BEGINS.
+
+_LOAD_PHASES = [
+    ("starting",         3,  "Container starting"),
+    ("engine_init",     10,  "Initializing engine"),
+    ("loading_weights", 30,  "Loading weights"),
+    ("compiling",       45,  "Compiling model (torch.compile)"),
+    ("profiling",       62,  "Profiling memory"),
+    ("kv_cache",        78,  "Sizing KV cache"),
+    ("capturing",       88,  "Capturing CUDA graphs"),
+    ("ready",          100,  "Ready"),
+]
+_PHASE_PCT = {p: pct for p, pct, _ in _LOAD_PHASES}
+_PHASE_LABEL = {p: label for p, _, label in _LOAD_PHASES}
+
+# Ordered longest-lived first: a single line can match several, and the LAST
+# matching rule wins so progress only ever moves forward.
+_LOAD_PATTERNS = [
+    ("engine_init",     _re.compile(r"Initializing a V1 LLM engine|api_utils.*non-default args")),
+    # "Model loading took" belongs here, not to profiling: it is emitted when the
+    # weights finish, and treating it as the start of profiling skipped the whole
+    # compile phase and parked the bar at 65% for a minute.
+    ("loading_weights", _re.compile(r"Loading weights|default_loader|Loading safetensors"
+                                    r"|Model loading took")),
+    ("compiling",       _re.compile(r"torch\.compile|Compiling a graph|Dynamo bytecode"
+                                    r"|Directly load the compiled graph|torch_compile_cache"
+                                    r"|backend='inductor'")),
+    ("profiling",       _re.compile(r"Memory profiling|Profiling CUDA graph memory")),
+    # Measured order on this box: estimated graph memory and the KV verdict are
+    # both logged ~10s BEFORE capture actually starts, so they precede capturing.
+    ("kv_cache",        _re.compile(r"Estimated CUDA graph memory|Available KV cache memory"
+                                    r"|GPU KV cache size|maximum concurrency")),
+    ("capturing",       _re.compile(r"Capturing CUDA graph|Graph capturing finished"
+                                    r"|CuTeDSL warmup")),
+    ("ready",           _re.compile(r"Application startup complete|Starting vLLM API server")),
+]
+
+# A container that is `Up` proves nothing: the recipe path keeps the container
+# alive and runs vLLM as an exec inside it, so engine death leaves a healthy-
+# looking container with a dead server. Death must be read from the log.
+_LOAD_FAILED_RE = _re.compile(
+    r"Engine core initialization failed"
+    r"|EngineDeadError"
+    r"|raise (ValueError|RuntimeError)\("
+    r"|torch\.OutOfMemoryError"
+    r"|CUDA out of memory"
+    r"|Error response from daemon"
+    r"|invalid option"
+)
+
+# The line worth putting in front of a human, extracted from a traceback storm.
+# Searched, not anchored: vLLM prefixes every line with "(EngineCore pid=217) ERROR
+# 08-04 03:51:46 [core.py:1231] " and the prefix shape varies by subsystem, so the
+# exception has to be found mid-line. Requiring the colon excludes the `raise
+# ValueError(` frames that appear in the traceback body above the real message.
+_LOAD_CAUSE_RE = _re.compile(
+    r"((?:torch\.)?(?:ValueError|RuntimeError|OutOfMemoryError|AssertionError|OSError|"
+    r"ImportError|MemoryError)\s*:\s*\S.*)$")
+
+
+def _classify_vllm_log_line(line: str) -> Optional[str]:
+    """Map one container log line to a load phase, or None if it says nothing new."""
+    for phase, pat in _LOAD_PATTERNS:
+        if pat.search(line):
+            return phase
+    return None
+
+
+def _load_failure_reason(lines: list) -> str:
+    """Pull the one explanatory line out of a failed startup's log tail.
+
+    vLLM reports the same error three times (EngineCore, its re-raise, then the
+    APIServer's RuntimeError wrapper) wrapped in ~90 lines of traceback. The
+    useful one is the first concrete exception message; the RuntimeError wrapper
+    ("See root cause above") is the least useful and is only a fallback.
+    """
+    fallback = ""
+    for line in lines:
+        m = _LOAD_CAUSE_RE.search(line.strip())
+        if not m:
+            continue
+        msg = " ".join(m.group(1).split())
+        if "See root cause above" in msg or "Engine core initialization failed" in msg:
+            fallback = fallback or msg
+            continue
+        return msg
+    if fallback:
+        return fallback
+    for line in reversed(lines):
+        if line.strip():
+            # Label it honestly. Presenting an arbitrary trailing line as "the
+            # error" is how a routine access-log entry got reported as the cause
+            # of a failure that had not actually happened.
+            return ("No exception was logged. Last output: "
+                    + " ".join(line.split())[:300])
+    return "Container exited without logging a cause."
+
+
+# ── Launch preflight ("dry load") ─────────────────────────────────────────────
+# Every real launch failure on this box so far was knowable before committing
+# ~100 GB of unified memory and 3 minutes of weight load:
+#
+#   2026-07-30  mount scope   — snapshots/<sha> mounted without blobs/, every
+#                               weight file a dangling symlink inside the container
+#   2026-08-04  entrypoint    — `docker run <image> --model ...` against an image
+#                               whose entrypoint execs its arguments; dead in 2s
+#   2026-08-04  memory budget — page cache charged against gpu-memory-utilization
+#
+# So preflight is static-first: parse the script, check the things that are true
+# before anything runs, and only then spend a couple of seconds in a container.
+
+_PF_IMAGE_RE   = _re.compile(r"^\s*(?:--\S+\s+)*([a-z0-9][\w./-]*(?::[\w.-]+)?)\s*\\\s*$", _re.M)
+_PF_MOUNT_RE   = _re.compile(r"-v\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+_PF_MODEL_RE   = _re.compile(r"--model[= ]\s*(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+_PF_UTIL_RE    = _re.compile(r"--gpu-memory-utilization[= ]\s*([0-9.]+)")
+_PF_RESTART_RE = _re.compile(r"--restart[= ]\s*(\S+)")
+_PF_RECIPE_RE  = _re.compile(r"run-recipe\.sh\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
+
+
+def _pf(level: str, check: str, title: str, detail: str, fix: str = "") -> dict:
+    return {"level": level, "check": check, "title": title, "detail": detail, "fix": fix}
+
+
+def _first_group(m) -> str:
+    return next((g for g in m.groups() if g), "") if m else ""
+
+
+_PF_ASSIGN_RE = _re.compile(r"^\s*([A-Za-z_]\w*)=(?:\"([^\"]*)\"|'([^']*)'|(\S+))\s*$", _re.M)
+_PF_VAR_RE = _re.compile(r"\$\{(\w+)\}|\$(\w+)")
+
+
+# Only these come from the process environment. Scripts legitimately use $HOME in
+# mount paths, but the preflight result is returned over HTTP, so expansion is an
+# allowlist rather than a blanket os.environ lookup — nothing else gets echoed back.
+_PF_ENV_ALLOWED = ("HOME", "USER")
+
+
+def _expand_script_vars(value: str, text: str) -> str:
+    """Resolve `$VAR` against literal assignments in the same script.
+
+    Launch scripts name things once at the top (`RECIPE="qwen3.6-…-solo"`,
+    `-v "$HOME/.cache/huggingface:…"`) and use the variable below, so a parser
+    that reads the use site literally comes away with "$RECIPE" or a mount docker
+    rejects as "invalid characters for a local volume name" — and every check
+    downstream of it degrades into a false failure.
+    """
+    if "$" not in value:
+        return value
+    env = {k: os.environ[k] for k in _PF_ENV_ALLOWED if k in os.environ}
+    for m in _PF_ASSIGN_RE.finditer(text):
+        env[m.group(1)] = next((g for g in m.groups()[1:] if g is not None), "")
+    return _PF_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), value)
+
+
+def _script_code(text: str) -> str:
+    """The script with whole-line comments removed.
+
+    Load scripts carry long rationale headers that quote the very commands being
+    looked for — the Qwen3.6 profile's own comments mention `run-recipe.sh` and
+    `docker rm -f vllm_node`. Parsing the raw text makes preflight read the
+    documentation instead of the code, so every fact is taken from here.
+    """
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+def _parse_launch_script(text: str) -> dict:
+    """Extract the launch facts preflight reasons about, for either script shape."""
+    code = _script_code(text)
+    recipe = _expand_script_vars(_first_group(_PF_RECIPE_RE.search(code)), code)
+    image = ""
+    for m in _PF_IMAGE_RE.finditer(code):
+        cand = m.group(1)
+        if "/" in cand or ":" in cand:
+            image = cand
+            break
+    mounts = [_expand_script_vars(_first_group(m), code)
+              for m in _PF_MOUNT_RE.finditer(code)]
+    return {
+        "code": code,
+        "recipe": recipe,
+        "recipe_backed": bool(recipe),
+        "image": image,
+        "mounts": mounts,
+        "model": _expand_script_vars(_first_group(_PF_MODEL_RE.search(code)), code),
+        "util": float(_first_group(_PF_UTIL_RE.search(code)) or 0) or None,
+        "restart": _first_group(_PF_RESTART_RE.search(code)),
+        "has_serve": bool(_re.search(r"^\s*vllm serve\b", code, _re.M)),
+        "clears_container": "docker rm -f vllm_node" in code,
+    }
+
+
+def _preflight_static(text: str, cfg: dict) -> list:
+    """Checks that need nothing but the script text. Pure — unit-testable."""
+    facts = _parse_launch_script(text)
+    out = []
+
+    if facts["recipe_backed"]:
+        out.append(_pf("ok", "shape", "Recipe-backed profile",
+                       f"Delegates to run-recipe.sh recipe '{facts['recipe']}'. "
+                       "Launch flags are owned by the recipe YAML, not by this script."))
+    else:
+        expected = _vllm_serve_command(facts["image"], cfg)
+        if expected and not facts["has_serve"]:
+            out.append(_pf(
+                "fail", "entrypoint", "Missing `vllm serve` subcommand",
+                f"Image '{facts['image'] or '(unparsed)'}' execs its arguments, so the "
+                f"container will try to exec `--model` and exit 2 within seconds.",
+                f"Insert `{expected} \\` immediately after the image line."))
+        elif not expected and facts["has_serve"]:
+            out.append(_pf(
+                "fail", "entrypoint", "Unexpected `vllm serve` subcommand",
+                f"Image '{facts['image']}' already starts the API server, so `vllm serve` "
+                f"is passed to it as a positional model argument.",
+                "Remove the `vllm serve` line."))
+        else:
+            out.append(_pf("ok", "entrypoint", "Entrypoint contract matches image",
+                           f"'{facts['image'] or 'image'}' "
+                           f"{'needs' if expected else 'does not need'} an explicit "
+                           f"`vllm serve`, and the script "
+                           f"{'has' if facts['has_serve'] else 'omits'} one."))
+
+    if facts["restart"]:
+        out.append(_pf(
+            "warn", "restart_policy", f"Script sets --restart {facts['restart']}",
+            "A failed launch will be resurrected across reboot under the name "
+            "vllm_node. run-recipe.sh treats any existing vllm_node as 'already "
+            "running' and skips its own launch, so a broken profile can keep the "
+            "box's default model down indefinitely.",
+            "Remove --restart; vllm-default-model.service owns boot recovery."))
+
+    if not facts["clears_container"]:
+        out.append(_pf(
+            "warn", "collision", "Script does not clear the existing container",
+            "Without `docker rm -f vllm_node` a previous container keeps the name and "
+            "the port, and the launch either fails or is silently skipped.",
+            "Add `docker rm -f vllm_node 2>/dev/null || true` before launching."))
+
+    if facts["model"] and not facts["recipe_backed"]:
+        under_mount = any(facts["model"].startswith(m.split(":", 1)[-1].rstrip("/"))
+                          for m in facts["mounts"] if ":" in m)
+        if not under_mount:
+            out.append(_pf(
+                "warn", "mount_scope", "Model path is not under any bind mount",
+                f"--model points at {facts['model']} but no -v maps a container path "
+                f"containing it. HF snapshot dirs are symlinks into ../../blobs/, so a "
+                f"mount scoped to snapshots/<sha> leaves every weight file dangling.",
+                "Mount the models--*/ root, not the snapshot subdirectory."))
+    return out
+
+
+def _preflight_memory(util: Optional[float]) -> list:
+    """The budget check. `util` None means the script did not declare one."""
+    mem = _cuda_visible_memory()
+    if "error" in mem:
+        return [_pf("warn", "memory", "Could not read /proc/meminfo", mem["error"])]
+    reclaim = mem["reclaimable_gib"]
+    budget = _vllm_budget_gib(util, mem) if util else None
+    arith = ""
+    if budget:
+        arith = (f" At util {util}, vLLM's budget is {budget['budget_gib']} GiB, of which "
+                 f"{budget['charged_gib']} GiB is already charged as unavailable — leaving "
+                 f"{budget['usable_gib']} GiB. Reclaiming the cache would raise that to "
+                 f"{budget['usable_after_reclaim_gib']} GiB.")
+    detail = (f"{reclaim} GiB of page cache is held. CUDA reports free memory, not "
+              f"MemAvailable, so cached pages are billed against "
+              f"--gpu-memory-utilization even though the kernel would happily drop "
+              f"them.{arith}")
+    if reclaim >= _MEM_RECLAIM_FAIL_GIB:
+        level = "fail"
+    elif reclaim >= _MEM_RECLAIM_WARN_GIB:
+        level = "warn"
+    else:
+        return [_pf("ok", "memory", "Page cache is not eating the budget",
+                    f"{reclaim} GiB cached; {mem['free_gib']} GiB genuinely free.{arith}")]
+    return [_pf(level, "memory", f"{reclaim} GiB of page cache will be charged to vLLM",
+                detail, _DROP_CACHES_CMD)]
+
+
+# Long enough for `import vllm` (~15s cold) plus argparse, short enough that the
+# button never feels hung. A timeout is reported as `skip`, never as `fail`: a
+# slow probe is not evidence of a bad script.
+_PF_SMOKE_TIMEOUT_S = 90
+
+# Validates flags without allocating a single byte of KV cache. Kept tolerant of
+# vLLM's module reshuffles — an ImportError here means "cannot check", not "bad".
+_PF_ARGPARSE_PROBE = (
+    "import sys\n"
+    "try:\n"
+    "    from vllm.utils.argparse_utils import FlexibleArgumentParser\n"
+    "except Exception:\n"
+    "    from vllm.utils import FlexibleArgumentParser\n"
+    "from vllm.entrypoints.openai.cli_args import make_arg_parser\n"
+    "make_arg_parser(FlexibleArgumentParser()).parse_args(sys.argv[1:])\n"
+    "print('ARGS_OK')\n"
+)
+
+
+async def _preflight_runtime(facts: dict, script: str) -> list:
+    """Checks that need docker. Each degrades to `skip` rather than a false failure."""
+    out = []
+
+    name = await _run("docker", "ps", "-a", "--filter", "name=^vllm_node$",
+                      "--format", "{{.Status}}", timeout=15)
+    existing = (name.stdout or "").strip()
+    if existing:
+        out.append(_pf(
+            "warn", "container_exists", f"A container named vllm_node exists ({existing})",
+            "It holds the name and port 8000. The script's `docker rm -f` clears it, but "
+            "run-recipe.sh would instead report 'already running' and skip launching.",
+            "docker rm -f vllm_node"))
+
+    image = facts.get("image")
+    if image:
+        insp = await _run("docker", "image", "inspect", image, "--format", "{{.Id}}",
+                          timeout=20)
+        if insp.returncode != 0:
+            out.append(_pf(
+                "warn", "image", f"Image '{image}' is not present locally",
+                "The launch will pull it first, which can take several minutes and will "
+                "look like a hung load.", f"docker pull {image}"))
+        else:
+            out.append(_pf("ok", "image", f"Image '{image}' present", insp.stdout.strip()[:19]))
+
+    # The mount-scope test from 2026-07-30, run for real: read the model's own
+    # config.json through the exact bind mounts the launch will use. A dangling
+    # symlink fails here in about a second instead of after a 3-minute load.
+    if "$" in (facts.get("model") or "") or any("$" in m for m in facts.get("mounts", [])):
+        # Scripts compute paths at runtime (`HASH=$(basename "$SNAP_HOST")`), and
+        # command substitution cannot be resolved without executing the script.
+        # An unresolved path is "unknown", never "broken" — reporting it as a
+        # failure would train the reader to ignore this check.
+        out.append(_pf(
+            "skip", "mount_readable", "Model path is computed at runtime",
+            f"{facts.get('model')} contains a shell substitution, so the files could "
+            f"not be read ahead of the launch. Static checks still apply."))
+    elif facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]:
+        args = ["docker", "run", "--rm", "--entrypoint", "/bin/sh"]
+        for m in facts["mounts"]:
+            args += ["-v", m]
+        target = facts["model"].rstrip("/") + "/config.json"
+        args += [image or "busybox", "-c", f"cat {shlex.quote(target)} >/dev/null"]
+        probe = await _run(*args, timeout=60)
+        if probe.returncode == 0:
+            out.append(_pf("ok", "mount_readable", "Model files readable inside the container",
+                           f"Read {target} through the configured bind mounts."))
+        else:
+            out.append(_pf(
+                "fail", "mount_readable", "Model files are NOT readable inside the container",
+                f"Reading {target} through the configured mounts failed: "
+                f"{(probe.stderr or probe.stdout or '').strip()[:300]}. This reads like a "
+                f"corrupt download but is almost always mount scope — HF snapshot entries "
+                f"are relative symlinks into ../../blobs/.",
+                "Mount the models--*/ root so blobs/ and snapshots/ are both in scope."))
+    return out
+
+
+async def _preflight_smoke(facts: dict, script: str) -> list:
+    """Spend a couple of seconds proving the arguments actually parse."""
+    if facts["recipe_backed"]:
+        _, recipe_root = _recipe_dirs()   # runner dir = parent of the recipe yaml dir
+        runner = recipe_root / "run-recipe.sh"
+        if not runner.exists():
+            return [_pf("skip", "smoke", "Recipe runner not found",
+                        f"{runner} does not exist, so the recipe could not be dry-run.")]
+        proc = await asyncio.create_subprocess_exec(
+            str(runner), facts["recipe"], "--dry-run",
+            cwd=str(recipe_root),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(),
+                                               timeout=_PF_SMOKE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill(); await proc.wait()
+            return [_pf("skip", "smoke", "Recipe dry-run timed out", "")]
+        text = (stdout or b"").decode(errors="replace")
+        if proc.returncode == 0:
+            return [_pf("ok", "smoke", "Recipe dry-run succeeded",
+                        text.strip()[-600:] or "run-recipe.sh --dry-run exited 0")]
+        return [_pf("fail", "smoke", "Recipe dry-run failed", text.strip()[-600:])]
+
+    if not facts.get("image"):
+        return [_pf("skip", "smoke", "No image parsed from the script", "")]
+    # Everything after the `vllm serve` line is a server flag; feed exactly those
+    # to vLLM's own parser inside the image.
+    code = facts.get("code") or _script_code(script)
+    body = code.split("vllm serve", 1)[1] if facts["has_serve"] else ""
+    flags = [_expand_script_vars(a, code)
+             for a in shlex.split(body.replace("\\\n", " "))] if body else []
+    if not flags:
+        return [_pf("skip", "smoke", "No server flags parsed from the script", "")]
+    args = ["docker", "run", "--rm", "--entrypoint", "python3"]
+    for m in facts["mounts"]:
+        args += ["-v", m]
+    args += [facts["image"], "-c", _PF_ARGPARSE_PROBE] + flags
+    probe = await _run(*args, timeout=_PF_SMOKE_TIMEOUT_S)
+    combined = ((probe.stdout or "") + (probe.stderr or "")).strip()
+    if "ARGS_OK" in combined:
+        return [_pf("ok", "smoke", "vLLM accepted every flag",
+                    f"{len(flags)} arguments parsed by vLLM's own argument parser "
+                    f"inside {facts['image']}, without loading weights.")]
+    # Only argparse's own vocabulary counts as the script being wrong. Everything
+    # else — an import that needs CUDA, a moved module, a slow pull — means the
+    # probe could not run, and saying "rejected" there would be a false alarm.
+    # vLLM builds pydantic config objects during parsing, and some of them touch
+    # the device, which this deliberately GPU-less probe cannot provide.
+    if _re.search(r"error: (unrecognized arguments|argument |invalid choice|"
+                  r"the following arguments are required|expected)", combined):
+        return [_pf("fail", "smoke", "vLLM rejected the launch arguments",
+                    combined[-600:])]
+    return [_pf("skip", "smoke", "Could not run the argument probe",
+                (combined[-400:] or "no output") +
+                "\n\nThe probe runs without a GPU, so vLLM config objects that touch "
+                "the device cannot be constructed. This says nothing about the script.")]
+
+
+@app.post("/api/vllm/preflight", dependencies=[Depends(verify_auth)])
+async def vllm_preflight(req: EngineStartRequest):
+    """Dry-load a profile: everything a real launch would hit, minus the weights."""
+    profiles = _scan_profiles("vllm")
+    profile = next((p for p in profiles if p["id"] == req.profile), None)
+    if not profile:
+        raise HTTPException(404, f"Profile '{req.profile}' not found")
+    script_path = Path(os.path.expanduser(profile.get("script", "")))
+    if not script_path.exists():
+        raise HTTPException(400, f"Script not found: {script_path}")
+    text = script_path.read_text(errors="ignore")
+    facts = _parse_launch_script(text)
+
+    checks = _preflight_static(text, _app_config.get("vllm", {}) or {})
+    util = facts["util"]
+    if util is None and facts["recipe_backed"]:
+        util = _recipe_util(facts["recipe"])
+    checks += _preflight_memory(util)
+    checks += await _preflight_runtime(facts, text)
+    checks += await _preflight_smoke(facts, text)
+
+    verdict = ("fail" if any(c["level"] == "fail" for c in checks)
+               else "warn" if any(c["level"] == "warn" for c in checks) else "ok")
+    return {
+        "profile": req.profile,
+        "verdict": verdict,
+        "checks": checks,
+        "facts": facts,
+        "memory": _cuda_visible_memory(),
+        "budget": _vllm_budget_gib(util, _cuda_visible_memory()) if util else None,
+    }
+
+
+# The one owner of "where the recipe YAMLs and run-recipe.sh live." Generator, Dry-Run
+# smoke, and preflight memory math must all agree on this, or a configured recipe_dir
+# would launch from one place while validating another. Config -> default (no env
+# override: no other vllm block key has one either).
+def _live_vllm_cfg() -> dict:
+    """The `vllm` config block with env overrides applied — config -> env -> default,
+    the same precedence the `alerts` block uses.
+
+    The env layer lands HERE rather than inside the generator because
+    `_build_vllm_profile_script` is deliberately a pure function of the `vllm_cfg`
+    it is handed. Resolving the override at the single point where the live block
+    is read keeps the generator and the preflight helpers (`_recipe_dirs`,
+    `_recipe_util`) from disagreeing about which recipe directory is in force.
+    """
+    cfg = dict(_app_config.get("vllm", {}) or {})
+    if env_dir := os.environ.get("MODEL_MANAGER_VLLM_RECIPE_DIR"):
+        cfg["recipe_dir"] = cfg.get("recipe_dir") or env_dir
+    return cfg
+
+
+def _vllm_recipe_dir() -> str:
+    return _live_vllm_cfg().get("recipe_dir") or "~/spark-vllm-docker/recipes"
+
+
+def _recipe_dirs() -> tuple[Path, Path]:
+    """(recipe_yaml_dir, runner_dir) from the live config. Pre-flight-only use
+    (_recipe_util, _preflight_smoke): the generator stays a pure function of its
+    vllm_cfg argument. run-recipe.sh sits in the checkout root, sibling of the
+    recipes/ subdir, so the runner dir is the yaml dir's parent — the same
+    assumption the generated wrapper's `cd "$RECIPE_DIR/.."` makes."""
+    ydir = Path(os.path.expanduser(_vllm_recipe_dir()))
+    return ydir, ydir.parent
+
+
+def _read_recipe(recipe_dir, name: str) -> tuple[Optional[dict], list[str]]:
+    """Render and normalize one run-recipe YAML; malformed input is no opinion."""
+    if not isinstance(name, str) or not _re.fullmatch(r"[\w.-]+", name):
+        return None, [f"invalid recipe name {name!r}"]
+
+    try:
+        path = Path(os.path.expanduser(os.fspath(recipe_dir))) / f"{name}.yaml"
+        recipe = yaml.safe_load(path.read_text())
+        if not isinstance(recipe, dict):
+            return None, [f"recipe {name!r} is not a YAML mapping"]
+        if "command" not in recipe:
+            return None, [f"recipe {name!r} has no command"]
+        defaults = recipe.get("defaults", {})
+        params = {**defaults, **{}}
+        try:
+            rendered = recipe["command"].format(**params)
+        except (KeyError, IndexError, ValueError) as exc:
+            return None, [f"recipe {name!r} command placeholder error: {exc}"]
+        tokens = shlex.split(rendered)
+
+        flags = {}
+        wanted = {
+            "--gpu-memory-utilization", "--gpu-memory-utilization-gb",
+            "--max-model-len", "--kv-cache-dtype", "--tool-call-parser",
+            "--reasoning-parser", "--port",
+        }
+        for index, token in enumerate(tokens):
+            flag, separator, inline = token.partition("=")
+            if flag not in wanted:
+                continue
+            if separator:
+                flags[flag] = inline
+            elif index + 1 < len(tokens):
+                flags[flag] = tokens[index + 1]
+
+        def _number(flag: str, cast):
+            value = flags.get(flag)
+            return cast(value) if value is not None else None
+
+        return {
+            "name": recipe.get("name") or None,
+            "description": recipe.get("description") or None,
+            "model": recipe.get("model") or None,
+            "gpu_memory_utilization": _number("--gpu-memory-utilization", float),
+            "gpu_memory_utilization_gb": _number("--gpu-memory-utilization-gb", float),
+            "max_model_len": _number("--max-model-len", int),
+            "kv_cache_dtype": flags.get("--kv-cache-dtype") or None,
+            "tool_call_parser": flags.get("--tool-call-parser") or None,
+            "reasoning_parser": flags.get("--reasoning-parser") or None,
+            "port": _number("--port", int),
+            "solo_only": recipe.get("solo_only") if "solo_only" in recipe else None,
+            "cluster_only": recipe.get("cluster_only") if "cluster_only" in recipe else None,
+            "mods": recipe.get("mods") if "mods" in recipe else None,
+        }, []
+    except Exception as exc:
+        location = str(path) if "path" in locals() else repr(recipe_dir)
+        return None, [f"could not read recipe {name!r} from {location}: {exc}"]
+
+
+def _recipe_util(recipe: str) -> Optional[float]:
+    """Return only a fractional recipe utilization for preflight memory math."""
+    record, _ = _read_recipe(_recipe_dirs()[0], recipe)
+    return record.get("gpu_memory_utilization") if record is not None else None
+
+
+@app.post("/api/vllm/reclaim-cache", dependencies=[Depends(verify_auth)])
+async def vllm_reclaim_cache():
+    """Drop the page cache so it stops being charged against the launch budget.
+
+    Non-destructive: the kernel re-reads from disk on demand. Requires passwordless
+    sudo; a box without it gets a clear 501 rather than a silent no-op. This grants
+    no privilege the profile scripts did not already have — they run as the same
+    user — but it is behind verify_auth because it is a system-wide side effect.
+    """
+    before = _cuda_visible_memory()
+    probe = await _run("sudo", "-n", "true", timeout=10)
+    if probe.returncode != 0:
+        raise HTTPException(501, "Passwordless sudo is unavailable, so the page cache "
+                                 f"cannot be dropped from here. Run manually: {_DROP_CACHES_CMD}")
+    os.sync()
+    res = await _run("sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches", timeout=60)
+    if res.returncode != 0:
+        raise HTTPException(500, f"drop_caches failed: {(res.stderr or '').strip()[:300]}")
+    after = _cuda_visible_memory()
+    freed = round(after.get("free_gib", 0) - before.get("free_gib", 0), 1)
+    return {"ok": True, "freed_gib": freed, "before": before, "after": after,
+            "message": f"Reclaimed {freed} GiB — now visible to CUDA."}
+
+
+# ── Load progress stream ──────────────────────────────────────────────────────
+# Sourced from `docker logs -f`, NOT from the /tmp launch log, because the /tmp
+# log only ever captures the *first* foreground attempt: a detached or recipe-
+# backed launch writes almost nothing there, and after a reboot /tmp is gone
+# entirely. `docker logs` is the one source that works for every profile shape
+# and survives a manager restart.
+
+_PROGRESS_TAIL = 400          # enough to catch a load already in flight
+_PROGRESS_CAUSE_WINDOW = 120  # log lines kept for root-cause extraction
+
+
+async def _container_state(name: str) -> dict:
+    res = await _run("docker", "inspect", name,
+                     "--format", "{{.Id}}|{{.State.Status}}|{{.State.ExitCode}}",
+                     timeout=15)
+    if res.returncode != 0:
+        return {"exists": False, "status": "absent", "exit_code": None, "id": ""}
+    cid, _, rest = (res.stdout or "").strip().partition("|")
+    status, _, code = rest.partition("|")
+    return {"exists": True, "id": cid, "status": status,
+            "exit_code": int(code) if code.strip().lstrip("-").isdigit() else None}
+
+
+_PROGRESS_APPEAR_TIMEOUT_S = 45   # docker rm -f + docker run, plus an image pull check
+
+
+async def _vllm_health_ok() -> bool:
+    try:
+        r = await _http.get(_engine_bases["vllm"] + "/health", timeout=5.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _load_progress_events(container: str, fresh: bool = False) -> AsyncGenerator[str, None]:
+    """Stream load phases until the model is ready or the load provably failed.
+
+    Contract, mirroring _hf_download_events: exactly one terminal event (`ready`
+    or `failed`). The pre-existing UI polled /status every 20s for ten minutes and
+    called that "Model loading…", which is indistinguishable from a container that
+    died in two seconds — the exact reason a broken profile looked like nothing
+    happening at all.
+    """
+    started = _time.monotonic()
+    phase, pct = "starting", _PHASE_PCT["starting"]
+    recent: list = []
+    facts: dict = {}
+    sent_terminal = False
+
+    def frame(**kw) -> str:
+        kw.setdefault("elapsed_s", round(_time.monotonic() - started, 1))
+        return f"data: {json.dumps(kw)}\n\n"
+
+    # An already-serving model must report ready, not "starting": the log tail of a
+    # long-running container is full of request lines and the startup milestones
+    # have long since scrolled out of it. Skipped for a fresh launch, where the
+    # *previous* model may still be answering /health for another second or two.
+    if not fresh and await _vllm_health_ok():
+        yield frame(status="ready", phase="ready", percent=100,
+                    label=_PHASE_LABEL["ready"], line="Already serving")
+        return
+
+    # The launch script runs `docker rm -f` before `docker run`, so right after
+    # POST /start the name still resolves to the OUTGOING container. Attaching to
+    # that one and watching it get removed looks exactly like a crash — the first
+    # end-to-end test of this stream reported "failed" 3.6s in, quoting a stray
+    # access-log line from the model being replaced. So a fresh launch waits for a
+    # container with a different ID, and identity is the container ID, not the name.
+    state = await _container_state(container)
+    prior_id = state.get("id", "") if fresh else ""
+    if not state["exists"] or (fresh and state.get("id") == prior_id and prior_id):
+        deadline = _time.monotonic() + _PROGRESS_APPEAR_TIMEOUT_S
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            state = await _container_state(container)
+            if state["exists"] and state.get("id") != prior_id:
+                break
+            yield frame(status="loading", phase="starting", percent=2,
+                        label="Waiting for container", line="")
+    if not state["exists"] or (prior_id and state.get("id") == prior_id):
+        yield frame(status="failed", phase="absent", percent=0,
+                    error=f"No new container named {container} appeared within "
+                          f"{_PROGRESS_APPEAR_TIMEOUT_S}s. The launch script exited "
+                          f"without starting it — check the script's own log.")
+        return
+    container_id = state["id"]
+
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "logs", "-f", "--tail", str(_PROGRESS_TAIL), container_id,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    yield frame(status="loading", phase=phase, percent=pct,
+                label=_PHASE_LABEL[phase], line="Attached to container log")
+    try:
+        while True:
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+            except asyncio.TimeoutError:
+                # Silence is normal during torch.compile. Use it to re-check that
+                # the container is still alive, then emit a heartbeat so the bar
+                # keeps showing elapsed time.
+                state = await _container_state(container_id)
+                if state["status"] in ("exited", "dead"):
+                    break
+                yield frame(status="loading", phase=phase, percent=pct,
+                            label=_PHASE_LABEL[phase], line="")
+                continue
+            if not raw:
+                break
+            line = raw.decode(errors="replace").rstrip()
+            recent.append(line)
+            del recent[:-_PROGRESS_CAUSE_WINDOW]
+
+            # Opportunistic telemetry — the two numbers worth seeing mid-load.
+            m = _re.search(r"Available KV cache memory:\s*([\d.]+)\s*GiB", line)
+            if m:
+                facts["kv_cache_gib"] = float(m.group(1))
+            m = _re.search(r"Model loading took\s*([\d.]+)\s*GiB", line)
+            if m:
+                facts["weights_gib"] = float(m.group(1))
+
+            if _LOAD_FAILED_RE.search(line):
+                reason = _load_failure_reason(recent)
+                hint = ""
+                if "KV cache" in reason or "out of memory" in reason.lower():
+                    hint = (f"On GB10 the page cache is charged against "
+                            f"--gpu-memory-utilization. Reclaim it and retry: "
+                            f"{_DROP_CACHES_CMD}")
+                yield frame(status="failed", phase="failed", percent=pct,
+                            error=reason, hint=hint, line=line, **facts)
+                sent_terminal = True
+                break
+
+            new = _classify_vllm_log_line(line)
+            if new and _PHASE_PCT[new] > pct:
+                phase, pct = new, _PHASE_PCT[new]
+            if new == "ready":
+                yield frame(status="ready", phase="ready", percent=100,
+                            label=_PHASE_LABEL["ready"], line=line, **facts)
+                sent_terminal = True
+                break
+            yield frame(status="loading", phase=phase, percent=pct,
+                        label=_PHASE_LABEL[phase], line=line[-300:], **facts)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+    if not sent_terminal:
+        # The stream ended without a verdict: the container died, or the log closed.
+        state = await _container_state(container_id)
+        if state["status"] in ("exited", "dead"):
+            yield frame(status="failed", phase="failed", percent=pct,
+                        error=_load_failure_reason(recent),
+                        exit_code=state.get("exit_code"), **facts)
+        else:
+            # Container is Up but the log ended — on the recipe path the container
+            # outlives a dead engine, so `Up` is not proof of health. Ask the API.
+            if await _vllm_health_ok():
+                yield frame(status="ready", phase="ready", percent=100,
+                            label=_PHASE_LABEL["ready"], **facts)
+            else:
+                yield frame(status="failed", phase="failed", percent=pct,
+                            error=_load_failure_reason(recent),
+                            hint="The container is running but the API is not "
+                                 "answering /health — on the recipe path vLLM runs as "
+                                 "an exec inside a container that survives its death.",
+                            **facts)
+
+
+@app.get("/api/vllm/progress")
+async def vllm_progress(container: str = "vllm_node", fresh: bool = False):
+    if not _re.fullmatch(r"[A-Za-z0-9][\w.-]{0,63}", container):
+        raise HTTPException(400, "Invalid container name")
+    return StreamingResponse(
+        _load_progress_events(container, fresh=fresh), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Dynamic engine routes ─────────────────────────────────────────────────────
@@ -2062,7 +4240,13 @@ for _ek, _ev in _ENGINES.items():
     def _make_engine_routes(key: str, eng: dict):
         @app.get(f"/api/{key}/profiles", name=f"{key}_profiles")
         async def profiles(k=key):
-            return _scan_profiles(k)
+            return _profiles_with_models(k)
+
+        @app.delete(f"/api/{key}/profiles/{{profile_id}}", name=f"{key}_profile_delete",
+                    dependencies=[Depends(verify_auth)])
+        async def delete_profile(profile_id: str, k=key):
+            """Delete a profile's start script. Leaves model weights untouched."""
+            return _delete_profile_script(k, profile_id)
 
         @app.get(f"/api/{key}/status", name=f"{key}_status")
         async def status(k=key, e=eng):
@@ -2073,33 +4257,89 @@ for _ek, _ev in _ENGINES.items():
         @app.post(f"/api/{key}/stop", name=f"{key}_stop",
                   dependencies=[Depends(verify_auth)])
         async def stop(k=key, e=eng):
-            return await _engine_stop(_engine_bases[k], e["name"])
+            return await _engine_stop(_engine_bases[k], e["name"],
+                                      e.get("docker_filter", k))
 
         @app.post(f"/api/{key}/start", name=f"{key}_start",
                   dependencies=[Depends(verify_auth)])
         async def start(req: EngineStartRequest, k=key):
             return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k,
-                                       engine_key=k, force=req.force)
+                                       engine_key=k, force=req.force,
+                                       recipe=req.recipe if k == "llamacpp" else None,
+                                       overrides=req.overrides if k == "vllm" else None)
 
     _make_engine_routes(_ek, _ev)
+
+
+@app.get("/api/llamacpp/recipes")
+async def llamacpp_recipes():
+    """The quant ladder the llama.cpp profile scripts read.
+
+    llama.cpp differs from vLLM here: one GGUF repo ships ten quants of the same weights,
+    so a script-per-quant would be ten near-identical files that drift. The ladder is data.
+    """
+    try:
+        cfg = json.loads(_CONFIG_FILE.read_text())
+    except Exception as e:
+        return {"recipes": {}, "default": None, "error": str(e)}
+    lc = cfg.get("llamacpp", {})
+    return {"recipes": lc.get("recipes", {}) or {},
+            "default": lc.get("default_recipe")}
 
 # ── HuggingFace Download ───────────────────────────────────────────────────────
 
 _HF_DOWNLOAD_SCRIPT = """
-import sys, json, os, time
+import sys, json, os, time, fnmatch, importlib.util
 sys.stdout.reconfigure(line_buffering=True)
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-from huggingface_hub import list_repo_tree, hf_hub_download
-from pathlib import Path
-
-repo = os.environ["HF_REPO_ID"]
-local_dir = os.environ.get("HF_LOCAL_DIR") or None
+# Define the event reporter FIRST. Anything that raises before J exists dies as a bare
+# traceback on stderr, which the parent turns into `log` events the UI discards — that is
+# exactly how an orphaned hf_transfer NameError here stayed invisible while every download
+# failed. Keep initialization inside the guarded block below so it can never regress.
 J = lambda **kw: print(json.dumps(kw), flush=True)
-J(status="starting", repo=repo)
+
+try:
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    # huggingface_hub 1.x downloads Xet-backed repos through hf_xet automatically; the
+    # perf knob is HF_XET_HIGH_PERFORMANCE (raises hf_xet concurrency/throughput on big
+    # shards). The old HF_HUB_ENABLE_HF_TRANSFER/hf_transfer path is superseded by Xet.
+    # Must be set before importing huggingface_hub; guarded so downloads still work if
+    # hf_xet is absent (falls back to the default HTTP path).
+    _has_xet = importlib.util.find_spec("hf_xet") is not None
+    if _has_xet:
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    from huggingface_hub import list_repo_tree, hf_hub_download
+    from pathlib import Path
+
+    repo = os.environ.get("HF_REPO_ID")
+    if not repo:
+        raise RuntimeError("HF_REPO_ID is not set")
+    local_dir = os.environ.get("HF_LOCAL_DIR") or None
+    ignore = json.loads(os.environ.get("HF_IGNORE_PATTERNS") or "[]")
+    allow = json.loads(os.environ.get("HF_ALLOW_PATTERNS") or "[]")
+    J(status="starting", repo=repo)
+    if _has_xet:
+        J(status="Xet acceleration enabled")
+except Exception as e:
+    J(status="error", error=f"startup failed: {e}")
+    raise SystemExit(0)
+
+def _keep(p):
+    if allow and not any(fnmatch.fnmatch(p, g) for g in allow):
+        return False
+    if ignore and any(fnmatch.fnmatch(p, g) for g in ignore):
+        return False
+    return True
 
 try:
     entries = [e for e in list_repo_tree(repo, recursive=True)
                if hasattr(e, 'size') and not e.path.startswith('.')]
+    if ignore or allow:
+        kept = [e for e in entries if _keep(e.path)]
+        skipped = len(entries) - len(kept)
+        skipped_gb = sum(e.size or 0 for e in entries if not _keep(e.path)) / 1024**3
+        if skipped:
+            J(status=f"Skipping {skipped} file(s) ({skipped_gb:.1f} GB) by pattern")
+        entries = kept
     total_files = len(entries)
     total_bytes = sum(e.size or 0 for e in entries)
     J(status=f"Found {total_files} files ({total_bytes/1024**3:.1f} GB)")
@@ -2185,6 +4425,82 @@ def _allowed_model_roots() -> list[Path]:
     return roots
 
 
+def _looks_like_model_dir(d: Path) -> bool:
+    """True only for a directory that is itself one model.
+
+    Deliberately strict. `/opt/models/hub` is a 282 GB *cache root* full of
+    models--* entries; it is a directory under an allowed root, and the token
+    'hub' appears in every HF path, so a laxer test made it a delete candidate
+    for a profile whose real model directory had been removed.
+    """
+    if d.name.startswith(".") or d.name in ("hub", "blobs", "snapshots", "refs"):
+        return False
+    if (d / "config.json").exists():
+        return True
+    if (d / "snapshots").is_dir() and not any(
+            c.name.startswith("models--") for c in d.iterdir() if c.is_dir()):
+        return True
+    return False
+
+
+def _candidate_model_dirs() -> list[Path]:
+    """Every top-level model directory under the allowed roots."""
+    dirs = []
+    for root in _allowed_model_roots():
+        try:
+            dirs += [d for d in root.iterdir() if d.is_dir() and _looks_like_model_dir(d)]
+        except Exception:
+            continue
+    return dirs
+
+
+def _profiles_with_models(engine_key: str) -> list:
+    """Profiles for an engine, annotated with the model dir each one launches.
+
+    The UI needs `model_dir` to offer a weights delete next to a profile delete;
+    `model_size_gb` so the confirm can state what is actually being freed.
+    """
+    model_dirs = _candidate_model_dirs()
+    out = []
+    for p in _scan_profiles(engine_key):
+        d = _script_model_dir(p["script"], model_dirs)
+        p["model_dir"] = str(d) if d else None
+        p["model_missing"] = bool(d is None)
+        if d:
+            blobs = d / "blobs"
+            src = blobs if blobs.exists() else d
+            try:
+                p["model_size_gb"] = round(
+                    sum(f.stat().st_size for f in src.rglob("*") if f.is_file()) / 1e9, 1)
+            except Exception:
+                p["model_size_gb"] = None
+        else:
+            p["model_size_gb"] = None
+        out.append(p)
+    return out
+
+
+def _delete_profile_script(engine_key: str, profile_id: str) -> dict:
+    """Remove a start_*.sh for an engine, by profile id (the script stem)."""
+    d = _engine_dirs.get(engine_key)
+    if not d:
+        raise HTTPException(404, "Unknown engine")
+    # Reject traversal: the id is a stem, never a path.
+    if "/" in profile_id or "\\" in profile_id or profile_id.startswith("."):
+        raise HTTPException(400, "Invalid profile id")
+    script = (d / f"{profile_id}.sh").resolve()
+    try:
+        script.relative_to(d.resolve())
+    except ValueError:
+        raise HTTPException(400, "Profile is outside the engine directory")
+    if not script.exists():
+        raise HTTPException(404, "Profile not found")
+    script.unlink()
+    _script_content_cache.pop(str(script), None)
+    _logger.info("Deleted %s profile script %s", engine_key, script.name)
+    return {"ok": True, "deleted": str(script)}
+
+
 def _find_launch_dir(path: Path) -> Path:
     """Accept an HF model dir, snapshot dir, or flat model dir and return the launch dir."""
     if (path / "config.json").exists():
@@ -2225,7 +4541,18 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
             size_gb = _dir_size_gb(hf_root)
     else:
         size_gb = _dir_size_gb(launch_dir)
-    vram_gb = int(min(112, max(16, round((size_gb * 1.35) + 12))))
+    # VRAM estimate = weights (≈ on-disk size, scaled by how much the format
+    # expands when loaded) + a fixed overhead for CUDA context, activations and
+    # the fp8 KV cache. Already-quantized weights load ~1:1, so the old flat
+    # 1.35× over-inflated every 4-/8-bit model by ~35% and tripped admission on
+    # a model that actually fits (e.g. gpt-oss-120b FP4: 100→81 GB).
+    _dtype = (inferred.get("dtype") or "").upper()
+    _weight_mult = (
+        1.05 if _dtype in ("FP4", "INT4") else
+        1.15 if _dtype in ("FP8", "INT8") else
+        1.35  # BF16/FP16/Unknown: fp16 weights + workspace headroom
+    )
+    vram_gb = int(min(112, max(16, round((size_gb * _weight_mult) + 12))))
     return {
         "name": model_name,
         "served": model_name.replace("/", "--"),
@@ -2236,6 +4563,8 @@ def _profile_model_info(launch_dir: Path, requested_name: str | None = None) -> 
         "task_label": task_label,
         "size_gb": size_gb,
         "vram_gb": vram_gb,
+        "architectures": (config.get("architectures", [])
+                          if isinstance(config.get("architectures", []), list) else []),
     }
 
 
@@ -2243,12 +4572,338 @@ def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]
     hf_cache_parent = HF_CACHE_DIR.parent.resolve()  # ~/.cache/huggingface
     if _path_under(launch_dir, hf_cache_parent):
         rel = launch_dir.resolve().relative_to(hf_cache_parent)
+        # Deliberately NOT shlex.quote'd: this line is a constant, and it relies on the
+        # shell expanding $HOME at launch time. Quoting would make $HOME a literal and
+        # break every cache-backed profile. No untrusted value is interpolated here.
         return [
             f'  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
         ], "/root/.cache/huggingface/" + str(rel).replace(os.sep, "/")
+    # HF-layout repo outside HF_CACHE_DIR (i.e. under a custom dir such as
+    # /opt/models or /mnt/models). Entries in snapshots/<rev>/ are relative
+    # symlinks to ../../blobs/<hash>, so mounting the snapshot dir alone leaves
+    # every file dangling inside the container and vLLM aborts with
+    # "Invalid repository ID or local directory specified". Mount the whole
+    # models--* repo (blobs/ + snapshots/) and point --model at the subpath.
+    resolved = launch_dir.resolve()
+    for repo_root in (resolved, *resolved.parents):
+        if (repo_root.name.startswith("models--")
+                and (repo_root / "blobs").is_dir()
+                and (repo_root / "snapshots").is_dir()):
+            rel = resolved.relative_to(repo_root)
+            container_root = f"/models/{slug}"
+            container_model = container_root
+            if rel.parts:
+                container_model += "/" + rel.as_posix()
+            return [
+                f'  -v {shlex.quote(f"{repo_root}:{container_root}:ro")} \\',
+            ], container_model
+    # Flat model dir: files live directly inside, safe to mount on its own.
     return [
-        f'  -v "{launch_dir}:/models/{slug}:ro" \\',
+        f'  -v {shlex.quote(f"{launch_dir}:/models/{slug}:ro")} \\',
     ], f"/models/{slug}"
+
+
+# A served model name ends up as a shell word in a generated start script AND in the
+# `# Name:` comment header that _parse_script_meta reads back. Anything outside this set is
+# rejected outright: grammar first, shlex.quote second, because defence-in-depth here is
+# cheap and the blast radius is arbitrary code execution as the service user.
+_SERVED_NAME_RE = _re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
+_MOE_BACKEND_RE = _re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def _validate_served_name(name: str) -> str:
+    """Reject any model name that could break out of a shell word or a comment line."""
+    if not isinstance(name, str) or not _SERVED_NAME_RE.match(name):
+        raise HTTPException(
+            400,
+            "Invalid model name. Allowed characters: letters, digits, dot, underscore, "
+            "hyphen and forward slash (max 128 chars).")
+    return name
+
+
+def _one_line(value: str) -> str:
+    """Flatten a value destined for a single-line `# Header:` comment."""
+    return _re.sub(r"[\r\n]+", " ", str(value)).strip()
+
+
+def _vllm_serve_command(image: str, cfg: dict) -> str:
+    """Return the serve subcommand this image needs, or "" if its entrypoint serves already.
+
+    Entrypoint semantics belong to the image, not to the model. Two shapes verified on this
+    box:
+
+      eugr/spark-vllm:latest → Entrypoint ["/opt/nvidia/nvidia_entrypoint.sh"], Cmd null.
+                               That script execs its arguments, so without an explicit
+                               `vllm serve` the container tries to exec `--model` and dies.
+      vllm/vllm-openai:*     → its entrypoint already starts the OpenAI API server, so
+                               arguments are server flags and `vllm serve` must NOT be added.
+
+    The known-good hand-written profiles/vLLM/start_hf_qwen_qwen3-8b.sh uses exactly this
+    form on the eugr image. Deliberately NOT using `docker run --entrypoint vllm`: that
+    bypasses nvidia_entrypoint.sh, which does CUDA environment setup inside the image.
+
+    Unknown images default to the explicit form, which is the safe direction — `vllm serve`
+    also works when passed as the container command to an image that execs its arguments.
+    """
+    if "serve_command" in (cfg or {}):
+        # Explicit wins, including an empty string meaning "add nothing" (same idiom as
+        # vllm.moe_backend).
+        val = (cfg or {}).get("serve_command")
+        return "" if val is None else str(val).strip()
+    ref = (image or "").split("@")[0]  # drop any @sha256: digest before matching
+    return "" if "vllm-openai" in ref else "vllm serve"
+
+
+def _resolve_recipe_model(model_name: str, vllm_cfg: dict) -> tuple[Optional[str], list[str]]:
+    """Choose the deterministic most-specific configured recipe glob."""
+    recipes = vllm_cfg.get("recipes") if isinstance(vllm_cfg, dict) else None
+    if not isinstance(recipes, dict) or not recipes:
+        return None, []
+    folded_name = str(model_name).casefold()
+    matches = []
+    for pattern, recipe_name in recipes.items():
+        if not isinstance(pattern, str):
+            continue
+        if fnmatch.fnmatchcase(folded_name, pattern.casefold()):
+            matches.append((pattern, recipe_name))
+    if not matches:
+        return None, []
+
+    def _specificity(item):
+        pattern = item[0]
+        wildcard_count = sum(pattern.count(char) for char in "*?[")
+        literal_length = sum(char not in "*?[]" for char in pattern)
+        return wildcard_count, -literal_length, pattern.casefold(), pattern
+
+    pattern, recipe_name = min(matches, key=_specificity)
+    warnings = []
+    if len(matches) > 1:
+        warnings.append(
+            f"multiple recipe patterns match {model_name!r}; chose {pattern!r}")
+    if not isinstance(recipe_name, str) or not _re.fullmatch(r"[\w.-]+", recipe_name):
+        warnings.append(f"invalid recipe name {recipe_name!r} for pattern {pattern!r}")
+        return None, warnings
+    return recipe_name, warnings
+
+
+def _kv_dtype_from_config(config: dict) -> Optional[str]:
+    """Return fp8 only for an explicit model-owned floating 8-bit KV declaration."""
+    if not isinstance(config, dict):
+        return None
+    candidates = [config]
+    if isinstance(config.get("text_config"), dict):
+        candidates.append(config["text_config"])
+    for candidate in candidates:
+        quant = candidate.get("quantization_config")
+        if not isinstance(quant, dict):
+            continue
+        if str(quant.get("kv_cache_dtype", "")).casefold() == "fp8":
+            return "fp8"
+        scheme = quant.get("kv_cache_scheme")
+        if not isinstance(scheme, dict):
+            continue
+        try:
+            eight_bit = int(scheme.get("num_bits")) == 8
+        except (TypeError, ValueError):
+            eight_bit = False
+        kind = " ".join(str(scheme.get(key, "")).casefold()
+                        for key in ("type", "dtype"))
+        if eight_bit and ("float" in kind or "fp8" in kind):
+            return "fp8"
+    return None
+
+
+def _resolve_launch(config: dict, info: dict, vllm_cfg: dict) -> dict:
+    """Resolve recipe delegation or derived Docker flags for one model."""
+    name = str(info.get("name", ""))
+    is_gpt_oss = "gpt-oss" in name.lower() or "gpt_oss" in name.lower()
+    if is_gpt_oss:
+        return {"shape": "docker", "gpt_oss": True}
+
+    recipe_name, warnings = _resolve_recipe_model(name, vllm_cfg)
+    if recipe_name is not None:
+        res_dir = vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        record, reader_warnings = _read_recipe(res_dir, recipe_name)
+        warnings.extend(reader_warnings)
+        if record is not None:
+            if record.get("cluster_only") is True:
+                warnings.append(f"recipe {recipe_name!r} is cluster_only")
+            if record.get("port") is not None and record["port"] != 8000:
+                warnings.append(
+                    f"recipe {recipe_name!r} uses port {record['port']}, not 8000")
+            return {
+                "shape": "recipe", "recipe": recipe_name,
+                "record": record, "warnings": warnings,
+            }
+
+    kv_dtype = _kv_dtype_from_config(config)
+    spec = _derive_launch_spec(
+        config, weights_gb=info.get("size_gb", 0.0), pool_gb=121.0,
+        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2)
+    warnings.extend(spec.get("warnings") or [])
+    max_model_len = spec.get("max_model_len")
+    if not isinstance(max_model_len, (int, float)) or max_model_len <= 0:
+        max_model_len = None
+    else:
+        max_model_len = int(max_model_len)
+    util = spec.get("recommended_util")
+    if not isinstance(util, (int, float)) or util <= 0.10:
+        util = None
+    else:
+        util = float(util)
+    return {
+        "shape": "docker", "kv_dtype": kv_dtype, "util": util,
+        "max_model_len": max_model_len, "warnings": warnings,
+        # The full spec is threaded through so `_vllm_script_preamble` can emit the
+        # `# Derived:` header without re-deriving. Historically this function dropped
+        # fourteen of the spec's keys on the floor and the card had nothing to show.
+        "spec": spec,
+    }
+
+
+# The `# Derived:` header is a versioned data format read back by `_parse_script_meta`.
+# Bump when the shape changes; readers must tolerate an unknown version.
+_SCRIPT_META_VERSION = 1
+
+# Placeholder fallbacks used when the spec could not derive a number. These are the same
+# constants the `${VAR:-N}` emission used inline before they were hoisted here — hoisting
+# is what makes "one source of truth, two renderings" literally true.
+_GPT_OSS_MAX_MODEL_LEN = 65536
+_FALLBACK_MAX_MODEL_LEN = 32768
+_FALLBACK_UTIL = 0.75
+_DEFAULT_MAX_NUM_SEQS = 2
+
+
+def _launch_defaults(resolved: dict) -> dict:
+    """The three numbers that become the `${VAR:-N}` placeholder defaults.
+
+    Single source of truth: the script argv and the `# Derived:` header both read this,
+    so the header can never advertise a context the script would not actually use.
+    """
+    if resolved.get("gpt_oss"):
+        # gpt-oss takes the full-precision KV path with a fixed context; `_resolve_launch`
+        # short-circuits before deriving a spec for it.
+        return {"max_model_len": _GPT_OSS_MAX_MODEL_LEN, "util": _FALLBACK_UTIL,
+                "max_num_seqs": _DEFAULT_MAX_NUM_SEQS}
+    ml = resolved.get("max_model_len")
+    util = resolved.get("util")
+    return {
+        "max_model_len": int(ml) if ml is not None else _FALLBACK_MAX_MODEL_LEN,
+        "util": float(util) if util is not None else _FALLBACK_UTIL,
+        "max_num_seqs": _DEFAULT_MAX_NUM_SEQS,
+    }
+
+
+def _json_num(value):
+    """Coerce to a JSON-representable number, or None. NaN/Inf are not valid JSON."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+    except Exception:
+        return None
+    return int(value) if isinstance(value, int) else float(value)
+
+
+def _script_meta_headers(info: dict, resolved: Optional[dict]) -> str:
+    """Emit the four machine-readable header comments `_parse_script_meta` reads back.
+
+    Each is a single line of compact JSON after the colon so the parser has exactly one
+    shape to handle. Warning strings embed `{value!r}` of vendor-supplied config fields,
+    so they are flattened AND json-escaped — a raw newline would break the contract.
+    """
+    if not resolved:
+        return ""
+    if resolved.get("shape") == "recipe":
+        derived = {
+            "v": _SCRIPT_META_VERSION,
+            "editable": False,
+            "reason": "the recipe YAML owns these flags",
+        }
+        recommended = {}
+    else:
+        defaults = _launch_defaults(resolved)
+        spec = resolved.get("spec") or {}
+        derived = {
+            "v": _SCRIPT_META_VERSION,
+            "editable": True,
+            "max_model_len": defaults["max_model_len"],
+            "max_fitting_context": _json_num(spec.get("max_fitting_context")),
+            "declared_max_context": _json_num(spec.get("declared_max_context")),
+            "max_num_seqs": defaults["max_num_seqs"],
+            "util": defaults["util"],
+        }
+        recommended = {
+            "gpu_memory_utilization": _json_num(spec.get("recommended_util")),
+            "max_model_len": _json_num(spec.get("max_model_len")),
+        }
+    warnings = [_one_line(w) for w in (info.get("warnings") or [])]
+    dump = lambda obj: json.dumps(obj, separators=(",", ":"))
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        f"# Derived: {dump(derived)}\n"
+        f"# Recommended: {dump(recommended)}\n"
+        f"# Warnings: {dump(warnings)}\n"
+        f"# Generated: {stamp}\n"
+    )
+
+
+def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool,
+                          resolved: Optional[dict] = None) -> str:
+    """The single shared owner of generated profile metadata and collision cleanup."""
+    if recipe_backed:
+        rationale = (
+            "# Recipe-backed: the YAML remains the source of truth for measured flags and\n"
+            "# in-container mods that a generated docker command cannot reproduce.\n")
+    else:
+        rationale = ""
+    return f"""#!/bin/bash
+# Name: HF {_one_line(info['name'])}
+# Description: Local HF snapshot via vLLM ({_one_line(info['dtype'])}, {info['size_gb']:.1f} GB on disk)
+# VRAM: {info['vram_gb']}
+#
+# Auto-generated by DGX Model Manager from:
+# {_one_line(launch_dir)}
+{_script_meta_headers(info, resolved)}{rationale}set -euo pipefail
+
+docker rm -f vllm_node 2>/dev/null || true
+
+"""
+
+
+# Defence in depth behind `_OVERRIDE_ENV`'s allow-list: the placeholders expand host-side
+# straight into docker argv, so a value that reached the environment by any other route
+# (a stray `export`, a hand-edited unit) must abort before `docker run`, not after.
+_VLLM_OVERRIDE_GUARD = r"""# Override guard — these expand into docker argv.
+for _dmm_var in VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS; do
+  _dmm_val="${!_dmm_var:-}"
+  if [[ -n "$_dmm_val" && ! "$_dmm_val" =~ ^[0-9]+$ ]]; then
+    echo "Invalid $_dmm_var: expected a positive integer, got '$_dmm_val'" >&2
+    exit 2
+  fi
+done
+if [[ -n "${VLLM_GPU_MEMORY_UTILIZATION:-}" \
+   && ! "${VLLM_GPU_MEMORY_UTILIZATION}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "Invalid VLLM_GPU_MEMORY_UTILIZATION: expected a decimal, got" \
+       "'${VLLM_GPU_MEMORY_UTILIZATION}'" >&2
+  exit 2
+fi
+unset _dmm_var _dmm_val
+
+"""
+
+
+def _recipe_profile_body(recipe_dir, recipe_name: str) -> str:
+    recipe_path = Path(os.path.expanduser(os.fspath(recipe_dir)))
+    return f"""RECIPE_DIR={shlex.quote(str(recipe_path))}
+RECIPE={shlex.quote(recipe_name)}
+
+# recipe_dir owns the YAMLs; run-recipe.sh is its sibling in the checkout root.
+cd "$RECIPE_DIR/.."
+# Detached mode lets DMM read progress uniformly from docker logs.
+exec ./run-recipe.sh "$RECIPE" -d
+"""
 
 
 def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) -> tuple[str, str, dict]:
@@ -2257,57 +4912,139 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
         raise HTTPException(400, f"Only safetensors/PyTorch snapshots can be used with vLLM; found {info['fmt']}")
     if info.get("task_label") not in ("Text Gen", "Vision LLM"):
         raise HTTPException(400, f"Only text/vision LLM snapshots can be added to vLLM; detected {info.get('task_label')}")
+    # Validate the name that actually reaches the script — including one recovered from a
+    # models--* ancestor, not just the caller-supplied one.
+    _validate_served_name(info["name"])
+    _validate_served_name(info["served"])
     slug = _safe_profile_slug(info["name"])
     script_name = f"start_hf_{slug}.sh"
+    _vllm_cfg = _live_vllm_cfg()
+    try:
+        config = json.loads((launch_dir / "config.json").read_text())
+        if not isinstance(config, dict):
+            config = {}
+    except Exception:
+        config = {}
+    resolved = _resolve_launch(config, info, _vllm_cfg)
+    info["warnings"] = list(resolved.get("warnings") or [])
+    if resolved["shape"] == "recipe":
+        preamble = _vllm_script_preamble(
+            info, launch_dir, recipe_backed=True, resolved=resolved)
+        res_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
+        return (script_name, preamble + _recipe_profile_body(
+            res_dir, resolved["recipe"]), info)
+    # The docker preamble is deliberately built LAST (just before script assembly):
+    # capability warnings are appended to info["warnings"] further down, and the
+    # `# Warnings:` header must carry the complete list, not a prefix of it.
+
     mounts, container_model = _container_model_mount(launch_dir, slug)
     dtype = info["dtype"]
     is_fp4 = dtype in ("FP4", "INT4") or "fp4" in info["name"].lower() or "nvfp4" in info["name"].lower()
     is_moe = bool(info["is_moe"]) or "moe" in info["name"].lower() or "a3b" in info["name"].lower()
+    # gpt-oss family uses the OpenAI harmony chat format + MXFP4 weights. On GB10
+    # (sm_121) the stock vllm-openai Marlin MXFP4 kernel miscomputes the first decode
+    # token (vLLM #37030) → harmony parser desync → OpenWebUI token-soup. The
+    # SM121-patched eugr/spark-vllm image (vLLM 0.23.1) fixes it. See
+    # profiles/vLLM/start_hf_openai_gpt-oss-120b.sh for the full root-cause writeup.
+    is_gpt_oss = "gpt-oss" in info["name"].lower() or "gpt_oss" in info["name"].lower()
 
     env_lines = [
         "  -e HF_HUB_OFFLINE=1 \\",
         "  -e CUDA_DEVICE_MAX_CONNECTIONS=8 \\",
     ]
-    if is_fp4:
+    if is_gpt_oss:
+        # Harmony/MXFP4 on sm_121: seed the o200k vocab for offline openai_harmony,
+        # force Marlin MoE with the SM121 split-K atomic-add race fix. NOT
+        # VLLM_NVFP4_GEMM_BACKEND (that's for NVFP4 models and is a no-op here).
+        env_lines += [
+            "  -e TIKTOKEN_ENCODINGS_BASE=/root/.cache/huggingface/harmony-encodings \\",
+            "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
+            "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
+            "  -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \\",
+        ]
+    elif is_fp4:
         env_lines += [
             "  -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \\",
             "  -e VLLM_USE_FLASHINFER_MOE_FP4=0 \\",
             "  -e VLLM_NVFP4_GEMM_BACKEND=marlin \\",
         ]
 
+    # shlex.quote every dynamic atom (defence-in-depth behind _validate_served_name). It
+    # supplies its own quoting, so these must NOT also be wrapped in double quotes —
+    # double-quoting its output would reintroduce $(...) evaluation. `vllm-active` is a
+    # literal and needs none.
+    # One source of truth for the three placeholder defaults; the `# Derived:` header
+    # renders the same dict.
+    _defaults = _launch_defaults(resolved)
     arg_lines = [
-        f'  --model "{container_model}" \\',
-        f'  --served-model-name "{info["name"]}" "{info["served"]}" vllm-active \\',
+        f'  --model {shlex.quote(container_model)} \\',
+        f'  --served-model-name {shlex.quote(info["name"])} {shlex.quote(info["served"])} vllm-active \\',
         "  --host 0.0.0.0 --port 8000 \\",
         "  --trust-remote-code --dtype auto \\",
-        "  --gpu-memory-utilization 0.75 \\",
-        "  --max-model-len 32768 --max-num-seqs 2 \\",
-        "  --kv-cache-dtype fp8 --enable-chunked-prefill \\",
+        # Placeholders are deliberately NOT shlex.quote'd: the comment above concerns
+        # dynamic atoms, and these must stay bash-expandable. The derived value is the
+        # default, so an unset environment reproduces today's script exactly.
+        f"  --gpu-memory-utilization ${{VLLM_GPU_MEMORY_UTILIZATION:-"
+        f"{_defaults['util']}}} \\",
     ]
-    if is_moe:
-        arg_lines.append("  --moe-backend marlin \\")
-    if "qwen" in info["name"].lower():
+    if is_gpt_oss:
+        # Full-precision KV (fp8 KV is unneeded on the 128 GB unified pool and adds
+        # sampling-tail noise on the harmony path); 65536 = ~324K token KV capacity.
         arg_lines += [
-            "  --enable-auto-tool-choice \\",
-            "  --tool-call-parser qwen3_coder \\",
+            f"  --max-model-len ${{VLLM_MAX_MODEL_LEN:-{_defaults['max_model_len']}}} \\",
+            f"  --max-num-seqs ${{VLLM_MAX_NUM_SEQS:-{_defaults['max_num_seqs']}}} \\",
+            "  --enable-chunked-prefill \\",
         ]
+    else:
+        arg_lines += [
+            f"  --max-model-len ${{VLLM_MAX_MODEL_LEN:-{_defaults['max_model_len']}}} \\",
+            f"  --max-num-seqs ${{VLLM_MAX_NUM_SEQS:-{_defaults['max_num_seqs']}}} \\",
+        ]
+        if resolved.get("kv_dtype") == "fp8":
+            arg_lines.append("  --kv-cache-dtype fp8 --enable-chunked-prefill \\")
+        else:
+            arg_lines.append("  --enable-chunked-prefill \\")
+    # On GB10 (sm_121) Marlin MoE miscomputes for some architectures; setting
+    # vllm.moe_backend to "" in config.json omits the flag and lets vLLM autoselect.
+    _moe_backend = _vllm_cfg.get("moe_backend", "marlin")
+    _moe_backend = "" if _moe_backend is None else str(_moe_backend).strip()
+    if (is_moe or is_gpt_oss) and _moe_backend:
+        if not _MOE_BACKEND_RE.match(_moe_backend):
+            raise HTTPException(400, "Invalid vllm.moe_backend: expected lowercase letters, "
+                                     "digits and underscores only.")
+        arg_lines.append(f"  --moe-backend {_moe_backend} \\")
+    if not is_gpt_oss:
+        tool_parser, reasoning_parser, capability_warnings = (
+            _capability_emission_details(_capability_entry(info)))
+        info["warnings"].extend(capability_warnings)
+        if tool_parser is not None:
+            arg_lines += [
+                "  --enable-auto-tool-choice \\",
+                f"  --tool-call-parser {shlex.quote(tool_parser)} \\",
+            ]
+        if reasoning_parser is not None:
+            arg_lines.append(
+                f"  --reasoning-parser {shlex.quote(reasoning_parser)} \\")
     arg_lines.append("  --generation-config vllm")
 
-    script = f"""#!/bin/bash
-# Name: HF {info['name']}
-# Description: Local HF snapshot via vLLM ({dtype}, {info['size_gb']:.1f} GB on disk)
-# VRAM: {info['vram_gb']}
-#
-# Auto-generated by DGX Model Manager from:
-# {launch_dir}
-set -euo pipefail
+    # Whether an explicit `vllm serve` is needed is a property of the IMAGE, not of the
+    # model family. Treating it as model-specific meant every generated non-gpt-oss script
+    # was unlaunchable whenever config.json pointed `vllm.image` at an exec-args image.
+    if is_gpt_oss:
+        image = _vllm_cfg.get("image_gpt_oss") or "eugr/spark-vllm:latest"
+    else:
+        image = _vllm_cfg.get("image") or "vllm/vllm-openai:v0.20.0"
+    _serve_cmd = _vllm_serve_command(image, _vllm_cfg)
+    if _serve_cmd:
+        arg_lines.insert(0, f"  {_serve_cmd} \\")
+    image = shlex.quote(str(image))
 
-docker rm -f vllm_node 2>/dev/null || true
-
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \\
+    preamble = _vllm_script_preamble(
+        info, launch_dir, recipe_backed=False, resolved=resolved)
+    script = preamble + _VLLM_OVERRIDE_GUARD + f"""docker run -d --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
-  vllm/vllm-openai:v0.20.0 \\
+  {image} \\
 {chr(10).join(arg_lines)}
 """
     return script_name, script, info
@@ -2341,6 +5078,253 @@ async def create_vllm_profile_from_hf(req: CreateVLLMProfileRequest):
     return _create_vllm_profile_from_path(req.path, req.model_name)
 
 
+# ─── Parameterize a legacy script (04-03) ─────────────────────────────────────
+# Single source of truth for flag → placeholder variable: the same allow-list the
+# override API validates against, so a script can never grow a placeholder the
+# override path would reject as unknown.
+_FLAG_TO_ENV = {
+    "--max-model-len": _OVERRIDE_ENV["max_model_len"][0],
+    "--gpu-memory-utilization": _OVERRIDE_ENV["gpu_memory_utilization"][0],
+    "--max-num-seqs": _OVERRIDE_ENV["max_num_seqs"][0],
+}
+
+
+def _placeholder_re(env_name: str):
+    return _re.compile(r"^\$\{" + _re.escape(env_name) + r":-[0-9]+(?:\.[0-9]+)?\}$")
+
+
+class ParameterizeRefused(Exception):
+    """A rewrite that would be partial. Refusing whole is the only safe answer:
+    the hand-tuned scripts carry root-cause writeups and are not reconstructible."""
+
+
+def _parameterize_script_text(text: str) -> tuple[str, list[str]]:
+    """Rewrite literal flag values into `${VLLM_*:-<literal>}` placeholders.
+
+    Pure and total: the original literal becomes the default, so an unset
+    environment reproduces the current script's behaviour byte-for-byte in argv.
+    Idempotent — a token that is already the exact placeholder is left alone.
+    Raises `ParameterizeRefused` if any target flag is present-but-not-literal or
+    absent entirely; a half-rewritten hand-tuned script is worse than none.
+    """
+    notes: list[str] = []
+    rewrote: dict[str, str] = {}
+    already: set = set()
+
+    lines = (text or "").splitlines(keepends=True)
+    out_lines = []
+    for raw in lines:
+        if raw.strip().startswith("#"):
+            out_lines.append(raw)
+            continue
+
+        def _sub(match):
+            flag, token = match.group(1), match.group(2)
+            env = _FLAG_TO_ENV[flag]
+            if _placeholder_re(env).match(token):
+                already.add(flag)
+                return match.group(0)
+            if not _NUM_RE.match(token):
+                raise ParameterizeRefused(
+                    f"{flag} value {token!r} is not a literal number — refusing to "
+                    f"rewrite this script (it would be a partial rewrite)")
+            if flag in rewrote and rewrote[flag] != token:
+                raise ParameterizeRefused(
+                    f"{flag} appears twice with different values "
+                    f"({rewrote[flag]!r} and {token!r}) — refusing")
+            rewrote[flag] = token
+            return f"{flag} ${{{env}:-{token}}}"
+
+        out_lines.append(_FLAG_RE.sub(_sub, raw))
+
+    missing = [f for f in _FLAG_TO_ENV if f not in rewrote and f not in already]
+    if missing:
+        raise ParameterizeRefused(
+            "script does not set " + ", ".join(sorted(missing)) +
+            " as a literal value — refusing rather than guessing a default")
+
+    for flag in sorted(rewrote):
+        notes.append(f"{flag} {rewrote[flag]} → ${{{_FLAG_TO_ENV[flag]}:-{rewrote[flag]}}}"
+                     " (same value; only the default changes source)")
+    for flag in sorted(already):
+        notes.append(f"{flag} is already parameterized — left unchanged")
+    return "".join(out_lines), notes
+
+
+_PROFILE_ID_RE = _re.compile(r"^start_[A-Za-z0-9._-]+$")
+
+
+def _resolve_profile_script(profile_id: str) -> Path:
+    """profile_id → the script Path, with no way out of the profile directory."""
+    if not _PROFILE_ID_RE.match(profile_id or ""):
+        raise HTTPException(400, "Invalid profile id")
+    target = (_engine_dirs["vllm"] / f"{profile_id}.sh")
+    if not _path_under(target, _engine_dirs["vllm"]) or not target.is_file():
+        raise HTTPException(404, "Profile script not found")
+    return target
+
+
+def _parameterize_preview(profile_id: str) -> dict:
+    target = _resolve_profile_script(profile_id)
+    current = target.read_text()
+    try:
+        proposed, notes = _parameterize_script_text(current)
+    except ParameterizeRefused as exc:
+        raise HTTPException(422, str(exc))
+    # Built server-side on purpose: the client never holds or resends script text,
+    # so the apply path cannot be fed attacker-authored content (T-04-13).
+    diff = "".join(difflib.unified_diff(
+        current.splitlines(keepends=True), proposed.splitlines(keepends=True),
+        fromfile=f"a/{target.name}", tofile=f"b/{target.name}"))
+    return {
+        "profile_id": profile_id,
+        "current": current,
+        "proposed": proposed,
+        "diff": diff,
+        "changed": proposed != current,
+        "notes": notes,
+        "sha256": hashlib.sha256(current.encode()).hexdigest(),
+    }
+
+
+class ParameterizeApplyRequest(BaseModel):
+    sha256: str
+
+
+def _parameterize_apply(profile_id: str, expect_sha: str) -> dict:
+    target = _resolve_profile_script(profile_id)
+    current = target.read_text()
+    actual = hashlib.sha256(current.encode()).hexdigest()
+    if not expect_sha or not hmac.compare_digest(actual, expect_sha.strip()):
+        # TOCTOU guard (T-04-12): ~3 concurrent sessions share this directory, so
+        # "the preview I showed you" and "the file on disk" are not the same claim.
+        raise HTTPException(409, (
+            "Profile script changed since the preview was generated "
+            f"(expected sha256 {expect_sha[:12]}…, on disk {actual[:12]}…). "
+            "Nothing was written — re-run the preview."))
+    try:
+        proposed, notes = _parameterize_script_text(current)
+    except ParameterizeRefused as exc:
+        raise HTTPException(422, str(exc))
+
+    backup = target.with_suffix(target.suffix + ".bak")
+    backup.write_text(current)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(proposed)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    _logger.info("Parameterized profile %s (backup %s)", target, backup.name)
+    return {"ok": True, "profile_id": profile_id, "backup": str(backup),
+            "notes": notes, "sha256": hashlib.sha256(proposed.encode()).hexdigest(),
+            "profile": _parse_script_meta(target)}
+
+
+@app.post("/api/vllm/profiles/{profile_id}/parameterize/preview",
+          dependencies=[Depends(verify_auth)])
+async def vllm_parameterize_preview(profile_id: str):
+    return _parameterize_preview(profile_id)
+
+
+@app.post("/api/vllm/profiles/{profile_id}/parameterize/apply",
+          dependencies=[Depends(verify_auth)])
+async def vllm_parameterize_apply(profile_id: str, req: ParameterizeApplyRequest):
+    return _parameterize_apply(profile_id, req.sha256)
+
+
+_active_downloads: set = set()  # (repo_id, local_dir) of in-progress HF downloads
+
+
+def _is_terminal_hf_event(ev: dict) -> bool:
+    """A download stream is finished once the worker reports complete or error."""
+    return isinstance(ev, dict) and ev.get("status") in ("complete", "error")
+
+
+# Cap on the stderr tail echoed back to the client. A traceback storm must not blow up the
+# SSE frame, and only the worker's own stderr is ever echoed — never sub_env, which carries
+# HF tokens and the rest of the process environment.
+_HF_STDERR_TAIL_CHARS = 2000
+
+
+async def _hf_download_events(sub_env: dict, repo_id: str,
+                              dl_key: tuple) -> AsyncGenerator[str, None]:
+    """Run the HF download worker and yield SSE frames, exactly one of them terminal.
+
+    Module-level (rather than nested in the route) so the terminal-event contract is
+    directly testable without a live HTTP request. The contract: every stream ends with
+    exactly one `complete` or `error` event. A worker that dies before emitting one — the
+    failure mode that hid the orphaned hf_transfer NameError — gets one synthesized here
+    from its return code and stderr tail, so a dead download can never look in-progress.
+    """
+    proc = None
+    saw_terminal = False
+    stderr_tail = ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=sub_env,
+        )
+        assert proc.stdout
+        async for raw in proc.stdout:
+            line = raw.decode().strip()
+            if not line:
+                continue
+            # Parse first, so a malformed line can't masquerade as an auto-profile failure.
+            try:
+                ev = json.loads(line)
+            except Exception:
+                yield f"data: {line}\n\n"
+                continue
+            if _is_terminal_hf_event(ev):
+                if saw_terminal:
+                    # Never emit a second terminal event; demote it to a log line.
+                    yield f"data: {json.dumps({'log': line})}\n\n"
+                    continue
+                saw_terminal = True
+            yield f"data: {line}\n\n"
+            if (ev.get("status") == "complete"
+                    and int(ev.get("errors", 0) or 0) == 0 and ev.get("path")):
+                try:
+                    profile_result = _create_vllm_profile_from_path(str(ev["path"]), repo_id)
+                    yield f"data: {json.dumps({'auto_profile': profile_result})}\n\n"
+                except Exception as profile_exc:
+                    yield f"data: {json.dumps({'auto_profile_error': str(profile_exc)})}\n\n"
+        stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
+        decoded = stderr_data.decode(errors="replace")
+        stderr_tail = "\n".join(
+            ln.strip() for ln in decoded.split("\n") if ln.strip()
+        )[-_HF_STDERR_TAIL_CHARS:]
+        for line in decoded.split("\n"):
+            stripped = line.strip()
+            if stripped and "%" not in stripped and "it/s" not in stripped:
+                yield f"data: {json.dumps({'log': stripped})}\n\n"
+        rc = await proc.wait()
+        if not saw_terminal:
+            # A silent worker is a failed worker, whatever its return code says.
+            msg = f"Download worker exited with code {rc} without reporting a result"
+            if stderr_tail:
+                msg += f": {stderr_tail}"
+            saw_terminal = True
+            yield f"data: {json.dumps({'status': 'error', 'error': msg, 'returncode': rc})}\n\n"
+    except Exception as e:
+        if not saw_terminal:
+            saw_terminal = True
+            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+    finally:
+        # Client disconnect (GeneratorExit) also lands here: terminate the
+        # child so it can't orphan and block on a full stdout pipe, and free
+        # the repo so a later download can start. A terminal event cannot be
+        # yielded from here after GeneratorExit, which is why the synthesized
+        # one belongs in the normal path above.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+        _active_downloads.discard(dl_key)
+
+
 @app.post("/api/hf/download", dependencies=[Depends(verify_auth)])
 async def hf_download(req: HFDownloadRequest):
     repo_id = req.repo_id.strip()
@@ -2372,50 +5356,39 @@ async def hf_download(req: HFDownloadRequest):
     sub_env = {**os.environ, "HF_REPO_ID": repo_id}
     if local_dir:
         sub_env["HF_LOCAL_DIR"] = local_dir
+    if req.ignore_patterns:
+        sub_env["HF_IGNORE_PATTERNS"] = json.dumps(req.ignore_patterns)
+    if req.allow_patterns:
+        sub_env["HF_ALLOW_PATTERNS"] = json.dumps(req.allow_patterns)
 
-    async def stream() -> AsyncGenerator[str, None]:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-c", _HF_DOWNLOAD_SCRIPT,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=sub_env,
-            )
-            assert proc.stdout
-            async for raw in proc.stdout:
-                line = raw.decode().strip()
-                if line:
-                    yield f"data: {line}\n\n"
-                    try:
-                        ev = json.loads(line)
-                        if ev.get("status") == "complete" and int(ev.get("errors", 0) or 0) == 0 and ev.get("path"):
-                            profile_result = _create_vllm_profile_from_path(str(ev["path"]), repo_id)
-                            yield f"data: {json.dumps({'auto_profile': profile_result})}\n\n"
-                    except Exception as profile_exc:
-                        yield f"data: {json.dumps({'auto_profile_error': str(profile_exc)})}\n\n"
-            stderr_data = await proc.stderr.read()  # type: ignore[union-attr]
-            for line in stderr_data.decode().split("\n"):
-                stripped = line.strip()
-                if stripped and "%" not in stripped and "it/s" not in stripped:
-                    yield f"data: {json.dumps({'log': stripped})}\n\n"
-            await proc.wait()
-        except Exception as e:
-            yield f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n"
+    # Reject a duplicate download of the same target while one is in progress.
+    # Two writers to the same HF cache blob corrupt/stall each other — this is
+    # easy to trigger by clicking Approve twice or reloading the stream.
+    dl_key = (repo_id, local_dir)
+    if dl_key in _active_downloads:
+        raise HTTPException(409, f"A download of {repo_id} is already in progress")
+    _active_downloads.add(dl_key)
 
     return StreamingResponse(
-        stream(), media_type="text/event-stream",
+        _hf_download_events(sub_env, repo_id, dl_key), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _all_profiles() -> list:
+    """(profile, engine_name) pairs across every engine, for script cross-refs."""
+    _script_content_cache.clear()
+    pairs = []
+    for ek, ev in _ENGINES.items():
+        pairs += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    return pairs
 
 
 @app.get("/api/hf/inventory")
 async def hf_inventory():
     """Scan HF cache + custom dirs and return model inventory."""
     # Build profile list once for all models (avoids re-scanning per model)
-    _script_content_cache.clear()
-    all_profiles = []
-    for ek, ev in _ENGINES.items():
-        all_profiles += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    all_profiles = _all_profiles()
 
     custom_dirs = _load_custom_dirs()
     directories = []
@@ -2436,10 +5409,7 @@ async def hf_inventory():
 @app.get("/api/inventory")
 async def unified_inventory(include_ollama: bool = True):
     """Unified inventory: HF cache + custom dirs + optionally Ollama models."""
-    _script_content_cache.clear()
-    all_profiles = []
-    for ek, ev in _ENGINES.items():
-        all_profiles += [(p, ev["name"]) for p in _scan_profiles(ek)]
+    all_profiles = _all_profiles()
 
     custom_dirs = _load_custom_dirs()
     directories = []
@@ -2545,6 +5515,50 @@ async def remove_inventory_dir(path: str):
 
 class DeleteModelRequest(BaseModel):
     path: str
+    force: bool = False
+
+
+async def _model_dir_in_use(target: Path) -> Optional[str]:
+    """Return the name of a running container serving files under `target`, or None.
+
+    A delete can pull weights out from under a live engine: it keeps serving from
+    page cache and then fails at the next load with an error pointing nowhere near
+    this endpoint.
+
+    Docker metadata alone is not a reliable signal. The GB10 vLLM container runs
+    `sleep infinity` with the whole HF cache bind-mounted and the model launched
+    inside it, so neither Cmd nor Mounts names the model. Ask each engine what it
+    is actually serving.
+    """
+    # models--owner--name → "owner/name"
+    stem = target.name
+    if stem.startswith("models--"):
+        parts = stem[8:].split("--", 1)
+        served_candidates = {"/".join(parts).lower(), parts[-1].lower()}
+    else:
+        served_candidates = {stem.lower()}
+
+    for key, eng in _ENGINES.items():
+        models_path = eng.get("models_path")
+        if not models_path:
+            continue
+        try:
+            r = await _http.get(_engine_bases[key] + models_path, timeout=3.0)
+            ids = [d.get("id", "") for d in r.json().get("data", [])]
+        except Exception:
+            continue
+        for mid in ids:
+            if mid.lower() in served_candidates or mid.lower().endswith("/" + stem.lower()):
+                return f"{eng['name']} (serving {mid})"
+
+    # Secondary: an explicit path in a container's argv (non-`sleep` launches).
+    result = await _run("docker", "ps", "--format", "{{.Names}}", timeout=5)
+    for name in [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]:
+        insp = await _run("docker", "inspect", name,
+                          "--format", "{{json .Config.Cmd}}", timeout=5)
+        if insp.returncode == 0 and target.name in insp.stdout:
+            return name
+    return None
 
 
 @app.post("/api/hf/inventory/delete", dependencies=[Depends(verify_auth)])
@@ -2556,6 +5570,12 @@ async def delete_inventory_model(req: DeleteModelRequest):
     allowed_roots = [HF_CACHE_DIR.resolve()]
     for d in _load_custom_dirs():
         allowed_roots.append(Path(os.path.expanduser(d)).resolve())
+    # A root is not a model. `relative_to(root)` succeeds for root itself, so
+    # without this an allowed root passes every check below and rmtree takes the
+    # entire cache — 282 GB in the case of /opt/models/hub.
+    if target in allowed_roots:
+        raise HTTPException(400, "Refusing to delete a model root directory")
+
     allowed = False
     for root in allowed_roots:
         try:
@@ -2566,16 +5586,51 @@ async def delete_inventory_model(req: DeleteModelRequest):
             continue
     if not allowed:
         raise HTTPException(400, "Path is not under a known model directory")
+    if not _looks_like_model_dir(target):
+        raise HTTPException(400, f"'{target.name}' is not a single model directory")
     if not target.exists():
         raise HTTPException(404, "Directory not found")
     if not target.is_dir():
         raise HTTPException(400, "Path is not a directory")
 
+    # Never delete weights a running engine is serving, even with force.
+    in_use = await _model_dir_in_use(target)
+    if in_use:
+        raise HTTPException(
+            409, f"Model is in use by running container '{in_use}' — stop it first")
+
+    # A profile script pointing at deleted weights fails only at next launch, so
+    # surface the cross-reference here and require an explicit override.
+    if not req.force:
+        stem = target.name
+        if stem.startswith("models--"):
+            stem = stem[8:].split("--", 1)[-1]
+        has_script, engine = _check_script_xref(stem, _all_profiles())
+        if has_script:
+            raise HTTPException(
+                409, f"A {engine} profile script references this model — "
+                     f"delete the profile first, or re-send with force")
+
     try:
         shutil.rmtree(target)
         return {"ok": True, "deleted": str(target)}
+    except PermissionError:
+        pass
     except Exception as e:
         raise HTTPException(500, f"Failed to delete: {e}")
+
+    # Models pulled by a root-run downloader land root-owned (everything under
+    # /opt/models is), and the service runs as the login user. Every safety check
+    # above has already passed by this point; `_run` takes argv, so no shell.
+    r = await _run("sudo", "-n", "rm", "-rf", "--", str(target), timeout=300)
+    if r.returncode != 0:
+        raise HTTPException(
+            500, f"'{target.name}' is owned by another user and passwordless sudo "
+                 f"is unavailable: {(r.stdout + r.stderr).strip()[:200]}")
+    if target.exists():
+        raise HTTPException(500, f"Delete reported success but {target} still exists")
+    _logger.info("Deleted model dir %s (via sudo)", target)
+    return {"ok": True, "deleted": str(target), "sudo": True}
 
 # ── HF Metadata & Search ────────────────────────────────────────────────────
 
@@ -3349,6 +6404,38 @@ a.model-card:hover{border-color:var(--amber)}
 .prog-bar{height:100%;background:var(--amber);border-radius:2px;transition:width .3s;width:0}
 .prog-bar.spin{width:35%!important;animation:pgslide 1.2s ease-in-out infinite}
 @keyframes pgslide{0%{transform:translateX(-200%)}100%{transform:translateX(500%)}}
+/* Phase line above the bar: the bar alone cannot distinguish a 30s weight load
+   from a 65s torch.compile, and that ambiguity is what made a dead container
+   look like a slow one. */
+.prog-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px}
+.prog-phase{font-size:12px;font-weight:600;color:var(--text)}
+.prog-meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.preflight-wrap{margin-top:12px}
+.preflight-wrap:empty{display:none}
+.preflight-head{
+  display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  font-size:12px;font-weight:600;padding:8px 10px;border-radius:5px 5px 0 0;
+  border:1px solid var(--border);border-bottom:none;background:var(--s2);
+}
+.preflight-head.pf-ok{color:var(--green)}
+.preflight-head.pf-warn{color:var(--amber)}
+.preflight-head.pf-fail{color:var(--red)}
+.preflight-budget{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--muted)}
+.preflight-row{
+  border:1px solid var(--border);border-top:none;padding:8px 10px;
+  border-left:3px solid var(--border);background:#04040a;
+}
+.preflight-row:last-child{border-radius:0 0 5px 5px}
+.preflight-row.pf-ok{border-left-color:var(--green)}
+.preflight-row.pf-warn{border-left-color:var(--amber)}
+.preflight-row.pf-fail{border-left-color:var(--red)}
+.preflight-row.pf-skip{border-left-color:var(--muted);opacity:.65}
+.pf-title{font-size:12px;font-weight:600;color:var(--text)}
+.pf-detail{font-size:11px;color:var(--muted);line-height:1.6;margin-top:3px}
+.pf-fix{
+  font-family:var(--mono);font-size:11px;color:var(--amber);
+  margin-top:5px;white-space:pre-wrap;word-break:break-word;
+}
 .prog-log{
   font-family:var(--mono);font-size:11px;color:var(--muted);
   background:#04040a;border:1px solid var(--border);
@@ -3386,9 +6473,32 @@ a.model-card:hover{border-color:var(--amber)}
 .engine-actions{margin-left:auto;display:flex;gap:6px}
 
 /* ── Profile list ── */
+.recipe-bar{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 10px;
+  border:1px solid var(--border);border-radius:8px;background:var(--s2)}
+.recipe-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.recipe-select{font-family:var(--mono);font-size:12px;color:var(--text);background:var(--s1);
+  border:1px solid var(--border2);border-radius:6px;padding:5px 8px;min-width:230px}
+.recipe-select:focus{outline:none;border-color:var(--amber)}
+.recipe-desc{font-size:11px;color:var(--muted);line-height:1.4;flex:1}
 .profile-list{display:flex;flex-direction:column;gap:6px}
+/* 04-02 launch-settings panel: only the selected card shows it, so the list stays
+   scannable and the inputs visibly reset when the selection moves. */
+.p-settings{flex-basis:100%;display:none;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);cursor:default}
+.profile-item.selected .p-settings{display:block}
+.p-set-row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+.p-set-field{display:flex;flex-direction:column;gap:3px}
+.p-set-field label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.p-set-field input{
+  width:110px;background:var(--s0);border:1px solid var(--border);border-radius:5px;
+  color:var(--fg);font-family:var(--mono);font-size:11px;padding:4px 6px;
+}
+.p-set-field input:disabled{opacity:.45}
+.p-set-rec{font-size:10px;color:var(--amber);font-family:var(--mono)}
+.p-set-note{font-size:10px;color:var(--dim);margin-top:6px}
+.p-set-warn{font-size:10px;color:var(--amber);margin-top:6px;font-family:var(--mono)}
+.p-set-error{font-size:11px;color:var(--red,#e05252);margin-top:6px;font-weight:600}
 .profile-item{
-  display:flex;align-items:center;gap:12px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
   padding:12px 14px;
   background:var(--s1);border:1px solid var(--border);
   border-radius:8px;cursor:pointer;
@@ -3406,6 +6516,18 @@ a.model-card:hover{border-color:var(--amber)}
 .p-name{font-size:13px;font-weight:600}
 .p-desc{font-size:11px;color:var(--muted);margin-top:2px}
 .p-vram{font-family:var(--mono);font-size:11px;color:var(--amber);flex-shrink:0}
+/* Hidden until row hover: destructive controls should not sit under the cursor
+   on a list whose primary action is selecting a profile to launch. */
+.subtabs{display:flex;align-items:center;gap:4px;margin:0 0 10px;border-bottom:1px solid var(--border)}
+.subtab{
+  background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);
+  font-family:inherit;font-size:12px;font-weight:600;padding:7px 12px;cursor:pointer;
+}
+.subtab:hover{color:var(--fg)}
+.subtab.active{color:var(--amber);border-bottom-color:var(--amber)}
+.subtab-note{margin-left:auto;font-size:11px;color:var(--dim);font-family:var(--mono)}
+.p-actions{display:flex;gap:4px;flex-shrink:0;margin-left:8px;opacity:0;transition:opacity .12s}
+.profile-item:hover .p-actions,.profile-item.selected .p-actions{opacity:1}
 
 /* ── Config block ── */
 .config-block{
@@ -3858,6 +6980,10 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       <span class="nav-icon">💡</span>Recommendations
       <span class="nav-badge" id="badge-recs">—</span>
     </div>
+    <div class="nav-item" id="nav-updates" onclick="switchTab('updates')">
+      <span class="nav-icon">📦</span>Updates
+      <span class="nav-badge" id="badge-updates">—</span>
+    </div>
     <div class="nav-section-label">Routing</div>
     <div class="nav-item" id="nav-litellm" onclick="switchTab('litellm')">
       <span class="nav-icon">⚡</span>LiteLLM
@@ -4094,18 +7220,33 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
         Name, description, and VRAM are read from optional header comments in the script:<br>
         <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;\u00b7&nbsp; # Description: ... &nbsp;\u00b7&nbsp; # VRAM: 119</code>
       </div>
-      <div class="sec-label">Profiles</div>
+      <div class="subtabs" id="{k}-subtabs">
+        <button class="subtab active" id="{k}-subtab-models" onclick="setProfileView('{k}','models')">Models</button>
+        <button class="subtab" id="{k}-subtab-profiles" onclick="setProfileView('{k}','profiles')">Profiles</button>
+        <span class="subtab-note" id="{k}-subtab-note"></span>
+      </div>
+      <div class="recipe-bar" id="{k}-recipe-bar" style="display:none">
+        <label class="recipe-label" for="{k}-recipe">Recipe</label>
+        <select class="recipe-select" id="{k}-recipe" onchange="selectRecipe('{k}', this.value)"></select>
+        <span class="recipe-desc" id="{k}-recipe-desc"></span>
+      </div>
       <div class="profile-list" id="{k}-profile-list">
         <div class="empty"><div class="spin-icon" style="margin:0 auto"></div></div>
       </div>
       <div style="display:flex;align-items:center;gap:12px;margin-top:14px">
         <button class="btn btn-primary" id="{k}-start-btn" onclick="startEngine(engines.{k})">\u25b6 Start Selected</button>
-        <span style="font-size:12px;color:var(--muted)">Runs start script in background \u00b7 check status pill</span>
+        <button class="btn" id="{k}-dryrun-btn" onclick="dryRunProfile(engines.{k})">\u2697 Dry Run</button>
+        <span style="font-size:12px;color:var(--muted)">Dry Run checks the launch without loading weights</span>
       </div>
       <div class="progress-wrap" id="{k}-progress" style="margin-top:14px">
-        <div class="prog-bar-outer"><div class="prog-bar spin"></div></div>
+        <div class="prog-head" id="{k}-prog-head">
+          <span class="prog-phase" id="{k}-prog-phase">Starting\u2026</span>
+          <span class="prog-meta" id="{k}-prog-meta"></span>
+        </div>
+        <div class="prog-bar-outer"><div class="prog-bar spin" id="{k}-prog-bar"></div></div>
         <div class="prog-log" id="{k}-log"></div>
       </div>
+      <div id="{k}-preflight" class="preflight-wrap"></div>
     </div>
 ''' for k, e in _ENGINES.items()) + r"""
     <!-- ─── WARM MODELS ─── -->
@@ -4371,10 +7512,20 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
 
     <!-- ─── DASHBOARDS ─── -->
     <div class="tab" id="tab-sites">
-      <div class="page-hdr">
-        <div class="page-title">Dashboards</div>
-        <div class="page-sub">Other web UIs served on this box. Managed via the <code>sites</code> array in <code>config.json</code>.</div>
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Dashboards</div>
+          <div class="page-sub">Web UIs running on this box right now &mdash; discovered from listening ports and Kubernetes NodePorts. Names and groups can be curated via the <code>sites</code> array in <code>config.json</code>.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;white-space:nowrap">
+          <label class="page-sub" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer"
+                 title="Also show ports that answered with JSON or plain text instead of a page (APIs, exporters).">
+            <input type="checkbox" id="sites-show-api" onchange="renderSites()"> APIs
+          </label>
+          <button class="btn btn-sm" onclick="loadSites(true)" title="Re-probe every listening port">&#8635; Rescan</button>
+        </div>
       </div>
+      <div id="sites-meta" class="page-sub" style="margin-bottom:14px"></div>
       <div id="sites-root">
         <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
       </div>
@@ -4397,12 +7548,39 @@ details[open]>.debug-section-hdr::before{transform:rotate(90deg)}
       </div>
     </div>
 
+    <div class="tab" id="tab-updates">
+      <div class="page-hdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px">
+        <div>
+          <div class="page-title">Image Updates</div>
+          <div class="page-sub">How far each <code>llm-inference</code> image is behind upstream. Read-only &mdash; apply via <code>ai-infra/k8s/inference/UPGRADING.md</code>.</div>
+        </div>
+        <button class="btn btn-sm" id="updates-refresh-btn" onclick="refreshImageDrift()"
+                title="Query GitHub / Docker Hub for the newest release in each image's version track (~10-30s). Reports only; nothing is applied.">&#8635; Check now</button>
+      </div>
+      <div id="updates-meta" class="page-sub" style="margin-bottom:14px"></div>
+      <div id="updates-root">
+        <div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>
+      </div>
+    </div>
+
   </main>
 </div>
 
 <div id="toast-root"></div>
 
 <script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Escaping. ONE helper for the whole UI (T-04-16): escape at the DOM sink, in JS,
+// exactly once. Covers all five of & < > " ' so it is safe in both element-text
+// and quoted-attribute position. `q` (further down) escapes for a JS STRING
+// literal and is NOT an HTML escaper — a bare `q` in an onclick= attribute is
+// still breakable with a double quote, so attribute sites need esc(q(x)).
+// Do not add per-site .replace('<','&lt;') calls: 86 innerHTML sinks is exactly
+// how the original gap happened.
+// ─────────────────────────────────────────────────────────────────────────────
+const _ESC_MAP = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => _ESC_MAP[c]);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4544,6 +7722,7 @@ function switchTab(name) {
   else if (name === 'debug') { loadDebugTab(); }
   else if (name === 'sites') { loadSites(); }
   else if (name === 'recs') { loadRecommendations(); loadProposed(); }
+  else if (name === 'updates') { loadImageDrift(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4612,48 +7791,83 @@ function setPill(id, ok, label) {
 // Dashboards
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function loadSites() {
+let _lastSites = null;
+
+async function loadSites(rescan) {
   const root = document.getElementById('sites-root');
+  const meta = document.getElementById('sites-meta');
+  if (rescan) root.innerHTML = '<div class="empty"><div class="spin-icon" style="margin:0 auto 8px"></div></div>';
   try {
-    const d = await apiFetch('/api/sites');
-    const sites = d.sites || [];
-    if (!sites.length) {
-      root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
-        '<div class="empty-text">No dashboards configured &mdash; add a <code>sites</code> array to config.json</div></div>';
-      return;
-    }
-    // Group cards under sec-label headings; ungrouped entries land in "Other".
-    const groups = new Map();
-    sites.forEach(s => {
-      const g = s.group || 'Other';
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(s);
-    });
-    let html = '';
-    for (const [group, entries] of groups) {
-      html += '<div class="sec-label">' + _escHtml(group) + '</div>';
-      html += '<div class="model-grid">' + entries.map(s => {
-        let hostLabel = s.url;
-        try { hostLabel = new URL(s.url).host; } catch(e) {}
-        const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
-        const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
-        const href = _escHtml(s.url).replace(/"/g, '&quot;');
-        return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
-          '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
-          '<div class="model-card-info">' +
-            '<div class="model-card-name">' + _escHtml(s.name) + '</div>' +
-            '<div class="model-card-meta">' + _escHtml(hostLabel) +
-              (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
-          '</div>' +
-          '<div class="model-card-right"><span class="tag tag-amber">open ↗</span></div>' +
-        '</a>';
-      }).join('') + '</div>';
-    }
-    root.innerHTML = html;
+    _lastSites = await apiFetch('/api/sites' + (rescan ? '?refresh=1' : ''));
+    const dd = _lastSites.discovery || {};
+    const bits = [];
+    if (dd.enabled === false) bits.push('discovery disabled &mdash; showing config only');
+    else bits.push(dd.candidates + ' listening ports probed &middot; ' + dd.ui + ' UIs, ' + dd.api + ' APIs');
+    if (dd.host && dd.host.ok === false) bits.push('host scan failed: ' + _escHtml(dd.host.error || ''));
+    if (dd.kubernetes && dd.kubernetes.ok === false) bits.push('kubectl unavailable');
+    if (_lastSites.cached_age_s) bits.push('cached ' + _lastSites.cached_age_s + 's ago');
+    meta.innerHTML = bits.join(' &middot; ');
+    renderSites();
   } catch(e) {
     root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>' +
-      '<div class="empty-text">Could not load dashboards · ' + _escHtml(e.message) + '</div></div>';
+      '<div class="empty-text">Could not load dashboards &middot; ' + _escHtml(e.message) + '</div></div>';
   }
+}
+
+function renderSites() {
+  const root = document.getElementById('sites-root');
+  if (!_lastSites) return;
+  const showApi = document.getElementById('sites-show-api').checked;
+  const sites = (_lastSites.sites || []).filter(s => showApi || s.kind !== 'api');
+  if (!sites.length) {
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#128202;</div>' +
+      '<div class="empty-text">No web UIs found on this box</div></div>';
+    return;
+  }
+  // Two services can share a <title> ("Node Exporter" on :9100 and :9101) — a
+  // repeated name makes the pair unreadable, so it earns its port back.
+  const nameCount = {};
+  sites.forEach(s => { nameCount[s.name] = (nameCount[s.name] || 0) + 1; });
+  const label = s => nameCount[s.name] > 1 && s.port ? s.name + ' :' + s.port : s.name;
+
+  // Group cards under sec-label headings. Curated groups keep their meaning and
+  // sort first; the auto-assigned buckets fall to the bottom of the page.
+  const TAIL = ['Kubernetes', 'Host', 'Other'];
+  const groups = new Map();
+  sites.forEach(s => {
+    const g = s.group || 'Other';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(s);
+  });
+  const order = [...groups.keys()].sort((a, b) => {
+    const ai = TAIL.indexOf(a), bi = TAIL.indexOf(b);
+    if (ai !== bi) return (ai < 0 ? -1 : ai) - (bi < 0 ? -1 : bi);
+    return a.localeCompare(b);
+  });
+  let html = '';
+  for (const group of order) {
+    html += '<div class="sec-label">' + _escHtml(group) + '</div>';
+    html += '<div class="model-grid">' + groups.get(group).map(s => {
+      let hostLabel = s.url;
+      try { hostLabel = new URL(s.url).host; } catch(e) {}
+      const dotCls = s.reachable === true ? ' ok' : (s.reachable === false ? ' err' : '');
+      const dotTitle = s.reachable === true ? 'reachable' : (s.reachable === false ? 'unreachable' : 'unknown');
+      const href = _escHtml(s.url).replace(/"/g, '&quot;');
+      const tag = s.kind === 'api'
+        ? '<span class="tag">api</span>'
+        : '<span class="tag tag-amber">open ↗</span>';
+      return '<a class="model-card" href="' + href + '" target="_blank" rel="noopener">' +
+        '<span class="site-dot' + dotCls + '" title="' + dotTitle + '"></span>' +
+        '<div class="model-card-info">' +
+          '<div class="model-card-name">' + _escHtml(label(s)) + '</div>' +
+          '<div class="model-card-meta">' + _escHtml(hostLabel) +
+            (s.desc ? ' · ' + _escHtml(s.desc) : '') + '</div>' +
+        '</div>' +
+        '<div class="model-card-right">' + tag + '</div>' +
+      '</a>';
+    }).join('') + '</div>';
+  }
+  root.innerHTML = html;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4665,6 +7879,7 @@ const _SEV = {
   medium: { label: 'MEDIUM', bg: 'rgba(245,158,11,.15)', fg: '#fbbf24' },
   low:    { label: 'INFO',   bg: 'rgba(148,163,184,.15)', fg: '#94a3b8' },
 };
+let _lastRecs = [];  // last fired recommendations, for approve/apply lookups by id
 
 async function loadRecommendations() {
   const root = document.getElementById('recs-root');
@@ -4672,6 +7887,7 @@ async function loadRecommendations() {
   try {
     const d = await apiFetch('/api/recommendations');
     const recs = d.recommendations || [];
+    _lastRecs = recs;
     document.getElementById('badge-recs').textContent = recs.length;
     const st = d.state || {};
     meta.innerHTML = _escHtml((d.meta && d.meta.hardware) || '') +
@@ -4700,6 +7916,21 @@ async function loadRecommendations() {
         'style="color:var(--blue);text-decoration:none">' +
         _escHtml((s.note || s.url)) + (s.date ? ' (' + _escHtml(s.date) + ')' : '') + '</a>'
       ).join(' · ');
+      const rid = (r.id || '').replace(/'/g, "\\'");
+      const actions = [];
+      if (r.kind === 'model' && r.download && r.download.repo_id) {
+        actions.push('<button class="btn btn-sm btn-primary" onclick="approveModel(\'' + rid + '\')">' +
+          '⬇ Approve &amp; download</button>');
+      }
+      if (r.apply && (r.fired_for || []).length) {
+        r.fired_for.forEach(h => {
+          const pid = (h.profile || '').replace(/'/g, "\\'");
+          actions.push('<button class="btn btn-sm" onclick="applyRec(\'' + rid + '\',\'' + pid + '\')">' +
+            '✎ Apply to ' + _escHtml(h.profile.replace(/^start_/, '').replace(/\.sh$/, '')) + '</button>');
+        });
+      }
+      const actionBar = actions.length
+        ? '<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">' + actions.join('') + '</div>' : '';
       return '<div class="model-card" style="display:block;cursor:default;margin-bottom:12px">' +
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
           chip(sev.label, 'background:' + sev.bg + ';color:' + sev.fg) +
@@ -4712,6 +7943,7 @@ async function loadRecommendations() {
           _escHtml(r.action) + '</div>' +
         fired +
         (src ? '<div class="model-card-meta" style="margin-top:10px;font-size:12px">Sources: ' + src + '</div>' : '') +
+        actionBar +
       '</div>';
     }).join('');
   } catch(e) {
@@ -4785,6 +8017,286 @@ async function refreshKB() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Image drift — read-only. Every row is a statement about upstream, never an
+// action: there is no apply button here by design, because the risky half of an
+// upgrade (forward-only schema migrations) needs a human and a PVC backup.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _DRIFT_LABEL = {
+  outdated: ['Update available', 'var(--warn, #d98324)'],
+  current:  ['Up to date',       'var(--ok, #3fa66a)'],
+  unknown:  ['Unresolved',       'var(--muted)'],
+  partial:  ['Floating tag',     'var(--muted)'],
+  rolling:  ['Rolling tag',      'var(--muted)'],
+  digest:   ['Digest-pinned',    'var(--muted)'],
+};
+
+function renderImageDrift(d) {
+  const root = document.getElementById('updates-root');
+  const meta = document.getElementById('updates-meta');
+  const rows = (d && d.rows) || [];
+
+  if (!rows.length) {
+    root.innerHTML = '<div class="empty">' +
+      (d && d.exists === false
+        ? 'No report yet — press <b>Check now</b>.'
+        : esc((d && (d.errors || [])[0]) || 'No images found.')) + '</div>';
+    meta.textContent = '';
+    document.getElementById('badge-updates').textContent = '—';
+    return;
+  }
+
+  const order = {outdated:0, unknown:1, current:2, partial:3, rolling:4, digest:5};
+  rows.sort((a,b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) ||
+                     a.deployment.localeCompare(b.deployment));
+
+  const outdated = rows.filter(r => r.status === 'outdated').length;
+  document.getElementById('badge-updates').textContent = outdated || '0';
+
+  let html = '<div class="inv-table-wrap" style="border-radius:8px;border:1px solid var(--border)">' +
+             '<table class="inv-table"><thead><tr>' +
+             '<th>Deployment</th><th>Running</th><th>Latest in track</th><th>Status</th>' +
+             '</tr></thead><tbody>';
+  for (const r of rows) {
+    const [label, color] = _DRIFT_LABEL[r.status] || [r.status, 'var(--muted)'];
+    const running = r.tag || (r.image || '').split('@')[1] || '—';
+    let latest = r.latest ? esc(r.latest) : '<span style="color:var(--muted)">—</span>';
+    if (r.latest && r.verified === false) latest += ' <span title="Not present in the registry tag list — confirm before applying">*</span>';
+    html += '<tr><td><b>' + esc(r.deployment) + '</b></td>' +
+            '<td><code>' + esc(running) + '</code></td>' +
+            '<td><code>' + latest + '</code></td>' +
+            '<td style="color:' + color + '">' + esc(label) + '</td></tr>';
+    if (r.note) {
+      html += '<tr><td></td><td colspan="3" class="page-sub" style="padding-top:0">' +
+              esc(r.note) + '</td></tr>';
+    }
+  }
+  html += '</tbody></table></div>';
+
+  const stale = rows.filter(r => r.status === 'unknown').length;
+  html += '<div class="page-sub" style="margin-top:10px">' +
+    'Comparison stays inside each image’s version track, so a major-version move ' +
+    '(Postgres 15→16, Prometheus v2→v3) is deliberately not shown as an update — ' +
+    'those are migrations, not bumps. Floating and digest-pinned tags have nothing to compare against.' +
+    (stale ? ' <b>' + stale + '</b> image(s) could not be resolved upstream.' : '') +
+    '</div>';
+  root.innerHTML = html;
+
+  if (d.checked_at) {
+    const when = new Date(d.checked_at * 1000);
+    meta.textContent = outdated + ' of ' + rows.length + ' image(s) behind upstream · checked ' +
+                       when.toLocaleString();
+  }
+}
+
+async function loadImageDrift() {
+  try {
+    renderImageDrift(await apiFetch('/api/images/drift'));
+  } catch(e) { /* non-fatal: panel shows its empty state */ }
+}
+
+async function refreshImageDrift() {
+  const btn = document.getElementById('updates-refresh-btn');
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Checking…';
+  try {
+    const d = await apiFetch('/api/images/check', 'POST');
+    renderImageDrift(d);
+    const n = (d.rows || []).filter(r => r.status === 'outdated').length;
+    toast(n ? '✓ ' + n + ' image(s) behind upstream' : '✓ All tracked images current', n ? '' : 'ok');
+  } catch(e) {
+    toast('Image check failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = orig;
+  }
+}
+
+// Approve a model recommendation → confirm the HF repo, then run the existing
+// download flow (SSE), which auto-wires a vLLM profile on completion.
+function closeRecModal() { const m = document.getElementById('rec-modal'); if (m) m.remove(); }
+
+function approveModel(id) {
+  const r = _lastRecs.find(x => x.id === id);
+  if (!r || !r.download) { toast('No download info for this recommendation', 'err'); return; }
+  window._approveRecId = id;
+  const repo = r.download.repo_id || '';
+  const dir = r.download.local_dir || '';
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:520px;max-width:92vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Approve &amp; download</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:16px">' + _escHtml(r.title) +
+        '. This pulls the model from Hugging Face and auto-creates a vLLM profile when the download finishes.</div>' +
+      '<label style="font-size:11px;color:var(--muted)">HF repo</label>' +
+      '<input class="input" id="rec-dl-repo" value="' + _escHtml(repo).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="owner/model-name" style="width:100%;margin:4px 0 12px">' +
+      '<label style="font-size:11px;color:var(--muted)">Target dir (blank = HF cache)</label>' +
+      '<input class="input" id="rec-dl-dir" value="' + _escHtml(dir).replace(/"/g, '&quot;') + '" ' +
+        'placeholder="~/.cache/huggingface" style="width:100%;margin:4px 0 12px">' +
+      '<div id="rec-dl-progress" style="display:none;margin:8px 0 4px">' +
+        '<div class="prog" style="height:6px;background:var(--s2);border-radius:4px;overflow:hidden">' +
+          '<div id="rec-dl-bar" class="prog-bar" style="height:100%;width:0"></div></div>' +
+        '<pre id="rec-dl-log" style="font-size:11px;color:var(--muted);margin:8px 0 0;white-space:pre-wrap;' +
+          'max-height:160px;overflow:auto"></pre>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">' +
+        '<button class="btn btn-sm" id="rec-dl-close" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-dl-go" onclick="startApproveDownload(\'' +
+          id.replace(/'/g, "\\'") + '\')">Download</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  document.getElementById('rec-dl-repo').focus();
+}
+
+async function startApproveDownload(id) {
+  const repo = document.getElementById('rec-dl-repo').value.trim();
+  const dir = document.getElementById('rec-dl-dir').value.trim();
+  if (!repo) { document.getElementById('rec-dl-repo').focus(); return; }
+  const go = document.getElementById('rec-dl-go');
+  const cancel = document.getElementById('rec-dl-close');
+  const prog = document.getElementById('rec-dl-progress');
+  const bar = document.getElementById('rec-dl-bar');
+  const log = document.getElementById('rec-dl-log');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Downloading…';
+  prog.style.display = 'block';
+  bar.className = 'prog-bar spin';
+  const lines = ['Starting download: ' + repo];
+  log.textContent = lines[0];
+  let wired = false;
+  try {
+    const r = _lastRecs.find(x => x.id === (window._approveRecId || ''));
+    const dl = (r && r.download) || {};
+    const resp = await fetch('/api/hf/download', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({repo_id: repo, local_dir: dir || undefined,
+        ignore_patterns: dl.ignore_patterns, allow_patterns: dl.allow_patterns}),
+    });
+    if (!resp.ok) {
+      let msg = resp.statusText;
+      try { const d = await resp.json(); msg = d.detail || JSON.stringify(d); } catch(e) {}
+      throw new Error(msg);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        let ev; try { ev = JSON.parse(line.slice(6)); } catch(e) { continue; }
+        if (ev.file_start) {
+          const f = ev.file_start;
+          bar.className = 'prog-bar spin';
+          lines.push('[' + f.idx + '/' + f.total + '] ⤓ ' + f.name + ' (' + f.size_str + ')…');
+        } else if (ev.progress) {
+          const p = ev.progress;
+          bar.className = 'prog-bar'; bar.style.width = p.pct + '%';
+          lines[lines.length - 1] = '[' + p.idx + '/' + p.total_files + '] ✓ ' + p.file + '  ·  ' +
+            p.pct + '%  ·  ' + p.done_mb.toFixed(0) + ' / ' + p.total_mb.toFixed(0) + ' MB  ·  ' + p.speed;
+        } else if (ev.status && typeof ev.status === 'string' && ev.status !== 'complete' && ev.status !== 'error') {
+          lines.push(ev.status);  // "Skipping N files…", "Found N files…"
+        } else if (ev.status === 'complete') {
+          bar.className = 'prog-bar'; bar.style.width = '100%';
+          lines.push('✓ Downloaded → ' + ev.path + (ev.errors > 0 ? '  ⚠ ' + ev.errors + ' error(s)' : ''));
+          toast('✓ Downloaded: ' + repo, 'ok');
+        } else if (ev.auto_profile) {
+          wired = true;
+          const p = ev.auto_profile.profile || {};
+          lines.push('✓ vLLM profile wired: ' + (p.name || p.id || 'profile'));
+          toast('✓ Profile wired — recommendation satisfied', 'ok');
+        } else if (ev.auto_profile_error) {
+          lines.push('⚠ Profile not auto-created: ' + ev.auto_profile_error);
+        } else if (ev.status === 'error') {
+          throw new Error(ev.error || 'download failed');
+        } else if (ev.log) {
+          lines.push(ev.log);
+        }
+        log.textContent = lines.join('\n');
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    go.innerHTML = wired ? '✓ Done' : 'Finished';
+    cancel.textContent = 'Close';
+    loadRecommendations();          // fired model rec should now clear
+    loadEngineProfiles(engines.vllm);
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch(e) {
+    bar.className = 'prog-bar'; bar.style.width = '0';
+    lines.push('✗ ' + e.message);
+    log.textContent = lines.join('\n');
+    toast('Download failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Retry';
+  }
+}
+
+// Apply a config/tuning rec to a flagged profile: fetch a diff preview, then
+// confirm to write the edited start script.
+function _diffHtml(diff) {
+  return (diff || '').split('\n').map(l => {
+    let c = 'var(--muted)';
+    if (l.startsWith('+') && !l.startsWith('+++')) c = '#34d399';
+    else if (l.startsWith('-') && !l.startsWith('---')) c = '#f87171';
+    else if (l.startsWith('@@')) c = 'var(--blue)';
+    return '<span style="color:' + c + '">' + _escHtml(l) + '</span>';
+  }).join('\n');
+}
+
+async function applyRec(id, profile) {
+  toast('Computing diff…', '');
+  let d;
+  try {
+    d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile});
+  } catch(e) { toast('Apply failed: ' + e.message, 'err'); return; }
+  if (!d.changed) { toast('Already applied: ' + (d.note || 'no change'), 'ok'); return; }
+  const short = profile.replace(/^start_/, '').replace(/\.sh$/, '');
+  closeRecModal();
+  const overlay = document.createElement('div');
+  overlay.id = 'rec-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:24px;width:640px;max-width:94vw">' +
+      '<div style="font-size:15px;font-weight:700;margin-bottom:4px">Apply to ' + _escHtml(short) + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">' + _escHtml(d.note || '') +
+        ' — review the change to the start script, then confirm.</div>' +
+      '<pre style="font-size:11px;line-height:1.45;background:var(--s2);border:1px solid var(--border);' +
+        'border-radius:8px;padding:12px;max-height:340px;overflow:auto;white-space:pre">' + _diffHtml(d.diff) + '</pre>' +
+      '<div id="rec-apply-note" style="font-size:11px;color:var(--muted);margin-top:8px">' +
+        'The profile takes effect the next time you start it.</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+        '<button class="btn btn-sm" id="rec-apply-cancel" onclick="closeRecModal()">Cancel</button>' +
+        '<button class="btn btn-primary btn-sm" id="rec-apply-go" onclick="confirmApplyRec(\'' +
+          id.replace(/'/g, "\\'") + '\',\'' + profile.replace(/'/g, "\\'") + '\')">Apply change</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+}
+
+async function confirmApplyRec(id, profile) {
+  const go = document.getElementById('rec-apply-go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin-icon" style="width:12px;height:12px;vertical-align:-1px"></span> Applying…';
+  try {
+    const d = await apiFetch('/api/recommendations/apply', 'POST', {id: id, profile: profile, confirm: true});
+    toast('✓ ' + (d.note || 'applied'), 'ok');
+    closeRecModal();
+    loadRecommendations();
+    loadEngineProfiles(engines.vllm);
+  } catch(e) {
+    toast('Apply failed: ' + e.message, 'err');
+    go.disabled = false;
+    go.innerHTML = 'Apply change';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Ollama
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4805,10 +8317,10 @@ async function loadOllamaModels() {
     el.innerHTML = '<div class="model-grid">' + models.map(m => {
       const gb = m.size ? (m.size / 1e9).toFixed(1) + ' GB' : '?';
       const date = m.modified_at ? new Date(m.modified_at).toLocaleDateString() : '';
-      const safeName = m.name.replace(/'/g, "\\'");
+      const safeName = esc(m.name.replace(/'/g, "\\'"));
       return `<div class="model-card">
         <div class="model-card-info">
-          <div class="model-card-name">${m.name}</div>
+          <div class="model-card-name">${esc(m.name)}</div>
           <div class="model-card-meta">${gb}${date ? ' · ' + date : ''}</div>
         </div>
         <div class="model-card-right">
@@ -4921,7 +8433,7 @@ async function loadLiteLLMModels() {
       const isOllama = m.id.toLowerCase().includes('ollama') || m.id.toLowerCase().includes(':');
       return `<div class="model-card">
         <div class="model-card-info">
-          <div class="model-card-name">${m.id}</div>
+          <div class="model-card-name">${esc(m.id)}</div>
         </div>
         <span class="tag ${isOllama ? 'tag-ollama' : 'tag-sglang'}">${isOllama ? 'ollama' : 'sglang'}</span>
       </div>`;
@@ -5150,11 +8662,13 @@ async function warmStopOllama(name) {
 
 const engines = {
 """ + ",\n".join(f'''  {k}: {{
-    name: '{e["name"]}', api: '/api/{k}', selectedProfile: null,{" webui: true," if e.get("webui") else ""}
+    name: '{e["name"]}', api: '/api/{k}', selectedProfile: null, selectedRecipe: null, recipes: null,{" webui: true," if e.get("webui") else ""}
     key: '{k}',
     ids: {{ led: '{k}-engine-led', title: '{k}-engine-title', model: '{k}-engine-model',
            card: '{k}-engine-card', stop: '{k}-stop-btn', start: '{k}-start-btn',
            profiles: '{k}-profile-list', prog: '{k}-progress', log: '{k}-log',
+           bar: '{k}-prog-bar', phase: '{k}-prog-phase', meta: '{k}-prog-meta',
+           dryrun: '{k}-dryrun-btn', preflight: '{k}-preflight',
            footer: '{k}-engine-footer'{(", webui: '" + k + "-webui-btn'") if e.get("webui") else ""} }}
   }}''' for k, e in _ENGINES.items()) + r"""
 };
@@ -5208,25 +8722,412 @@ async function loadEngineStatus(eng) {
 async function loadEngineProfiles(eng) {
   const el = document.getElementById(eng.ids.profiles);
   try {
-    const profiles = await apiFetch(eng.api + '/profiles');
-    if (!profiles.length) {
-      el.innerHTML = '<div class="empty"><div class="empty-text">No profiles defined</div></div>';
-      return;
-    }
-    if (!eng.selectedProfile) eng.selectedProfile = profiles[0].id;
-    el.innerHTML = profiles.map(p => `
-      <div class="profile-item ${eng.selectedProfile === p.id ? 'selected' : ''}"
-           onclick="selectEngineProfile('${eng.key}', '${p.id}', this)">
-        <div class="p-radio"></div>
-        <div class="p-info">
-          <div class="p-name">${p.name}</div>
-          <div class="p-desc">${p.description}</div>
-        </div>
-        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
-      </div>
-    `).join('');
+    eng.profiles = await apiFetch(eng.api + '/profiles');
+    renderEngineProfiles(eng);
   } catch(e) {
     el.innerHTML = '<div class="empty"><div class="empty-text">Could not load profiles</div></div>';
+  }
+  if (eng.key === 'llamacpp') loadRecipes(eng);
+}
+
+// llama.cpp only. A GGUF repo ships one set of weights at ten quantizations, so the
+// quant/context/speculation choice is a launch *parameter*, not a separate profile —
+// otherwise the profile list becomes ten near-identical rows that drift apart.
+async function loadRecipes(eng) {
+  const bar = document.getElementById(eng.key + '-recipe-bar');
+  const sel = document.getElementById(eng.key + '-recipe');
+  if (!bar || !sel) return;
+  let d;
+  try { d = await apiFetch('/api/llamacpp/recipes'); }
+  catch(e) { bar.style.display = 'none'; return; }
+
+  const names = Object.keys(d.recipes || {});
+  // No recipes configured means the scripts use their own defaults. Showing an empty
+  // dropdown would imply a choice that does not exist.
+  if (!names.length) { bar.style.display = 'none'; eng.recipes = null; return; }
+
+  eng.recipes = d.recipes;
+  if (!eng.selectedRecipe || !eng.recipes[eng.selectedRecipe]) {
+    eng.selectedRecipe = (d.default && eng.recipes[d.default]) ? d.default : names[0];
+  }
+  sel.innerHTML = names.map(n => {
+    const r = eng.recipes[n];
+    return '<option value="' + _escHtml(n) + '"' +
+           (n === eng.selectedRecipe ? ' selected' : '') + '>' +
+           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GB') +
+           '</option>';
+  }).join('');
+  bar.style.display = 'flex';
+  selectRecipe(eng.key, eng.selectedRecipe);
+}
+
+function selectRecipe(key, name) {
+  const eng = engines[key];
+  if (!eng || !eng.recipes || !eng.recipes[name]) return;
+  eng.selectedRecipe = name;
+  const r = eng.recipes[name];
+  const d = document.getElementById(key + '-recipe-desc');
+  if (d) {
+    d.textContent = (r.desc || '') +
+      (r.spec && r.spec !== 'none' ? '  ·  spec: ' + r.spec : '') +
+      (r.vision ? '  ·  vision' : '');
+  }
+}
+
+// Two views over the same list, so the launch list stays uncluttered:
+//   models   — profiles whose weights are on disk; the things you can start.
+//   profiles — every start_*.sh, including ones whose weights are gone. This is
+//              the housekeeping view, and the only place orphans are visible.
+function setProfileView(key, view) {
+  const eng = engines[key];
+  eng.profileView = view;
+  ['models','profiles'].forEach(v => {
+    const b = document.getElementById(key + '-subtab-' + v);
+    if (b) b.classList.toggle('active', v === view);
+  });
+  renderEngineProfiles(eng);
+}
+
+function renderEngineProfiles(eng) {
+  const el = document.getElementById(eng.ids.profiles);
+  const all = eng.profiles || [];
+  const view = eng.profileView || 'models';
+  const profiles = view === 'models' ? all.filter(p => !p.model_missing) : all;
+
+  const note = document.getElementById(eng.key + '-subtab-note');
+  if (note) {
+    const onDisk = {};
+    all.forEach(p => { if (p.model_dir) onDisk[p.model_dir] = p.model_size_gb || 0; });
+    const gb = Object.values(onDisk).reduce((s,v) => s+v, 0);
+    const orphans = all.filter(p => p.model_missing).length;
+    note.textContent = all.length + ' profiles · ' + gb.toFixed(1) + ' GB on disk'
+      + (orphans ? ' · ' + orphans + ' orphaned' : '');
+  }
+
+  if (!all.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles defined</div></div>';
+    return;
+  }
+  if (!profiles.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-text">No profiles with weights on disk</div></div>';
+    return;
+  }
+  // Selection must stay on a visible row, or Start launches something unseen.
+  if (!eng.selectedProfile || !profiles.some(p => p.id === eng.selectedProfile)) {
+    eng.selectedProfile = profiles[0].id;
+  }
+  {
+    const q = s => String(s == null ? '' : s).replace(/'/g, "\\'");
+    el.innerHTML = profiles.map(p => `
+      <div class="profile-item ${eng.selectedProfile === p.id ? 'selected' : ''}"
+           onclick="selectEngineProfile('${eng.key}', '${esc(q(p.id))}', this)">
+        <div class="p-radio"></div>
+        <div class="p-info">
+          <div class="p-name">${esc(p.name)}${p.model_missing
+            ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
+          <div class="p-desc">${esc(p.description)}</div>
+        </div>
+        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
+        <div class="p-actions" onclick="event.stopPropagation()">
+          ${p.model_dir
+            ? `<button class="btn-icon-del" title="Delete model weights from disk${
+                 p.model_size_gb ? ' (' + p.model_size_gb + ' GB)' : ''}"
+                 onclick="deleteProfileWeights('${eng.key}','${esc(q(p.model_dir))}','${esc(q(p.name))}',${p.model_size_gb || 0})">&#9679;</button>`
+            : ''}
+          <button class="btn-icon-del" title="Delete this profile script"
+                  onclick="deleteEngineProfile('${eng.key}','${esc(q(p.id))}','${esc(q(p.name))}')">&#10005;</button>
+        </div>
+        ${eng.key === 'vllm' ? renderProfileSettings(p) : ''}
+      </div>
+    `).join('');
+    // Warning and meta-error text is vendor-supplied (it embeds {value!r} of config
+    // fields), so it is written with textContent, never interpolated into the HTML
+    // above. T-04-07.
+    el.querySelectorAll('.profile-item').forEach((card, i) => {
+      const p = profiles[i];
+      if (!p) return;
+      const errEl = card.querySelector('.p-set-error');
+      if (errEl) errEl.textContent =
+        'Profile header is unreadable: ' + (p.meta_error || 'unknown parse failure');
+      const warnEl = card.querySelector('.p-set-warn');
+      if (warnEl && (p.warnings || []).length) {
+        warnEl.textContent = '⚠ ' + p.warnings.join(' · ');
+      }
+    });
+  }
+}
+
+// Five card states: header-error, recipe-backed, editable, read-only (04-03) and
+// unparseable (04-03). meta_error is checked FIRST and on its own: a corrupt header is a
+// defect, not a fallback (04-CONTEXT.md), so it must never fall through to the legacy
+// rendering that would silently show a launch as ordinary.
+function renderProfileSettings(p) {
+  if (p.meta_error) {
+    return `<div class="p-settings" data-state="header-error" onclick="event.stopPropagation()">
+      <div class="p-set-error"></div>
+      <div class="p-set-note">The script itself is still valid and can be launched, but its
+        generated metadata cannot be read. Regenerate the profile to repair it.</div>
+    </div>`;
+  }
+  const d = p.derived;
+  if (d && d.editable === false) {
+    return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+      <div class="p-set-row">
+        <div class="p-set-field"><label>Context</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="—"></div>
+        <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="—"></div>
+      </div>
+      <div class="p-set-note">Not adjustable here — ${esc(d.reason || 'the recipe YAML owns these flags')}.</div>
+    </div>`;
+  }
+  // 04-03 fix: classification is authoritative when there is no `# Derived:` header.
+  // `_parse_script_flags` only reads LITERAL numbers, so a recipe wrapper and an
+  // already-parameterized script both report three `unparseable` flags — which is a
+  // statement about the regex, not about the script. Routing either into the legacy
+  // renderer told the truth about the parser and a lie about the file.
+  if (!d && p.classification === 'recipe') {
+    return renderRecipeProfileSettings();
+  }
+  if (!d && p.classification === 'parameterized') {
+    return renderParameterizedProfileSettings(p);
+  }
+  if (!d) return renderLegacyProfileSettings(p);  // 04-03 owns read-only/unparseable.
+  const rec = p.recommended || {};
+  const recUtil = rec.gpu_memory_utilization != null
+    ? `<span class="p-set-rec">recommended ${esc(rec.gpu_memory_utilization)}</span>` : '';
+  const recCtx = rec.max_model_len != null
+    ? `<span class="p-set-rec">recommended ${esc(rec.max_model_len)}</span>` : '';
+  const ceiling = d.declared_max_context != null
+    ? ` Over-requesting is clamped to the KV ceiling (${esc(d.max_fitting_context)}) and the
+        vendor ceiling (${esc(d.declared_max_context)}); the request is discarded, not applied,
+        so a value above those will silently give you less context than you typed.` : '';
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context ${recCtx}</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="${esc(d.max_model_len)}">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util ${recUtil}</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization" placeholder="${esc(d.util)}">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="${esc(d.max_num_seqs)}">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+    </div>
+    <div class="p-set-note">Per-launch only — nothing is written to the script on disk.
+      Leave a box empty to use the derived default shown in grey. Linux page cache is billed
+      against the same budget as gpu-memory-utilization, so reclaim it before judging a
+      utilization recommendation.${ceiling}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// 04-03: a hand-written script has no `# Derived:` header, so its numbers come from
+// `_parse_script_flags` — a regex over the script text. Those values are READ-ONLY:
+// nothing here can override a flag the launcher does not template. A flag the parser
+// could not read as a literal renders the word "unparseable", never a guess.
+const LEGACY_FIELDS = [
+  ['max_model_len', 'Context'],
+  ['util', 'GPU memory util'],
+  ['max_num_seqs', 'Max num seqs'],
+];
+
+// 04-03 fix: a recipe wrapper whose `# Derived:` header is absent. The recipe YAML owns
+// these flags exactly as it does for a header-bearing one, so this reuses the same copy
+// rather than inventing a fourth way to say "not adjustable here".
+function renderRecipeProfileSettings() {
+  return `<div class="p-settings" data-state="recipe-backed" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field"><label>Context</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>GPU memory util</label><input disabled placeholder="&#8212;"></div>
+      <div class="p-set-field"><label>Max num seqs</label><input disabled placeholder="&#8212;"></div>
+    </div>
+    <div class="p-set-note">Not adjustable here — the recipe YAML owns these flags.</div>
+  </div>`;
+}
+
+// 04-03 fix: already parameterized, but with no `# Derived:` header — the state every
+// script reaches by going through Parameterize…, since that rewrites flags without
+// generating metadata. Overrides DO work (the script templates all three vars), so the
+// controls are live; what is missing is the derived default, which lives in the script's
+// own `${VAR:-N}` and is deliberately not echoed here — `_parse_script_flags` reads
+// literals only, and a guessed placeholder would be worse than an empty one.
+function renderParameterizedProfileSettings(p) {
+  // The button is offered ONLY when the script names its own source dir. Without that,
+  // `from-hf` would 409 (or worse, silently replace a hand-tuned script), so the note
+  // points at where regeneration actually lives instead of at a control that isn't there.
+  const regen = p.regen_path
+    ? `<button class="btn btn-sm" onclick="regenerateProfile('${
+         esc(String(p.id).replace(/'/g, "\\'"))}','${
+         esc(String(p.regen_path).replace(/'/g, "\\'"))}')">Regenerate metadata</button>`
+    : '';
+  const regenNote = p.regen_path
+    ? ` "Regenerate metadata" rebuilds it from ${esc(p.regen_path)}, keeping the
+        parameterized flags.`
+    : ` This script does not record a source directory — regenerating it would mean
+        replacing it from HF browse → Create vLLM profile, which discards anything
+        hand-written in it.`;
+  // The grey number is the script's own `${VAR:-N}` default, so this card reads like
+  // every other one. A var with no literal default falls back to the em dash rather than
+  // to a guess.
+  const sd = p.script_defaults || {};
+  const ph = k => esc(sd[k] != null ? sd[k] : '—');
+  return `<div class="p-settings" data-state="editable" onclick="event.stopPropagation()">
+    <div class="p-set-row">
+      <div class="p-set-field">
+        <label>Context</label>
+        <input type="number" min="1" step="1" data-override="max_model_len"
+               placeholder="${ph('max_model_len')}">
+      </div>
+      <div class="p-set-field">
+        <label>GPU memory util</label>
+        <input type="number" min="0.10" max="0.95" step="0.01"
+               data-override="gpu_memory_utilization"
+               placeholder="${ph('gpu_memory_utilization')}">
+      </div>
+      <div class="p-set-field">
+        <label>Max num seqs</label>
+        <input type="number" min="1" max="256" step="1" data-override="max_num_seqs"
+               placeholder="${ph('max_num_seqs')}">
+      </div>
+      <button class="btn btn-sm" onclick="reclaimPageCache(this)">Reclaim page cache</button>
+      ${regen}
+    </div>
+    <div class="p-set-note">This script is parameterized — per-launch overrides work, and
+      an empty box uses the grey default written into the script itself. No recommendation
+      or KV-ceiling check is available, because those need the model's own config rather
+      than the script text.${regenNote}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+function renderLegacyProfileSettings(p) {
+  const flags = p.flags || {};
+  const unparseable = LEGACY_FIELDS.filter(([k]) => flags[k] === 'unparseable' ||
+                                                    flags[k] == null);
+  const fields = LEGACY_FIELDS.map(([k, label]) => {
+    const raw = flags[k];
+    const bad = (raw === 'unparseable' || raw == null);
+    return `<div class="p-set-field"><label>${esc(label)}</label>
+      <input disabled value="${bad ? 'unparseable' : esc(raw)}"></div>`;
+  }).join('');
+  const note = unparseable.length
+    ? `Read-only. ${unparseable.length} of 3 flags could not be read as a literal number
+       (they may be shell variables or built at runtime), so no value is shown rather than
+       a guessed one. Parameterizing is refused while any flag is unparseable.`
+    : `Read-only — this script hard-codes its flags. "Parameterize" rewrites each value
+       into a <code>\${VAR:-value}</code> placeholder with the SAME number as the default,
+       so behaviour is unchanged and per-launch overrides become possible. You will see a
+       diff before anything is written.`;
+  const action = unparseable.length ? '' :
+    // `q` is block-scoped to the card renderer, so the JS-string escape is inlined
+    // here; esc() then closes the surrounding attribute context.
+    `<button class="btn btn-sm" onclick="parameterizeProfile('${
+       esc(String(p.id == null ? '' : p.id).replace(/'/g, "\\'"))}')">Parameterize…</button>`;
+  return `<div class="p-settings" data-state="${unparseable.length ? 'unparseable' : 'read-only'}"
+        onclick="event.stopPropagation()">
+    <div class="p-set-row">${fields}${action}</div>
+    <div class="p-set-note">${note}</div>
+    <div class="p-set-warn"></div>
+  </div>`;
+}
+
+// Preview FIRST, always. The server builds the diff and hands back a sha256 of the file
+// it read; apply sends that hash straight back and the server refuses (409) if the file
+// moved underneath us — ~6 concurrent sessions share this profile directory.
+// Rebuilds the `# Derived:` / `# Recommended:` / `# Warnings:` headers a parameterized
+// script lacks, by regenerating it from the launch dir it names. Only ever called with a
+// `regen_path` the server supplied, so the from-hf 409 guard (target exists with
+// different contents) cannot fire — the script already references that dir.
+async function regenerateProfile(profileId, path) {
+  if (!confirm('Regenerate ' + profileId + '.sh from ' + path + '?\n\n'
+               + 'This rewrites the script from its model directory, restoring the '
+               + 'derived defaults, recommendation and KV-ceiling warnings.')) return;
+  try {
+    await apiFetch('/api/vllm/profiles/from-hf', 'POST', {path: path});
+    toast('✓ Regenerated ' + profileId, 'ok');
+    await loadEngineProfiles(engines.vllm);
+  } catch (e) {
+    toast('Regenerate failed: ' + e.message, 'err');
+  }
+}
+
+async function parameterizeProfile(profileId) {
+  try {
+    const prev = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                                + '/parameterize/preview', 'POST', {});
+    if (!prev.changed) { toast('Already parameterized — nothing to do', 'ok'); return; }
+    const ok = confirm('Rewrite ' + profileId + '.sh?\n\n' + prev.notes.join('\n')
+                       + '\n\n' + prev.diff);
+    if (!ok) return;
+    const res = await apiFetch('/api/vllm/profiles/' + encodeURIComponent(profileId)
+                               + '/parameterize/apply', 'POST', {sha256: prev.sha256});
+    toast('✓ Parameterized (backup: ' + res.backup.split('/').pop() + ')', 'ok');
+    if (typeof loadWarmModels === 'function') loadWarmModels();
+  } catch (e) {
+    toast('Parameterize failed: ' + e.message, 'err');
+  }
+}
+
+// Page cache counts against the util budget, so a correct recommendation looks broken
+// until it is reclaimed. Same endpoint the Dry Run memory check offers.
+async function reclaimPageCache(btn) {
+  btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+    toast('✓ ' + res.message, 'ok');
+  } catch (e) {
+    toast('Reclaim failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// The request-body builder. Mirrors `_collect_overrides` in app.py: a blank or
+// whitespace-only box means "use the derived default", expressed as the key being ABSENT.
+function collectProfileOverrides() {
+  const panel = document.querySelector('#vllm-profile-list .profile-item.selected .p-settings[data-state="editable"]');
+  if (!panel) return undefined;
+  const out = {};
+  panel.querySelectorAll('input[data-override]').forEach(inp => {
+    const raw = String(inp.value == null ? '' : inp.value).trim();
+    if (!raw) return;
+    const num = Number(raw);
+    out[inp.dataset.override] = Number.isFinite(num) ? num : raw;
+  });
+  return Object.keys(out).length ? out : undefined;
+}
+
+async function deleteEngineProfile(key, id, name) {
+  if (!confirm('Delete the profile "' + name + '"?\n\nThis removes the start script only. Model weights on disk are untouched.')) return;
+  try {
+    await apiFetch(engines[key].api + '/profiles/' + encodeURIComponent(id), 'DELETE');
+    toast('Profile deleted: ' + name, 'ok');
+    if (engines[key].selectedProfile === id) engines[key].selectedProfile = null;
+    await loadEngineProfiles(engines[key]);
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
+  }
+}
+
+// Weights deletion goes through the guarded inventory endpoint, so the in-use
+// and profile-cross-reference checks apply here too. The cross-reference will
+// always fire from this page — this profile references the model by definition.
+async function deleteProfileWeights(key, dirPath, name, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete the model weights for "' + name + '"' + size + '?\n\nPermanently removes:\n' + dirPath + '\n\nThe profile is kept and will fail to launch until the weights are re-downloaded.')) return;
+  try {
+    await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+    toast('Weights deleted: ' + name + size, 'ok');
+    await loadEngineProfiles(engines[key]);
+  } catch(e) {
+    toast('Delete failed: ' + e.message, 'err');
   }
 }
 
@@ -5234,6 +9135,9 @@ function selectEngineProfile(key, id, el) {
   engines[key].selectedProfile = id;
   const container = document.getElementById(engines[key].ids.profiles);
   container.querySelectorAll('.profile-item').forEach(p => p.classList.remove('selected'));
+  // Overrides are per-launch and per-profile: carrying a typed context across a selection
+  // change would launch a different model with numbers the user meant for the old one.
+  container.querySelectorAll('.p-settings input[data-override]').forEach(i => { i.value = ''; });
   el.classList.add('selected');
 }
 
@@ -5254,6 +9158,30 @@ async function stopEngine(eng) {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
+  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
+  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
+  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
+  // able to block the only GPU. Runs before any button state is touched, so declining leaves
+  // the UI exactly as it was.
+  let forceFromGate = false;
+  if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
+    try {
+      const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+      if (r && r.verdict === 'fail') {
+        const blocking = (r.checks || []).filter(c => c.level === 'fail')
+          .map(c => c.title + (c.detail ? ': ' + c.detail : '')).join('; ');
+        if (!confirm('Preflight found blocking problems:\n\n' + blocking +
+                     '\n\nRun Dry Run to see the details. Force start anyway?')) {
+          toast('Start blocked by preflight: ' + blocking, 'err');
+          return;
+        }
+        forceFromGate = true;
+      }
+    } catch (e) {
+      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+    }
+  }
   const btn  = document.getElementById(eng.ids.start);
   const prog = document.getElementById(eng.ids.prog);
   const log  = document.getElementById(eng.ids.log);
@@ -5263,36 +9191,25 @@ async function startEngine(eng) {
   prog.classList.add('show');
   log.textContent = 'Sending start command\u2026';
 
+  // Live load progress, streamed from `docker logs -f` server-side. Replaces a
+  // 20s status poll that reported "Model loading\u2026" for ten minutes whether the
+  // model was loading or the container had died two seconds in.
   const beginPoll = (d) => {
     toast('\u2713 ' + eng.name + ' starting', 'ok');
-    log.textContent = d.message + '\n\nPolling status every 20 seconds\u2026';
-    let pollCount = 0;
-    const poll = setInterval(async () => {
-      pollCount++;
-      await loadEngineStatus(eng);
-      const led = document.getElementById(eng.ids.led);
-      if (led.classList.contains('on')) {
-        const modelEl = document.getElementById(eng.ids.model);
-        if (modelEl.textContent && modelEl.textContent !== 'Model loading\u2026') {
-          clearInterval(poll);
-          toast('\u2713 ' + eng.name + ' is ready!', 'ok');
-          prog.classList.remove('show');
-        } else {
-          log.textContent = d.message + '\n\nContainer running \u2014 model still loading\u2026';
-        }
-      } else if (pollCount >= 30) {
-        clearInterval(poll);
-        log.textContent += '\n\n\u26a0 Timed out after 10 minutes \u2014 check logs';
-        toast(eng.name + ' did not start within 10 minutes', 'err');
-      }
-    }, 20000);
+    log.textContent = d.message;
+    if (eng.key !== 'vllm') { return legacyPoll(eng, d); }
+    followLoadProgress(eng, d);
   };
 
   const startWith = (force) =>
-    apiFetch(eng.api + '/start', 'POST', {profile: eng.selectedProfile, force});
+    apiFetch(eng.api + '/start', 'POST',
+             {profile: eng.selectedProfile, force,
+              overrides: eng.key === 'vllm' ? collectProfileOverrides() : undefined,
+              recipe: eng.key === 'llamacpp' ? eng.selectedRecipe : undefined});
+
 
   try {
-    beginPoll(await startWith(false));
+    beginPoll(await startWith(forceFromGate));
   } catch(e) {
     if (String(e.message || '').includes('unified memory') &&
         confirm(e.message + '\n\nForce start anyway?')) {
@@ -5309,6 +9226,168 @@ async function startEngine(eng) {
   } finally {
     btn.disabled = false;
     btn.innerHTML = '\u25b6 Start Selected';
+  }
+}
+
+// The pre-existing status poll, still used by engines with no progress stream.
+function legacyPoll(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  let pollCount = 0;
+  const poll = setInterval(async () => {
+    pollCount++;
+    await loadEngineStatus(eng);
+    const led = document.getElementById(eng.ids.led);
+    if (led.classList.contains('on')) {
+      const modelEl = document.getElementById(eng.ids.model);
+      if (modelEl.textContent && modelEl.textContent !== 'Model loading…') {
+        clearInterval(poll);
+        toast('✓ ' + eng.name + ' is ready!', 'ok');
+        prog.classList.remove('show');
+      } else {
+        log.textContent = d.message + '\n\nContainer running — model still loading…';
+      }
+    } else if (pollCount >= 30) {
+      clearInterval(poll);
+      log.textContent += '\n\n⚠ Timed out after 10 minutes — check logs';
+      toast(eng.name + ' did not start within 10 minutes', 'err');
+    }
+  }, 20000);
+}
+
+function setProgress(eng, pct, phaseLabel, meta) {
+  const bar   = document.getElementById(eng.ids.bar);
+  const phase = document.getElementById(eng.ids.phase);
+  const metaEl = document.getElementById(eng.ids.meta);
+  if (bar) {
+    // A real percentage means a determinate bar; drop the indeterminate sweep.
+    if (typeof pct === 'number') { bar.classList.remove('spin'); bar.style.width = pct + '%'; }
+    else { bar.classList.add('spin'); bar.style.width = ''; }
+  }
+  if (phase && phaseLabel) phase.textContent = phaseLabel;
+  if (metaEl) metaEl.textContent = meta || '';
+}
+
+function followLoadProgress(eng, d) {
+  const prog = document.getElementById(eng.ids.prog);
+  const log  = document.getElementById(eng.ids.log);
+  prog.classList.add('show');
+  setProgress(eng, 0, 'Attaching to container log…', '');
+
+  // fresh=1: a launch was just issued, so do not short-circuit on the *previous*
+  // model's /health, and tolerate the container not existing for a moment.
+  const es = new EventSource('/api/vllm/progress?fresh=1');
+  const finish = (ok, msg) => {
+    es.close();
+    loadEngineStatus(eng);
+    toast((ok ? '✓ ' : '✗ ') + msg, ok ? 'ok' : 'err');
+    if (ok) setTimeout(() => prog.classList.remove('show'), 4000);
+  };
+
+  es.onmessage = (ev) => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    const mins = e.elapsed_s != null
+      ? Math.floor(e.elapsed_s / 60) + 'm' + String(Math.round(e.elapsed_s % 60)).padStart(2, '0') + 's'
+      : '';
+    const bits = [mins];
+    if (e.weights_gib)   bits.push('weights ' + e.weights_gib + ' GiB');
+    if (e.kv_cache_gib)  bits.push('KV ' + e.kv_cache_gib + ' GiB');
+
+    if (e.status === 'ready') {
+      setProgress(eng, 100, 'Ready', bits.join(' · '));
+      finish(true, eng.name + ' is ready in ' + mins);
+      return;
+    }
+    if (e.status === 'failed') {
+      setProgress(eng, e.percent, 'Load failed', bits.join(' · '));
+      // textContent, never innerHTML — this string is container output.
+      log.textContent = 'LOAD FAILED\n\n' + (e.error || 'unknown cause')
+        + (e.exit_code != null ? '\n\nContainer exit code: ' + e.exit_code : '')
+        + (e.hint ? '\n\n→ ' + e.hint : '');
+      finish(false, eng.name + ' failed to load');
+      return;
+    }
+    setProgress(eng, e.percent, e.label || 'Loading…', bits.join(' · '));
+    if (e.line) log.textContent = e.line;
+  };
+  es.onerror = () => {
+    es.close();
+    log.textContent += '\n\n⚠ Progress stream dropped — falling back to status polling.';
+    legacyPoll(eng, d);
+  };
+}
+
+async function dryRunProfile(eng) {
+  if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  const btn = document.getElementById(eng.ids.dryrun);
+  const out = document.getElementById(eng.ids.preflight);
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spin-icon"></div> Checking…';
+  out.textContent = '';
+  eng._preflightVerdict = null;
+  try {
+    const r = await apiFetch('/api/vllm/preflight', 'POST', {profile: eng.selectedProfile});
+    renderPreflight(out, r);
+    const t = {ok: 'Dry run clean', warn: 'Dry run passed with warnings', fail: 'Dry run found blocking problems'}[r.verdict];
+    eng._preflightVerdict = r.verdict;
+    toast(t, r.verdict === 'fail' ? 'err' : 'ok');
+  } catch (e) {
+    toast('Dry run failed: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '⚗ Dry Run';
+  }
+}
+
+function renderPreflight(out, r) {
+  const icons = {ok: '✓', warn: '⚠', fail: '✗', skip: '–'};
+  out.textContent = '';
+  const head = document.createElement('div');
+  head.className = 'preflight-head pf-' + r.verdict;
+  head.textContent = icons[r.verdict] + ' ' + r.profile;
+  if (r.budget) {
+    const b = document.createElement('span');
+    b.className = 'preflight-budget';
+    b.textContent = 'util ' + r.budget.util + ' → ' + r.budget.usable_gib
+      + ' GiB usable of a ' + r.budget.budget_gib + ' GiB budget';
+    head.appendChild(b);
+  }
+  out.appendChild(head);
+
+  for (const c of r.checks) {
+    const row = document.createElement('div');
+    row.className = 'preflight-row pf-' + c.level;
+    const t = document.createElement('div');
+    t.className = 'pf-title';
+    t.textContent = (icons[c.level] || '·') + ' ' + c.title;
+    row.appendChild(t);
+    if (c.detail) {
+      const d = document.createElement('div');
+      d.className = 'pf-detail';
+      d.textContent = c.detail;
+      row.appendChild(d);
+    }
+    if (c.fix) {
+      const f = document.createElement('div');
+      f.className = 'pf-fix';
+      f.textContent = c.fix;
+      row.appendChild(f);
+      if (c.check === 'memory') {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-sm';
+        btn.textContent = 'Reclaim page cache';
+        btn.onclick = async () => {
+          btn.disabled = true;
+          try {
+            const res = await apiFetch('/api/vllm/reclaim-cache', 'POST', {});
+            toast('✓ ' + res.message, 'ok');
+            dryRunProfile(engines.vllm);
+          } catch (e) { toast('Reclaim failed: ' + e.message, 'err'); btn.disabled = false; }
+        };
+        row.appendChild(btn);
+      }
+    }
+    out.appendChild(row);
   }
 }
 
@@ -5520,7 +9599,7 @@ function renderInventoryTable(models) {
     }
     const delBtn = m.source === 'ollama'
       ? ''
-      : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + '\')">&#10005;</button>';
+      : '<button class="btn-icon-del" title="Delete model" onclick="deleteInventoryModel(\'' + m.dir_path.replace(/'/g,"\\'") + "','" + (m.full_name || m.name).replace(/'/g,"\\'") + "'," + (m.size_gb || 0) + ')">&#10005;</button>';
     const canCreateVllm = m.source !== 'ollama' && !m.has_script
       && (m.format === 'safetensors' || m.format === 'pytorch')
       && (m.task_label === 'Text Gen' || m.task_label === 'Vision LLM');
@@ -5631,13 +9710,26 @@ async function createVLLMProfileFromInventory(dirPath, modelName) {
   }
 }
 
-async function deleteInventoryModel(dirPath, modelName) {
-  if (!confirm('Delete "' + modelName + '" from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
+async function deleteInventoryModel(dirPath, modelName, sizeGb) {
+  const size = sizeGb ? ' (' + sizeGb + ' GB)' : '';
+  if (!confirm('Delete "' + modelName + '"' + size + ' from disk?\n\nThis will permanently remove all files in:\n' + dirPath)) return;
   try {
     await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath});
-    toast('Deleted: ' + modelName, 'ok');
+    toast('Deleted: ' + modelName + size, 'ok');
     await loadUnifiedInventory();
   } catch(e) {
+    // A profile cross-reference is overridable; an in-use container is not.
+    if (/profile script references/.test(e.message)) {
+      if (!confirm(modelName + ' is referenced by a profile script.\n\nDeleting the weights will make that profile fail at next launch.\n\nDelete anyway?')) return;
+      try {
+        await apiFetch('/api/hf/inventory/delete', 'POST', {path: dirPath, force: true});
+        toast('Deleted: ' + modelName + size, 'ok');
+        await loadUnifiedInventory();
+      } catch(e2) {
+        toast('Delete failed: ' + e2.message, 'err');
+      }
+      return;
+    }
     toast('Delete failed: ' + e.message, 'err');
   }
 }
@@ -5673,38 +9765,42 @@ async function hfbSearch() {
     const d = await apiFetch(url);
     const models = d.models || [];
     if (!models.length) {
-      root.innerHTML = '<div class="empty"><div class="empty-text">No results found for "' + q + '"</div></div>';
+      root.innerHTML = '<div class="empty"><div class="empty-text">No results found for "' + esc(q) + '"</div></div>';
       return;
     }
     root.innerHTML = models.map(renderHFBCard).join('');
   } catch(e) {
-    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Search failed: ' + e.message + '</div></div>';
+    root.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div><div class="empty-text">Search failed: ' + esc(e.message) + '</div></div>';
   }
 }
 
 function renderHFBCard(m) {
   const taskBadge = m.task_label && m.task_label !== 'Unknown'
-    ? '<span class="inv-task-badge">' + m.task_label + '</span>' : '';
+    ? '<span class="inv-task-badge">' + esc(m.task_label) + '</span>' : '';
   const fmtTags = [];
   if (m.has_safetensors) fmtTags.push('<span class="hfb-tag fmt">safetensors</span>');
   if (m.has_gguf) fmtTags.push('<span class="hfb-tag fmt">gguf</span>');
   const tags = (m.tags || []).filter(t => t !== 'safetensors' && t !== 'gguf').slice(0, 8)
-    .map(t => '<span class="hfb-tag">' + t + '</span>').join('');
-  const safeId = m.id.replace(/'/g, "\\'");
+    .map(t => '<span class="hfb-tag">' + esc(t) + '</span>').join('');
+  // T-04-10: m.id / m.library_name / m.tags are named by a third party (hf.co).
+  // esc(q(...)) for the onclick attributes: q closes the JS-string context, esc
+  // closes the HTML-attribute context. Neither alone is sufficient.
+  const safeId = esc(String(m.id == null ? '' : m.id).replace(/'/g, "\\'"));
+  const domId = esc(String(m.id == null ? '' : m.id).replace(/\//g, '--'));
 
-  return '<div class="hfb-card" id="hfb-card-' + m.id.replace(/\//g, '--') + '">'
-    + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + m.id + '</div>' + taskBadge + '</div>'
+  return '<div class="hfb-card" id="hfb-card-' + domId + '">'
+    + '<div class="hfb-card-hdr"><div class="hfb-card-name">' + esc(m.id) + '</div>' + taskBadge + '</div>'
     + '<div class="hfb-card-meta">'
     + '<span class="dl">&#11015; ' + fmtNum(m.downloads) + '</span>'
     + '<span class="lk">&#9829; ' + fmtNum(m.likes) + '</span>'
-    + (m.library_name ? '<span>' + m.library_name + '</span>' : '')
+    + (m.library_name ? '<span>' + esc(m.library_name) + '</span>' : '')
     + '</div>'
     + '<div class="hfb-tags">' + fmtTags.join('') + tags + '</div>'
     + '<div class="hfb-card-actions">'
     + '<button class="btn btn-sm btn-primary" onclick="hfbDownload(\'' + safeId + '\')">Download</button>'
     + '<button class="hfb-expand-toggle" onclick="hfbToggleExpand(\'' + safeId + '\')">&#9660; Files &amp; Variants</button>'
     + '</div>'
-    + '<div class="hfb-expand" id="hfb-exp-' + m.id.replace(/\//g, '--') + '" style="display:none"></div>'
+    + '<div class="hfb-expand" id="hfb-exp-' + domId + '" style="display:none"></div>'
     + '</div>';
 }
 
@@ -5770,9 +9866,9 @@ function hfbDownload(repoId) {
 let _debugEngineTab = 'sglang';
 const _debugTimers = {};
 
-function _escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+// Kept as an alias so the warm-models call sites keep reading naturally; there is
+// still exactly one implementation, and it now also escapes " and '.
+function _escHtml(s) { return esc(s); }
 function _fmtUptime(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
   if (d > 0) return d + 'd ' + h + 'h ' + m + 'm';

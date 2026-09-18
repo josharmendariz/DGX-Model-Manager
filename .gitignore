@@ -25,3 +25,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 misc/
+
+# Image drift report written by image_updates.py
+image_drift.json

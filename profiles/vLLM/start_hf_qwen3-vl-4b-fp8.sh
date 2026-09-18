@@ -9,7 +9,7 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
+exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
   -v "/mnt/models/qwen3-vl-4b-fp8:/models/qwen3-vl-4b-fp8:ro" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
@@ -18,7 +18,7 @@ exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:800
   --served-model-name "qwen3-vl-4b-fp8" "qwen3-vl-4b-fp8" vllm-active \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --dtype auto \
-  --gpu-memory-utilization 0.75 \
-  --max-model-len 32768 --max-num-seqs 2 \
+  --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.75} \
+  --max-model-len ${VLLM_MAX_MODEL_LEN:-32768} --max-num-seqs ${VLLM_MAX_NUM_SEQS:-2} \
   --kv-cache-dtype fp8 --enable-chunked-prefill \
   --generation-config vllm

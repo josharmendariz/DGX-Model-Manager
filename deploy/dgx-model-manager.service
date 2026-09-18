@@ -7,20 +7,22 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=/home/josh/DGX-Model-Manager
+WorkingDirectory=%h/DGX-Model-Manager
 # Tailnet-private deployment: bound to the Tailscale IP only (config.json
 # app.host), same trust model as hermes-webui — so unauthenticated access
 # inside the tailnet is acknowledged.
 Environment=MODEL_MANAGER_ALLOW_UNAUTH=1
-# Wait for the Tailscale IP to exist before binding to it (tailscaled is a
-# system service we can't order against from a --user unit). Give up after
+# Wait for tailscale0 to carry an IPv4 address before binding to it (tailscaled
+# is a system service we can't order against from a --user unit). Give up after
 # ~60s and let the bind fail — Restart=always will retry.
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ip addr show tailscale0 2>/dev/null | grep -q 100.115.54.83 && exit 0; sleep 1; done; exit 0'
-ExecStart=/usr/bin/python3 /home/josh/DGX-Model-Manager/app.py
+ExecStartPre=/bin/sh -c 'for i in $$(seq 1 60); do [ -n "$$(ip -4 -o addr show tailscale0 2>/dev/null)" ] && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/python3 %h/DGX-Model-Manager/app.py
 Restart=always
 RestartSec=5
-# Health-gate the restart loop — / serves the UI without auth.
-ExecStartPost=/bin/sh -c 'for i in $(seq 1 30); do curl -sf http://100.115.54.83:8090/ >/dev/null && exit 0; sleep 1; done; exit 1'
+# Health-gate the restart loop — / serves the UI without auth. Resolve the bind
+# address at runtime so this unit is host-agnostic; fall back to loopback for
+# non-tailnet deployments.
+ExecStartPost=/bin/sh -c 'IP=$$(tailscale ip -4 2>/dev/null | head -1); [ -n "$$IP" ] || IP=127.0.0.1; for i in $$(seq 1 30); do curl -sf "http://$$IP:8090/" >/dev/null && exit 0; sleep 1; done; exit 1'
 
 [Install]
 WantedBy=default.target

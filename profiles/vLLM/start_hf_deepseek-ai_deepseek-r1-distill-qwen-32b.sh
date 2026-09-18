@@ -9,16 +9,19 @@ set -euo pipefail
 
 docker rm -f vllm_node 2>/dev/null || true
 
-exec docker run --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
-  -v "/opt/models/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-32B/snapshots/711ad2ea6aa40cfca18895e8aca02ab92df1a746:/models/deepseek-ai_deepseek-r1-distill-qwen-32b:ro" \
+exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:8000 \
+  -v /opt/models/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-32B:/models/deepseek-ai_deepseek-r1-distill-qwen-32b:ro \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
-  vllm/vllm-openai:v0.20.0 \
-  --model "/models/deepseek-ai_deepseek-r1-distill-qwen-32b" \
-  --served-model-name "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B" "deepseek-ai--DeepSeek-R1-Distill-Qwen-32B" vllm-active \
+  eugr/spark-vllm:latest \
+  vllm serve \
+  --model /models/deepseek-ai_deepseek-r1-distill-qwen-32b/snapshots/711ad2ea6aa40cfca18895e8aca02ab92df1a746 \
+  --served-model-name deepseek-ai/DeepSeek-R1-Distill-Qwen-32B deepseek-ai--DeepSeek-R1-Distill-Qwen-32B vllm-active \
   --host 0.0.0.0 --port 8000 \
   --trust-remote-code --dtype auto \
   --gpu-memory-utilization 0.75 \
   --max-model-len 32768 --max-num-seqs 2 \
   --kv-cache-dtype fp8 --enable-chunked-prefill \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
   --generation-config vllm
