@@ -2,7 +2,7 @@
 # Name: HF nvidia/Qwen3.8-Flash-Next-NVFP4 (hybrid, MTP)
 # Description: Qwen3.8-Flash-Next MoE (125B total / 6B active) via blazux/qwen3.8-Flash-DGX,
 #   hybrid fp8 side-layers + NVFP4 experts, MTP=2, 500k context via YaRN
-# VRAM: 97
+# VRAM: 92
 #
 # Replaces the dense Qwen3.8-27B-NVFP4-MTP profile as the box's default. Benchmarked
 # head-to-head on gb10 2026-09-17, same corpus/harness as that profile's own sweep:
@@ -88,11 +88,19 @@ if [[ "${SKIP_DROP_CACHES:-0}" != "1" ]]; then
     echo "WARN: could not drop page cache; KV budget may be short" >&2
 fi
 
+# At 0.80 this profile reserved 97.3 GiB for vLLM and left only 5.4 GiB available
+# to the host. The running engine then logged repeated NV_ERR_NO_MEMORY allocation
+# failures. Startup accounting measured 77.92 GiB of fixed/peak/graph use; 0.76
+# leaves about 14.5 GiB for KV cache, enough for roughly 537k tokens and therefore
+# preserves the advertised 500k context while returning about 4.9 GiB to the host.
+# Keep the override explicit so a bounded canary can test another value without
+# editing the tracked profile.
+#
 # serve.sh does its own `docker rm -f "$NAME"`; no need to duplicate it here.
 # --restart is deliberately stripped after launch (see the two dense-model profiles'
 # notes): a restart policy on a launch that may be wrong turns a bad script into a
 # persistent outage. vllm-default-model.service owns boot recovery instead.
 cd "$FLASH_REPO"
 NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=1 CTX=500000 MTP=2 \
-  GPU_MEM=0.80 ./scripts/serve.sh
+  GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" ./scripts/serve.sh
 docker update --restart no vllm_node

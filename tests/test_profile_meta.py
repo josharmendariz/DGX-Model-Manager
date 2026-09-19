@@ -310,6 +310,15 @@ def _committed_profile_names():
     )
 
 
+def test_qwen_flash_profile_preserves_500k_with_bounded_memory_default():
+    text = _committed_text(
+        "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh"
+    )
+    assert "CTX=500000" in text
+    assert 'GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}"' in text
+    assert "GPU_MEM=0.80" not in text
+
+
 def test_classify_covers_every_committed_profile(tmp_path):
     """Copied into tmp_path so the classifier is proved text-only — no live reads."""
     names = _committed_profile_names()
