@@ -30,3 +30,8 @@ misc/
 
 # Image drift report written by image_updates.py
 image_drift.json
+
+# Timestamped local backups and session checkpoints (gb10 git-reconcile
+# cleanup, 2026-09-21): not source, safe to keep on disk, noisy in git status.
+*.bak-*
+.last-session.json
