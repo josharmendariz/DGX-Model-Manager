@@ -276,7 +276,10 @@ _EXPECTED_CLASSES = {
     # placeholder marker alone is the evidence, so this is `parameterized` by the
     # same design as start_hf_qwen_qwen3-8b.sh above, not `legacy`.
     "start_hf_qwen_qwen3.8-27b-fp8-mtp.sh": "parameterized",
+    "start_hf_qwen_qwen3.8-27b-fp8.sh": "parameterized",
+    "start_hf_qwen_qwen3.8-27b.sh": "parameterized",
     "start_hf_unsloth_qwen3.8-27b-nvfp4-mtp.sh": "parameterized",
+    "start_hf_unsloth_qwen3.8-27b-nvfp4.sh": "parameterized",
     "start_nemotron_nano.sh": "legacy",
     "start_nemotron_super.sh": "legacy",
     "start_qwen3_coder_next.sh": "legacy",
