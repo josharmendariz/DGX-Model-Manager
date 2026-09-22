@@ -13,6 +13,8 @@ exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:
   -v /opt/models/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-32B:/models/deepseek-ai_deepseek-r1-distill-qwen-32b:ro \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
+  --label "dgx.profile=hf_deepseek-ai_deepseek-r1-distill-qwen-32b" \
+  --label "dgx.engine=vllm" \
   eugr/spark-vllm:latest \
   vllm serve \
   --model /models/deepseek-ai_deepseek-r1-distill-qwen-32b/snapshots/711ad2ea6aa40cfca18895e8aca02ab92df1a746 \

@@ -13,6 +13,8 @@ exec docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -v /mnt/models:/models:ro \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
+  --label "dgx.profile=qwen3_next_80b" \
+  --label "dgx.engine=vllm" \
   vllm/vllm-openai:cu130-nightly \
   --model /models/qwen3-next-80b-a3b-nvfp4 \
   --served-model-name qwen3-next-80b vllm-active \

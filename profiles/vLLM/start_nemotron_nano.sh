@@ -16,6 +16,8 @@ exec docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
   -e VLLM_NVFP4_GEMM_BACKEND=marlin \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  --label "dgx.profile=nemotron_nano" \
+  --label "dgx.engine=vllm" \
   vllm/vllm-openai:cu130-nightly \
   --model nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 \
   --served-model-name nemotron-3-nano vllm-active \

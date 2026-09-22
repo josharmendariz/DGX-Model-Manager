@@ -36,6 +36,8 @@ docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
   -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
   -e VLLM_NVFP4_GEMM_BACKEND=marlin \
+  --label "dgx.profile=hf_unsloth_qwen3.8-27b-nvfp4" \
+  --label "dgx.engine=vllm" \
   eugr/spark-vllm:latest \
   vllm serve \
   --model /root/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/57926baca9a82b4d6906b43f2750d55315f5b10f \
