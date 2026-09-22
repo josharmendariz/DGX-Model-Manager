@@ -22,6 +22,8 @@ exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
+  --label "dgx.profile=hf_qwen_qwen3-8b" \
+  --label "dgx.engine=vllm" \
   eugr/spark-vllm:latest \
   vllm serve \
   --model "${MODEL}" \

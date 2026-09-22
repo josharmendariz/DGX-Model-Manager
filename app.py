@@ -1648,7 +1648,31 @@ async def _k8s_vllm_deployments() -> dict:
     return {"ok": True, "deployments": deployments}
 
 
-def _identify_active_profile(status: dict, profiles: list[dict]) -> Optional[str]:
+async def _docker_label(container_name: str, label: str) -> Optional[str]:
+    """Read one Docker label off a running container, or None if unset/absent."""
+    result = await _run(
+        "docker", "inspect", "--format", f'{{{{index .Config.Labels "{label}"}}}}',
+        container_name, timeout=5)
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value if value and value != "<no value>" else None
+
+
+async def _identify_active_profile(status: dict, profiles: list[dict]) -> Optional[str]:
+    # Primary: the running container's own dgx.profile label — set at launch by
+    # the profile script, so it identifies the profile directly rather than
+    # inferring it from the served model name (which every profile aliases to
+    # the same generic "vllm-active", making name-based matching order-dependent
+    # and wrong whenever more than one profile matches).
+    container_name = next(
+        (i.get("name") for i in status.get("instances", []) if i.get("running")), None)
+    if container_name:
+        label = await _docker_label(container_name, "dgx.profile")
+        if label:
+            for p in profiles:
+                if p.get("id", "").removeprefix("start_") == label:
+                    return p.get("id")
     served = status.get("model") or ""
     if not served:
         return None
@@ -1675,7 +1699,7 @@ async def get_warm_models():
     vllm_status = await _engine_status(
         _engine_bases["vllm"], _ENGINES["vllm"].get("docker_filter", "vllm"),
         _ENGINES["vllm"].get("health_path", "/health"), _ENGINES["vllm"].get("models_path"))
-    active_profile = _identify_active_profile(vllm_status, vllm_profiles)
+    active_profile = await _identify_active_profile(vllm_status, vllm_profiles)
     nvidia, docker, ollama, k8s = await asyncio.gather(
         _nvidia_compute_apps(),
         _docker_model_containers(),
@@ -3136,11 +3160,12 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
     A new profile's start script does `docker rm -f <container>`, so whatever is
     running now will be torn down and its unified memory freed before the new one
     loads. Because a running engine's real footprint is unmeasurable on the GB10
-    (see _get_available_memory_gb), we identify WHICH profile is live by matching
-    the engine's reported served-model-name against each profile's start script
-    (scripts embed their own --served-model-name), and credit that profile's
-    declared vram_gb. Returns (0.0, "") if nothing is running or the running
-    profile cannot be identified — a deliberately conservative credit.
+    (see _get_available_memory_gb), we identify WHICH profile is live primarily
+    via the running container's own `dgx.profile` label (set at launch), falling
+    back to matching the engine's reported served-model-name against each
+    profile's start script for profiles that don't set the label yet. Returns
+    (0.0, "") if nothing is running or the running profile cannot be identified
+    — a deliberately conservative credit.
     """
     eng = _ENGINES.get(engine_key)
     if not eng:
@@ -3156,6 +3181,16 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
     served = status.get("model")
     if not served:
         return 0.0, ""
+    container_name = next(
+        (i.get("name") for i in status.get("instances", []) if i.get("running")), None)
+    if container_name:
+        label = await _docker_label(container_name, "dgx.profile")
+        if label:
+            for p in profiles:
+                if p.get("vram_gb") is None:
+                    continue
+                if p["id"].removeprefix("start_") == label:
+                    return float(p["vram_gb"]), p["id"]
     # Primary match: served name appears verbatim in a profile's start script.
     for p in profiles:
         if p.get("vram_gb") is None:

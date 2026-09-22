@@ -13,6 +13,8 @@ exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:
   -v "/mnt/models/qwen2.5-14b-instruct-gptq-int8:/models/qwen2.5-14b-instruct-gptq-int8:ro" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
+  --label "dgx.profile=hf_qwen2.5-14b-instruct-gptq-int8" \
+  --label "dgx.engine=vllm" \
   vllm/vllm-openai:v0.20.0 \
   --model "/models/qwen2.5-14b-instruct-gptq-int8" \
   --served-model-name "qwen2.5-14b-instruct-gptq-int8" "qwen2.5-14b-instruct-gptq-int8" vllm-active \

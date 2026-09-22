@@ -64,6 +64,8 @@ exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:
   -e TIKTOKEN_ENCODINGS_BASE=/root/.cache/huggingface/harmony-encodings \
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
   -e VLLM_MARLIN_USE_ATOMIC_ADD=1 \
+  --label "dgx.profile=hf_openai_gpt-oss-120b" \
+  --label "dgx.engine=vllm" \
   eugr/spark-vllm:latest \
   vllm serve \
   --model "/root/.cache/huggingface/hub/models--openai--gpt-oss-120b/snapshots/b5c939de8f754692c1647ca79fbf85e8c1e70f8a" \

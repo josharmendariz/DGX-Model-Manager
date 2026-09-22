@@ -23,6 +23,8 @@ exec docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
   -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
   -e VLLM_NVFP4_GEMM_BACKEND=marlin \
+  --label "dgx.profile=hf_lyf_qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-nvfp4" \
+  --label "dgx.engine=vllm" \
   vllm/vllm-openai:v0.20.0 \
   --model "/root/.cache/huggingface/hub/models--lyf--Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4/snapshots/c9eb0a997ecfc688c468146404606ef6df49555f" \
   --served-model-name "lyf/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4" "lyf--Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-NVFP4" vllm-active \
