@@ -259,7 +259,6 @@ _REPO_PROFILES = pathlib.Path(appmod.__file__).parent / "profiles" / "vLLM"
 _EXPECTED_CLASSES = {
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-14b.sh": "generated",
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-32b.sh": "generated",
-    "start_hf_lyf_qwen3.6-35b-a3b-uncensored-hauhaucs-aggressive-nvfp4.sh": "generated",
     # Hand-written wrapper around a third-party serve.sh; no generated-by marker,
     # no placeholder, no recipe call.
     "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh": "legacy",
