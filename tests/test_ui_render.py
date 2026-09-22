@@ -1,11 +1,11 @@
 """Source-text tests over the profile-card render path (04-02, criterion 3).
 
-The UI is a single Python-embedded HTML/JS blob with no test harness, so the render
+The UI is a single HTML/JS template (dashboard.html) with no test harness, so the render
 template is asserted as source text. Every assertion below strips `#`-comment lines
 first: prose in a comment must not be able to satisfy a gate.
 """
 
-import inspect
+import pathlib
 import re
 
 import app as appmod
@@ -17,7 +17,8 @@ def _code_only(source: str) -> str:
         line for line in source.splitlines() if not line.strip().startswith("#"))
 
 
-APP_SOURCE = _code_only(inspect.getsource(appmod))
+APP_SOURCE = _code_only(
+    (pathlib.Path(appmod.__file__).parent / "dashboard.html").read_text())
 
 
 def _fn(name: str) -> str:

@@ -3,7 +3,7 @@
 Two independent gates:
   1. Behavioural — the `esc` character table, executed under node when available and
      always re-checked against a Python reimplementation of the same table.
-  2. Source — a static guard over app.py asserting that no interpolation *or*
+  2. Source — a static guard over dashboard.html asserting that no interpolation *or*
      concatenation in the profile-card and HF-browse render paths reaches innerHTML
      without esc(). The concatenation half exists because two of the highest-risk
      sinks (the reflected search term, and e.message) are built with `+`, which a
@@ -20,7 +20,7 @@ import pytest
 
 import app as appmod
 
-APP_PATH = pathlib.Path(appmod.__file__)
+APP_PATH = pathlib.Path(appmod.__file__).parent / "dashboard.html"
 APP_SOURCE = APP_PATH.read_text()
 
 # Hostile inputs and their correct escaping. Every one of these is a real shape:

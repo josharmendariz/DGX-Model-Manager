@@ -112,6 +112,13 @@
     "include_ports": [],
     "exclude_services": []
   },
+  "homelab": {
+    "_comment": "Optional — the node list for System > Homelab (the built-in default lists this author's four machines, so set your own). tailscale_ip is optional; leave it out for a node that is not on the tailnet.",
+    "nodes": [
+      {"name": "controlplane", "role": "k3s control plane", "local_ip": "192.168.1.10", "tailscale_ip": "100.64.0.10"},
+      {"name": "nas", "role": "Storage", "local_ip": "192.168.1.20"}
+    ]
+  },
   "hosts": {
     "_comment": "Optional \u2014 name the machines you link to from the Dashboards tab once, so a sites entry can say \"host\": \"controlplane\" instead of repeating an IP everywhere it's used. Values are a hostname or IP only (no scheme, no port).",
     "controlplane": "100.92.70.98"
