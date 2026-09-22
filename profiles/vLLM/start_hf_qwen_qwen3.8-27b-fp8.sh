@@ -40,6 +40,8 @@ docker run -d --name vllm_node --gpus all -p 8000:8000 \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \
+  --label "dgx.profile=hf_qwen_qwen3.8-27b-fp8" \
+  --label "dgx.engine=vllm" \
   eugr/spark-vllm:latest \
   vllm serve \
   --model /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a \

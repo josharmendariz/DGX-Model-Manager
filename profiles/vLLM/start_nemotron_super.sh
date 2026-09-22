@@ -16,6 +16,8 @@ exec docker run -d --name vllm_node --restart unless-stopped --gpus all -p 8000:
   -e VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm \
   -e VLLM_USE_FLASHINFER_MOE_FP4=0 \
   -e VLLM_NVFP4_GEMM_BACKEND=marlin \
+  --label "dgx.profile=nemotron_super" \
+  --label "dgx.engine=vllm" \
   vllm/vllm-openai:v0.20.0 \
   --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
   --served-model-name nvidia/nemotron-3-super nemotron-3-super vllm-active \

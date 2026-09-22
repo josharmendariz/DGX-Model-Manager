@@ -19,7 +19,44 @@ def _mock_engine_status(status):
     return stub
 
 
+def _mock_docker_label(value):
+    async def stub(container_name, label):
+        return value
+    return stub
+
+
 # ── _running_profile_vram_credit ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_credit_prefers_dgx_profile_label_over_name_match(tmp_path, monkeypatch):
+    # Both profiles alias to the same generic served name ("vllm-active", as
+    # every real profile does) — without the label, substring/order matching
+    # could pick either one. The label must win regardless of script content.
+    profiles = [
+        _profile(tmp_path, "start_wrong", 20, "--served-model-name vllm-active\n"),
+        _profile(tmp_path, "start_right", 60, "--served-model-name vllm-active\n"),
+    ]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("right"))
+    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
+    assert credit == 60.0
+    assert pid == "start_right"
+
+
+@pytest.mark.asyncio
+async def test_credit_falls_back_to_name_match_when_label_absent(tmp_path, monkeypatch):
+    profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n")]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "qwen3-coder",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label(None))
+    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
+    assert credit == 60.0
+    assert pid == "start_big"
 
 @pytest.mark.asyncio
 async def test_credit_matches_served_name_in_script(tmp_path, monkeypatch):
@@ -256,3 +293,63 @@ def test_override_resolution_precedes_admission_in_source():
     src = inspect.getsource(appmod._engine_start)
     assert src.index("_resolve_overrides(") < src.index("await _vram_admission_check")
     assert src.index("_overridden_vram_gb(") < src.index("await _vram_admission_check")
+
+
+# ── _identify_active_profile ────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_identify_prefers_dgx_profile_label_over_name_match(tmp_path, monkeypatch):
+    profiles = [
+        _profile(tmp_path, "start_wrong", 20, "--served-model-name vllm-active\n"),
+        _profile(tmp_path, "start_right", 60, "--served-model-name vllm-active\n"),
+    ]
+    status = {
+        "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("right"))
+    assert await appmod._identify_active_profile(status, profiles) == "start_right"
+
+
+@pytest.mark.asyncio
+async def test_identify_falls_back_to_name_match_when_label_absent(tmp_path, monkeypatch):
+    profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n")]
+    status = {
+        "model": "qwen3-coder",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label(None))
+    assert await appmod._identify_active_profile(status, profiles) == "start_big"
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_none_without_served_model_or_instances():
+    assert await appmod._identify_active_profile({}, []) is None
+
+
+# ── _docker_label ────────────────────────────────────────────────────────────
+
+def _mock_run(stdout, returncode=0):
+    async def stub(*cmd, timeout=30):
+        import subprocess
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+    return stub
+
+
+@pytest.mark.asyncio
+async def test_docker_label_returns_value(monkeypatch):
+    monkeypatch.setattr(appmod, "_run", _mock_run("hf_qwen_qwen3.8-27b-fp8-mtp\n"))
+    assert await appmod._docker_label("vllm_node", "dgx.profile") == "hf_qwen_qwen3.8-27b-fp8-mtp"
+
+
+@pytest.mark.asyncio
+async def test_docker_label_none_on_unset_sentinel(monkeypatch):
+    # Docker's Go template prints the literal "<no value>" for a missing key.
+    monkeypatch.setattr(appmod, "_run", _mock_run("<no value>\n"))
+    assert await appmod._docker_label("vllm_node", "dgx.profile") is None
+
+
+@pytest.mark.asyncio
+async def test_docker_label_none_on_inspect_failure(monkeypatch):
+    monkeypatch.setattr(appmod, "_run", _mock_run("", returncode=1))
+    assert await appmod._docker_label("missing_container", "dgx.profile") is None
