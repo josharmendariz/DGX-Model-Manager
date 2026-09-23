@@ -4102,6 +4102,20 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
         else:
             out.append(_pf("ok", "image", f"Image '{image}' present", insp.stdout.strip()[:19]))
 
+    # Docker's short `-v host:container` syntax creates a missing host directory.
+    # Check first so a read-only validation does not mutate the host and then report
+    # the resulting empty directory as if it were a corrupt model download.
+    missing_mounts = []
+    for mount in facts.get("mounts", []):
+        source = mount.split(":", 1)[0]
+        if source and "$" not in source and not Path(source).exists():
+            missing_mounts.append(source)
+            out.append(_pf(
+                "fail", "mount_source", "Model mount source does not exist",
+                f"{source} is absent on this host. Docker would create an empty "
+                "directory there, hiding the stale profile path until vLLM starts.",
+                "Regenerate the profile from the model's current Inventory path."))
+
     # The mount-scope test from 2026-07-30, run for real: read the model's own
     # config.json through the exact bind mounts the launch will use. A dangling
     # symlink fails here in about a second instead of after a 3-minute load.
@@ -4114,7 +4128,8 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
             "skip", "mount_readable", "Model path is computed at runtime",
             f"{facts.get('model')} contains a shell substitution, so the files could "
             f"not be read ahead of the launch. Static checks still apply."))
-    elif facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]:
+    elif (facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]
+          and not missing_mounts):
         args = ["docker", "run", "--rm", "--entrypoint", "/bin/sh"]
         for m in facts["mounts"]:
             args += ["-v", m]
@@ -4225,6 +4240,35 @@ async def vllm_preflight(req: EngineStartRequest):
         "memory": _cuda_visible_memory(),
         "budget": _vllm_budget_gib(util, _cuda_visible_memory()) if util else None,
     }
+
+
+async def _validated_engine_start(req: EngineStartRequest, engine_key: str,
+                                  scan_fn) -> dict:
+    """Launch an engine, requiring vLLM's exact profile to pass preflight first.
+
+    Dry Run remains useful for inspecting all checks ahead of time, but it is not a
+    security or correctness boundary: API clients can call /start directly, and the UI
+    forgets its last verdict on refresh.  The server therefore runs the authoritative
+    check immediately before every ordinary vLLM launch.  ``force=true`` is the explicit
+    operator escape hatch shared with unified-memory admission.
+    """
+    if engine_key == "vllm" and not req.force:
+        result = await vllm_preflight(EngineStartRequest(profile=req.profile))
+        failures = [c for c in result.get("checks", []) if c.get("level") == "fail"]
+        if result.get("verdict") == "fail":
+            detail = "; ".join(
+                f"{c.get('title', 'Preflight failure')}: {c.get('detail', '')}".rstrip(": ")
+                for c in failures
+            ) or "profile validation failed"
+            raise HTTPException(
+                409,
+                f"vLLM preflight blocked '{req.profile}': {detail}. "
+                "Run Dry Run for the full report or retry with force=true.")
+
+    return await _engine_start(
+        req.profile, scan_fn, engine_key, engine_key=engine_key, force=req.force,
+        recipe=req.recipe if engine_key == "llamacpp" else None,
+        overrides=req.overrides if engine_key == "vllm" else None)
 
 
 # The one owner of "where the recipe YAMLs and run-recipe.sh live." Generator, Dry-Run
@@ -4559,10 +4603,8 @@ for _ek, _ev in _ENGINES.items():
         @app.post(f"/api/{key}/start", name=f"{key}_start",
                   dependencies=[Depends(verify_auth)])
         async def start(req: EngineStartRequest, k=key):
-            return await _engine_start(req.profile, lambda kk=k: _scan_profiles(kk), k,
-                                       engine_key=k, force=req.force,
-                                       recipe=req.recipe if k == "llamacpp" else None,
-                                       overrides=req.overrides if k == "vllm" else None)
+            return await _validated_engine_start(
+                req, k, lambda kk=k: _scan_profiles(kk))
 
     _make_engine_routes(_ek, _ev)
 
