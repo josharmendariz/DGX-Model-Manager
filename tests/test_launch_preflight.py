@@ -14,7 +14,10 @@ that all presented identically as "clicking Start did nothing":
 Every check below is on a pure function, so none of this needs docker.
 """
 
+from types import SimpleNamespace
+
 import pytest
+from fastapi import HTTPException
 
 import app as appmod
 
@@ -117,6 +120,104 @@ def test_generated_scripts_no_longer_emit_a_restart_policy():
 def test_missing_container_clear_is_flagged():
     script = FIXED_SCRIPT.replace("docker rm -f vllm_node 2>/dev/null || true\n", "")
     assert _levels(appmod._preflight_static(script, {}), "collision") == ["warn"]
+
+
+# ── Start gate: preflight is mandatory, not an optional UI gesture ───────────
+
+@pytest.mark.asyncio
+async def test_vllm_start_blocks_a_profile_that_fails_preflight(monkeypatch):
+    launched = []
+
+    async def _preflight(_req):
+        return {"verdict": "fail", "checks": [
+            {"level": "fail", "title": "Model mount missing",
+             "detail": "/mnt/models/example does not exist"},
+        ]}
+
+    async def _start(*args, **kwargs):
+        launched.append((args, kwargs))
+
+    monkeypatch.setattr(appmod, "vllm_preflight", _preflight)
+    monkeypatch.setattr(appmod, "_engine_start", _start)
+
+    with pytest.raises(HTTPException) as exc:
+        await appmod._validated_engine_start(
+            appmod.EngineStartRequest(profile="start_broken"),
+            "vllm", lambda: [])
+
+    assert exc.value.status_code == 409
+    assert "Model mount missing" in exc.value.detail
+    assert launched == []
+
+
+@pytest.mark.asyncio
+async def test_vllm_start_launches_after_nonfailing_preflight(monkeypatch):
+    calls = []
+
+    async def _preflight(_req):
+        calls.append("preflight")
+        return {"verdict": "warn", "checks": []}
+
+    async def _start(*args, **kwargs):
+        calls.append("start")
+        return {"ok": True}
+
+    monkeypatch.setattr(appmod, "vllm_preflight", _preflight)
+    monkeypatch.setattr(appmod, "_engine_start", _start)
+
+    result = await appmod._validated_engine_start(
+        appmod.EngineStartRequest(profile="start_warn"),
+        "vllm", lambda: [])
+
+    assert result == {"ok": True}
+    assert calls == ["preflight", "start"]
+
+
+@pytest.mark.asyncio
+async def test_force_is_the_explicit_preflight_bypass(monkeypatch):
+    calls = []
+
+    async def _preflight(_req):
+        calls.append("preflight")
+        return {"verdict": "fail", "checks": []}
+
+    async def _start(*args, **kwargs):
+        calls.append("start")
+        return {"ok": True}
+
+    monkeypatch.setattr(appmod, "vllm_preflight", _preflight)
+    monkeypatch.setattr(appmod, "_engine_start", _start)
+
+    result = await appmod._validated_engine_start(
+        appmod.EngineStartRequest(profile="start_force", force=True),
+        "vllm", lambda: [])
+
+    assert result == {"ok": True}
+    assert calls == ["start"]
+
+
+@pytest.mark.asyncio
+async def test_missing_mount_source_fails_without_asking_docker_to_create_it(
+        tmp_path, monkeypatch):
+    missing = tmp_path / "removed-model"
+    docker_calls = []
+
+    async def _run(*args, **kwargs):
+        docker_calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(appmod, "_run", _run)
+    facts = {
+        "image": "vllm/vllm-openai:test",
+        "mounts": [f"{missing}:/models/example:ro"],
+        "model": "/models/example",
+        "recipe_backed": False,
+    }
+
+    checks = await appmod._preflight_runtime(facts, "")
+
+    assert _levels(checks, "mount_source") == ["fail"]
+    assert not any(call[:2] == ("docker", "run") for call in docker_calls)
 
 
 # ── The memory budget (cause #3) ──────────────────────────────────────────────

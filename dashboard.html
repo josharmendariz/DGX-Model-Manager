@@ -3177,12 +3177,9 @@ async function stopEngine(eng) {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
-  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
-  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
-  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
-  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
-  // able to block the only GPU. Runs before any button state is touched, so declining leaves
-  // the UI exactly as it was.
+  // A remembered failed Dry Run lets the UI explain the problem before sending Start.
+  // The API independently runs the authoritative preflight on every unforced vLLM launch,
+  // because a refresh or a direct client must not bypass validation.
   let forceFromGate = false;
   if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
     try {
@@ -3198,7 +3195,7 @@ async function startEngine(eng) {
         forceFromGate = true;
       }
     } catch (e) {
-      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+      toast('Preflight recheck failed (' + e.message + '); the server will recheck on Start', 'err');
     }
   }
   const btn  = document.getElementById(eng.ids.start);
@@ -3230,7 +3227,8 @@ async function startEngine(eng) {
   try {
     beginPoll(await startWith(forceFromGate));
   } catch(e) {
-    if (String(e.message || '').includes('unified memory') &&
+    if ((String(e.message || '').includes('unified memory') ||
+         String(e.message || '').includes('preflight blocked')) &&
         confirm(e.message + '\n\nForce start anyway?')) {
       try {
         beginPoll(await startWith(true));
