@@ -208,3 +208,21 @@ def test_meta_error_still_outranks_the_new_classification_branches():
     """The 04-02 carry-over: meta_error is branched on first, or its test fails."""
     body = _fn("renderProfileSettings")
     assert body.index("p.meta_error") < body.index("p.classification === 'recipe'")
+
+
+def test_rendered_page_javascript_parses(tmp_path):
+    """One syntax error stops every script on the page, so the UI loads but never calls
+    the API — 2026-10-13, a line dropped into the middle of switchTab's else-if chain."""
+    import re
+    import shutil
+
+    import pytest
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    js = "\n;\n".join(re.findall(r"<script(?![^>]*src)[^>]*>(.*?)</script>", appmod.HTML, re.S))
+    path = tmp_path / "page.js"
+    path.write_text(js)
+    res = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
