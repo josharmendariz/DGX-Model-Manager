@@ -32,6 +32,13 @@ def isolate_alert_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_pin_state(tmp_path, monkeypatch):
+    """Keep the pinned-model store out of the repo — a lifespan in any test would read it."""
+    monkeypatch.setattr(appmod, "_PIN_FILE", tmp_path / "pinned_model.json")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def isolate_agent_history(tmp_path, monkeypatch):
     """Keep the agent run-history store out of the repo; reset state + locks per test.
 

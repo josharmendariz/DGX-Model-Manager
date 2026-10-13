@@ -363,6 +363,33 @@ a.model-card:hover{border-color:var(--amber)}
 .prog-meta{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .preflight-wrap{margin-top:12px}
 .preflight-wrap:empty{display:none}
+
+/* ── vLLM pinned model + load log tail ── */
+.pin-card{margin-bottom:12px;padding:12px 16px;background:var(--s1);border:1px solid var(--border);border-radius:8px}
+.pin-card.pinned{border-color:rgba(240,160,52,0.45)}
+.pin-head{display:flex;align-items:baseline;gap:10px;margin-bottom:6px}
+.pin-title{font-size:13px;font-weight:700;color:var(--amber)}
+.pin-sub{font-size:11px;color:var(--muted)}
+.pin-body{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.pin-name{font-family:var(--mono);font-size:12px;color:var(--text);min-width:0;overflow-wrap:anywhere}
+.pin-name.none{color:var(--muted)}
+.pin-actions{display:flex;gap:8px}
+.pin-status{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.6}
+.pin-status:empty{display:none}
+.pin-status .ok{color:var(--green)}
+.pin-status .warn{color:var(--amber)}
+.pin-status .bad{color:var(--red)}
+.logtail-card{margin-top:14px;padding:12px 16px;background:var(--s1);border:1px solid var(--border);border-radius:8px}
+.logtail-head{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+.logtail-title{font-size:13px;font-weight:600;color:var(--text)}
+.logtail-src{flex:1;font-family:var(--mono);font-size:11px;color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.logtail-auto{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px;cursor:pointer}
+.logtail-box{
+  height:340px;overflow:auto;margin:0;padding:10px 12px;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  font-family:var(--mono);font-size:11px;line-height:1.5;color:var(--text);
+  white-space:pre;
+}
 .preflight-head{
   display:flex;justify-content:space-between;align-items:baseline;gap:12px;
   font-size:12px;font-weight:600;padding:8px 10px;border-radius:5px 5px 0 0;
@@ -1625,6 +1652,7 @@ function switchTab(name) {
   activeTab = name;
   if (name === 'litellm') { loadLiteLLMModels(); loadLiteLLMConfig(); checkWildcard(); }
   else if (engines[name]) { loadEngineStatus(engines[name]); loadEngineProfiles(engines[name]); }
+  if (name === 'vllm') { loadVllmPin(); vllmLogTailToggle(); } else { stopVllmLogTail(); }
   else if (name === 'ollama') { loadOllamaModels(); }
   else if (name === 'inventory') { loadUnifiedInventory(); loadCustomDirs(); }
   else if (name === 'warm') { loadWarmModels(); }
@@ -2842,7 +2870,8 @@ function renderEngineProfiles(eng) {
            onclick="selectEngineProfile('${eng.key}', '${esc(q(p.id))}', this)">
         <div class="p-radio"></div>
         <div class="p-info">
-          <div class="p-name">${esc(p.name)}${p.model_missing
+          <div class="p-name">${esc(p.name)}${eng.key === 'vllm' && eng.pinnedProfile === p.id
+            ? ' <span class="inv-yes" title="Loads automatically on reboot">&#128204; pinned</span>' : ''}${p.model_missing
             ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
           <div class="p-desc">${esc(p.description)}</div>
         </div>
@@ -3173,6 +3202,87 @@ async function stopEngine(eng) {
     toast('Error: ' + e.message, 'err');
     btn.innerHTML = '\u25a0 Stop';
   }
+}
+
+// ── vLLM pinned model ──────────────────────────────────────────────────────
+// The pin is applied by the manager on its first start in a new boot; it never
+// stops a container, so a "skipped" outcome means something else won the boot.
+async function loadVllmPin() {
+  const eng = engines.vllm;
+  const card = document.getElementById('vllm-pin-card');
+  if (!eng || !card) return;
+  let d;
+  try { d = await apiFetch('/api/vllm/pin'); } catch (e) { return; }
+  eng.pinnedProfile = d.profile || null;
+  const nameEl = document.getElementById('vllm-pin-name');
+  const statusEl = document.getElementById('vllm-pin-status');
+  card.classList.toggle('pinned', !!d.profile);
+  nameEl.classList.toggle('none', !d.profile);
+  nameEl.textContent = d.profile ? (d.name || d.profile) + (d.is_default ? '  (default)' : '')
+                                 : 'None — nothing loads on reboot';
+  document.getElementById('vllm-unpin-btn').style.display = d.profile ? '' : 'none';
+  document.getElementById('vllm-pin-btn').textContent = d.profile ? 'Pin selected instead' : 'Pin selected';
+
+  const parts = [];
+  if (d.problem) {
+    parts.push('<span class="bad">⚠ Will not load on boot: ' + esc(d.problem) + '</span>');
+  }
+  const la = d.last_autostart;
+  if (la) {
+    const cls = la.action === 'launched' ? 'ok' : la.action === 'skipped' ? 'warn' : 'bad';
+    parts.push('Last boot (' + esc(la.at) + '): <span class="' + cls + '">' + esc(la.action) +
+               '</span> — ' + esc(la.detail) +
+               (la.profile && la.profile !== d.profile ? ' [profile ' + esc(la.profile) + ']' : ''));
+  }
+  statusEl.innerHTML = parts.join('<br>');
+  if (eng.profiles) renderEngineProfiles(eng);
+}
+
+async function pinSelectedVllm() {
+  const eng = engines.vllm;
+  if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
+  try {
+    const r = await apiFetch('/api/vllm/pin', 'PUT', {profile: eng.selectedProfile});
+    toast('Pinned ' + r.name + ' — loads on next reboot', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  loadVllmPin();
+}
+
+async function unpinVllm() {
+  if (!confirm('Unpin? Nothing will load automatically on reboot.')) return;
+  try { await apiFetch('/api/vllm/pin', 'DELETE'); toast('Unpinned', 'ok'); }
+  catch (e) { toast(e.message, 'err'); }
+  loadVllmPin();
+}
+
+// ── vLLM load log tail ─────────────────────────────────────────────────────
+let _vllmLogTailTimer = null;
+
+async function loadVllmLogTail() {
+  const box = document.getElementById('vllm-logtail-box');
+  const src = document.getElementById('vllm-logtail-src');
+  if (!box) return;
+  let d;
+  try { d = await apiFetch('/api/vllm/log-tail?lines=50'); }
+  catch (e) { src.textContent = 'error: ' + e.message; return; }
+  // Follow the bottom only if the reader was already there — don't yank them
+  // away from a line they scrolled up to read.
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  box.textContent = d.lines.length ? d.lines.join('\n')
+    : (d.source ? '(log is empty)' : 'No vLLM log found — vllm_node is ' + d.container_status + '.');
+  src.textContent = d.source ? d.source + ' · container ' + d.container_status : '';
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function stopVllmLogTail() {
+  if (_vllmLogTailTimer) { clearInterval(_vllmLogTailTimer); _vllmLogTailTimer = null; }
+}
+
+function vllmLogTailToggle() {
+  stopVllmLogTail();
+  loadVllmLogTail();
+  const cb = document.getElementById('vllm-logtail-auto');
+  if (cb && cb.checked) _vllmLogTailTimer = setInterval(loadVllmLogTail, 3000);
 }
 
 async function startEngine(eng) {
