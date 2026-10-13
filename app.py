@@ -1457,10 +1457,12 @@ async def _lifespan(app):
             _logger.warning(msg)
             print(msg, flush=True)
     alert_task = asyncio.create_task(_alert_loop())
+    pin_task = asyncio.create_task(_pinned_autostart())
     _logger.info("App started on port %s", APP_PORT)
     yield
     _logger.info("App shutting down")
     alert_task.cancel()
+    pin_task.cancel()
     await _http.aclose()
 
 app = FastAPI(title="DGX Model Manager", lifespan=_lifespan)
@@ -4529,6 +4531,313 @@ async def vllm_progress(container: str = "vllm_node", fresh: bool = False):
     )
 
 
+# ── Load log tail ─────────────────────────────────────────────────────────────
+# A plain "last N lines" view, complementing the phase stream above. The engine's
+# output lives in different places depending on how it was launched:
+#   1. DMM-generated scripts run vLLM as the container's PID 1 → `docker logs`.
+#   2. Recipe-backed launches (launch-cluster.sh) start the container as
+#      `sleep infinity` and `docker exec` vLLM into it, so `docker logs` is EMPTY
+#      and the output goes wherever the host-side `docker exec` process's stdout
+#      points (e.g. ~/vllm-active.log for the vllm-active boot unit).
+#   3. Last resort: the newest /tmp launch log DMM wrote.
+# Observed 2026-10-13 after a reboot: case 2, with `docker logs` silent for 15 min
+# while vLLM was actually downloading 37 GB of missing weights.
+
+_LOG_TAIL_MAX_LINES = 500
+_LOG_TAIL_READ_BYTES = 256 * 1024   # the vllm-active log reached 240 MB; never read it whole
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _clean_log_lines(text: str, n: int) -> list:
+    """Last n display lines: ANSI stripped, tqdm `\\r` redraws collapsed to their final state."""
+    out = []
+    for raw in text.split("\n"):   # not splitlines(): it also splits on bare \r
+        line = _ANSI_RE.sub("", raw.rstrip("\r").rsplit("\r", 1)[-1])
+        if line.strip():
+            out.append(line)
+    return out[-n:]
+
+
+def _tail_file(path: str, n: int) -> list:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - _LOG_TAIL_READ_BYTES))
+        data = f.read()
+    text = data.decode("utf-8", errors="replace")
+    if size > _LOG_TAIL_READ_BYTES:
+        text = text.split("\n", 1)[-1]   # drop the partial first line
+    return _clean_log_lines(text, n)
+
+
+def _docker_exec_log_file(container: str, proc_root: str = "/proc") -> Optional[str]:
+    """Host file receiving stdout of a `docker exec ... <container> ...` process, if any.
+
+    The newest such process wins: a recipe launch may leave a short-lived exec
+    (e.g. a mod applier) beside the long-running `vllm serve` one.
+    """
+    best = None   # (mtime, path)
+    for pid in os.listdir(proc_root):
+        if not pid.isdigit():
+            continue
+        try:
+            argv = Path(f"{proc_root}/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        args = [a.decode(errors="replace") for a in argv if a]
+        if (len(args) < 3 or os.path.basename(args[0]) != "docker"
+                or "exec" not in args[1:3] or container not in args):
+            continue
+        try:
+            target = os.readlink(f"{proc_root}/{pid}/fd/1")
+        except OSError:
+            continue
+        if target.startswith("/") and os.path.isfile(target):
+            mtime = os.path.getmtime(target)
+            if best is None or mtime > best[0]:
+                best = (mtime, target)
+    return best[1] if best else None
+
+
+async def _docker_logs_tail(container: str, n: int) -> Optional[list]:
+    """`docker logs --tail n`, stdout+stderr interleaved; None if the container is absent."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "logs", "--tail", str(n), container,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except (asyncio.TimeoutError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return _clean_log_lines(out.decode("utf-8", errors="replace"), n)
+
+
+async def _vllm_log_tail(container: str, n: int) -> dict:
+    state = await _container_state(container)
+    if state["exists"]:
+        lines = await _docker_logs_tail(container, n)
+        if lines:
+            return {"source": f"docker logs {container}", "lines": lines,
+                    "container_status": state["status"]}
+        path = await asyncio.to_thread(_docker_exec_log_file, container)
+        if path:
+            return {"source": path, "lines": await asyncio.to_thread(_tail_file, path, n),
+                    "container_status": state["status"]}
+    import glob
+    logs = sorted(glob.glob("/tmp/vllm_*.log"), key=os.path.getmtime, reverse=True)
+    if logs:
+        return {"source": logs[0], "lines": await asyncio.to_thread(_tail_file, logs[0], n),
+                "container_status": state["status"]}
+    return {"source": None, "lines": [], "container_status": state["status"]}
+
+
+@app.get("/api/vllm/log-tail")
+async def vllm_log_tail(container: str = "vllm_node", lines: int = 50):
+    if not _re.fullmatch(r"[A-Za-z0-9][\w.-]{0,63}", container):
+        raise HTTPException(400, "Invalid container name")
+    n = max(1, min(int(lines), _LOG_TAIL_MAX_LINES))
+    return await _vllm_log_tail(container, n)
+
+
+# ── Pinned model (load on boot) ───────────────────────────────────────────────
+# One vLLM profile can be pinned; the first time the manager starts in a new boot
+# (keyed on the kernel's boot_id, so a manager restart mid-boot never relaunches)
+# it launches that profile through the normal _engine_start path — same script,
+# same admission check, same container as clicking Start.
+#
+# Deliberately conservative:
+#   * Only profiles whose weights are fully on disk can be pinned or auto-started.
+#     A boot must never turn into a silent 37 GB download (2026-10-13).
+#   * If vLLM is already serving, or vllm_node is already running (another boot
+#     unit got there first), it does nothing — it never stops a container.
+#   * The boot is marked handled BEFORE launching, so a launch that takes the
+#     manager down with it cannot loop.
+
+_PIN_FILE = _APP_DIR / "pinned_model.json"
+_BOOT_ID_FILE = Path("/proc/sys/kernel/random/boot_id")
+_PIN_DOCKER_WAIT_S = 120
+
+
+def _boot_id() -> str:
+    try:
+        return _BOOT_ID_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _read_pin_state() -> dict:
+    try:
+        data = json.loads(_PIN_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_pin_state(state: dict) -> None:
+    tmp = _PIN_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, _PIN_FILE)
+
+
+def _snapshot_complete(snap: Path) -> bool:
+    """Every shard the safetensors index names resolves to a real file.
+
+    Judged from the index, NOT from stray `.incomplete` blobs: those outlive an
+    abandoned download (Qwen3.8-Flash-Next carries a 3 GB one from 2026-09-17
+    beside a complete snapshot), while a download in flight is exactly a snapshot
+    whose index names a shard that is not there yet.
+    """
+    index = snap / "model.safetensors.index.json"
+    if index.is_file():
+        try:
+            shards = set(json.loads(index.read_text()).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            return False
+        return bool(shards) and all((snap / s).is_file() for s in shards)
+    return any(p.is_file() for p in snap.glob("*.safetensors"))
+
+
+def _weights_incomplete(model_dir: Optional[str]) -> bool:
+    """True if a safetensors model dir has no complete snapshot. Non-safetensors dirs pass."""
+    if not model_dir:
+        return False
+    root = Path(model_dir)
+    snaps = [d for d in (root / "snapshots").iterdir() if d.is_dir()] \
+        if (root / "snapshots").is_dir() else [root]
+    looks_safetensors = any(
+        (s / "model.safetensors.index.json").exists() or any(s.glob("*.safetensors"))
+        for s in snaps)
+    if not looks_safetensors:
+        return False   # GGUF etc. — model_missing is the only signal we have
+    return not any(_snapshot_complete(s) for s in snaps)
+
+
+# Pinned when nothing has been chosen yet; an explicit Unpin stores null and sticks.
+# Override per box with config.json "vllm": {"default_pinned_profile": "<id>"}.
+_DEFAULT_PIN_PROFILE = "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid"
+
+
+def _effective_pin(state: dict) -> tuple:
+    """(profile_id or None, is_default)."""
+    if "profile" in state:
+        return state["profile"], False
+    default = _app_config.get("vllm", {}).get("default_pinned_profile", _DEFAULT_PIN_PROFILE)
+    return default or None, bool(default)
+
+
+def _pinnable_profile(profile_id: str) -> tuple:
+    """(profile, problem) — problem is None when the profile can be launched from disk."""
+    profile = next((p for p in _profiles_with_models("vllm") if p["id"] == profile_id), None)
+    if not profile:
+        return None, f"Profile '{profile_id}' not found"
+    if profile.get("model_missing"):
+        return profile, "its model weights are not on disk"
+    if _weights_incomplete(profile.get("model_dir")):
+        return profile, "its model download is incomplete"
+    return profile, None
+
+
+async def _pinned_autostart_once(profile_id: str) -> dict:
+    """Launch the pinned profile if nothing else holds vLLM. Returns the outcome record."""
+    def outcome(action: str, detail: str) -> dict:
+        _logger.info("Pinned autostart: %s — %s", action, detail)
+        return {"profile": profile_id, "action": action, "detail": detail,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+    deadline = _time.monotonic() + _PIN_DOCKER_WAIT_S
+    while (await _run("docker", "info", timeout=10)).returncode != 0:
+        if _time.monotonic() > deadline:
+            return outcome("failed", f"Docker not ready after {_PIN_DOCKER_WAIT_S}s")
+        await asyncio.sleep(3)
+
+    if await _vllm_health_ok():
+        return outcome("skipped", "vLLM was already serving")
+    state = await _container_state("vllm_node")
+    if state["exists"] and state["status"] in ("running", "restarting", "created"):
+        label = await _docker_label("vllm_node", "dgx.profile")
+        who = f"profile {label}" if label else "an unlabeled launch (another boot unit?)"
+        return outcome("skipped", f"vllm_node already {state['status']} with {who}")
+
+    profile, problem = await asyncio.to_thread(_pinnable_profile, profile_id)
+    if problem:
+        return outcome("failed", f"Not launched: {problem}")
+    try:
+        res = await _engine_start(profile_id, lambda: _scan_profiles("vllm"), "vllm",
+                                  engine_key="vllm")
+    except HTTPException as e:
+        return outcome("failed", str(e.detail))
+    except Exception as e:
+        return outcome("failed", f"{type(e).__name__}: {e}")
+    return outcome("launched", res.get("message", "launched"))
+
+
+async def _pinned_autostart() -> None:
+    boot = _boot_id()
+    if not boot:
+        return
+    if not _PIN_FILE.exists():
+        # First run of this feature on the box: the default pin applies from the
+        # NEXT boot. Deploying the manager must not itself launch a model.
+        _write_pin_state({"handled_boot_id": boot})
+        return
+    state = _read_pin_state()
+    profile_id, _ = _effective_pin(state)
+    if not profile_id or state.get("handled_boot_id") == boot:
+        return
+    state["handled_boot_id"] = boot
+    _write_pin_state(state)
+    result = await _pinned_autostart_once(profile_id)
+    state = _read_pin_state()
+    state["last_autostart"] = result
+    _write_pin_state(state)
+
+
+class PinRequest(BaseModel):
+    profile: str
+
+
+@app.get("/api/vllm/pin")
+async def get_vllm_pin():
+    state = _read_pin_state()
+    profile_id, is_default = _effective_pin(state)
+    out = {"profile": profile_id, "is_default": is_default, "name": None, "problem": None,
+           "pinned_at": state.get("pinned_at"),
+           "last_autostart": state.get("last_autostart")}
+    if profile_id:
+        profile, problem = await asyncio.to_thread(_pinnable_profile, profile_id)
+        out["name"] = profile["name"] if profile else None
+        out["problem"] = problem
+    return out
+
+
+@app.put("/api/vllm/pin", dependencies=[Depends(verify_auth)])
+async def set_vllm_pin(req: PinRequest):
+    profile, problem = await asyncio.to_thread(_pinnable_profile, req.profile)
+    if problem:
+        raise HTTPException(404 if profile is None else 400, f"Cannot pin: {problem}")
+    state = _read_pin_state()
+    state.update(profile=req.profile,
+                 pinned_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 # Pinning applies from the NEXT boot; it must not fire on the next
+                 # manager restart within this one.
+                 handled_boot_id=_boot_id())
+    _write_pin_state(state)
+    _logger.info("Pinned vLLM profile '%s' for boot", req.profile)
+    return {"ok": True, "profile": req.profile, "name": profile["name"]}
+
+
+@app.delete("/api/vllm/pin", dependencies=[Depends(verify_auth)])
+async def clear_vllm_pin():
+    state = _read_pin_state()
+    old, _ = _effective_pin(state)
+    state["profile"] = None   # explicit null, so the default does not come back
+    state.pop("pinned_at", None)
+    _write_pin_state(state)
+    _logger.info("Unpinned vLLM profile '%s'", old)
+    return {"ok": True, "unpinned": old}
+
+
 # ── Dynamic engine routes ─────────────────────────────────────────────────────
 # Auto-generate /api/{key}/profiles, status, stop, start for every engine.
 
@@ -6382,6 +6691,32 @@ _engine_pills = "".join(f'    <div class="pill" id="pill-{k}"><div class="dot"><
 _engine_nav_items = "".join(f'    <div class="nav-item" id="nav-{k}" onclick="switchTab(\'{k}\')">\n      <span class="nav-icon">{e["icon"]}</span>{e["name"]}\n    </div>\n' for k, e in _ENGINES.items())
 _log_tab_buttons = "".join(f'            <button class="btn btn-sm log-tab-btn{" active" if i == 0 else ""}" id="eng-tab-{k}" onclick="switchEngineLog(\'{k}\')">{e["name"]}</button>\n' for i, (k, e) in enumerate(_ENGINES.items()))
 _mem_alert_pct = str(_ALERT_THRESHOLDS["memory_percent"])
+# vLLM-only panels, spliced into the generic engine tab below.
+_VLLM_PIN_CARD = '''      <div class="pin-card" id="vllm-pin-card">
+        <div class="pin-head">
+          <span class="pin-title">&#128204; Pinned model</span>
+          <span class="pin-sub">loads automatically on reboot</span>
+        </div>
+        <div class="pin-body">
+          <div class="pin-name" id="vllm-pin-name">&mdash;</div>
+          <div class="pin-actions">
+            <button class="btn btn-sm" id="vllm-pin-btn" onclick="pinSelectedVllm()">Pin selected</button>
+            <button class="btn btn-sm btn-danger" id="vllm-unpin-btn" onclick="unpinVllm()" style="display:none">Unpin</button>
+          </div>
+        </div>
+        <div class="pin-status" id="vllm-pin-status"></div>
+      </div>
+'''
+_VLLM_LOG_TAIL_CARD = '''      <div class="logtail-card" id="vllm-logtail-card">
+        <div class="logtail-head">
+          <span class="logtail-title">Load log &middot; last 50 lines</span>
+          <span class="logtail-src" id="vllm-logtail-src"></span>
+          <label class="logtail-auto"><input type="checkbox" id="vllm-logtail-auto" checked onchange="vllmLogTailToggle()"> Auto-refresh</label>
+          <button class="btn btn-sm" onclick="loadVllmLogTail()">Refresh</button>
+        </div>
+        <pre class="logtail-box" id="vllm-logtail-box">Loading&hellip;</pre>
+      </div>
+'''
 _engine_tabs = "".join(f'''    <div class="tab" id="tab-{k}">
       <div class="page-hdr">
         <div class="page-title">{e["name"]} Engine</div>
@@ -6410,7 +6745,7 @@ _engine_tabs = "".join(f'''    <div class="tab" id="tab-{k}">
         Name, description, and VRAM are read from optional header comments in the script:<br>
         <code style="font-family:var(--mono);font-size:11px;color:var(--dim)"># Name: My Model &nbsp;\u00b7&nbsp; # Description: ... &nbsp;\u00b7&nbsp; # VRAM: 119</code>
       </div>
-      <div class="subtabs" id="{k}-subtabs">
+{_VLLM_PIN_CARD if k == "vllm" else ""}      <div class="subtabs" id="{k}-subtabs">
         <button class="subtab active" id="{k}-subtab-models" onclick="setProfileView('{k}','models')">Models</button>
         <button class="subtab" id="{k}-subtab-profiles" onclick="setProfileView('{k}','profiles')">Profiles</button>
         <span class="subtab-note" id="{k}-subtab-note"></span>
@@ -6437,7 +6772,7 @@ _engine_tabs = "".join(f'''    <div class="tab" id="tab-{k}">
         <div class="prog-log" id="{k}-log"></div>
       </div>
       <div id="{k}-preflight" class="preflight-wrap"></div>
-    </div>
+{_VLLM_LOG_TAIL_CARD if k == "vllm" else ""}    </div>
 ''' for k, e in _ENGINES.items())
 _settings_engine_cards = "".join(f'''      <div class="card" id="svc-{k}-card" style="margin-bottom:8px">
         <div class="card-row" style="align-items:center">
