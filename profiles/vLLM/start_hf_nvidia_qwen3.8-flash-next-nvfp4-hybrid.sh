@@ -54,7 +54,9 @@
 # AND verified by sha256 checksum in the Dockerfile, every patch gated behind an opt-in
 # env var (a no-op with the flag off) and self-verifies at build time. Cloned to
 # ~/qwen3.8-Flash-DGX on this box; this script is a thin wrapper around its own
-# scripts/serve.sh (the "default" profile: MODE=hybrid YARN=1 CTX=500000 MTP=2), not a
+# lowered 2026-10-15 from serve.sh default (YARN=1 CTX=500000) to native 262k: the
+# 500k YaRN reservation squeezed host memory (16 GiB avail) and caused ECONNRESET
+# harness faults fleet-wide. No consumer needs >262k. Revert: git checkout this file + rerun.
 # reimplementation — the serve script's own patch-application, YaRN math, MTP+YaRN
 # interaction fix, and effort-alias chat-template rewrite are all nontrivial and already
 # validated; hand-rolling them here would just be a second, untested copy.
@@ -101,6 +103,6 @@ fi
 # notes): a restart policy on a launch that may be wrong turns a bad script into a
 # persistent outage. vllm-default-model.service owns boot recovery instead.
 cd "$FLASH_REPO"
-NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=1 CTX=500000 MTP=2 \
+NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=0 CTX=262144 MTP=2 \
   GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" ./scripts/serve.sh
 docker update --restart no vllm_node
