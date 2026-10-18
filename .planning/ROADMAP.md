@@ -23,7 +23,7 @@ printed, and so synthesis runs on this box rather than an external service.
 - [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [x] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [x] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls (completed 2026-08-21)
-- [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label
+- [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label (partial: label reclaim shipped in 9410656; see status below)
 - [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
 
 ## Phase Details
@@ -183,6 +183,28 @@ Plans:
 - [ ] 05-01: Executor-budget metadata + unit-consistent admission math
 - [ ] 05-02: Label-based reclaim identification, launch lock, and failure surfacing
 
+**Status (verified against code 2026-10-18, origin/main 56bdfb5)**: Not formally planned or
+executed. Parts shipped outside the phase. Draft plan:
+`phases/05-admission-truth/05-PLAN-DRAFT.md`.
+  1. Executor budget: **open**. Generated scripts write `# VRAM:` as a weights estimate
+     (`size_gb × mult + 12`, `_profile_model_info`). Only the util-override path
+     (`_overridden_vram_gb`) uses `util × pool`, and it uses a hard-coded `121.0`, not live
+     MemTotal. Hand-written profiles happen to use `util × 121` by convention only.
+  2. Binary GiB units: **open**. MemAvailable is read as GiB (`/1024/1024`). Weights, KV and
+     overhead in `_derive_launch_spec` and `_profile_model_info` are decimal GB (`/1e9`).
+     Both are compared in `_vram_admission_check`.
+  3. Docker-label reclaim: **mostly done** (9410656). `_running_profile_vram_credit` and
+     `_identify_active_profile` read `dgx.profile` first. Substring/fuzzy name-match fallback
+     remains for unlabeled containers. `start_hf_qwen_qwen3.6-35b-a3b-fp8.sh`
+     (recipe-backed) still sets no label.
+  4. Concurrent starts: **open**. `_engine_start` has no lock or in-flight reservation.
+     Two starts (UI + pinned autostart, or two engines) can both pass admission against
+     the same MemAvailable.
+  5. Exit code / OOM: **partial**. `_load_progress_events` reports `State.ExitCode` on the
+     SSE stream when the container exits, and the UI shows it (`dashboard.html`). There is
+     no `OOMKilled` read and no test on that path. The verdict exists only while a client
+     is watching the stream.
+
 ### Phase 6: Verifiable research capture
 **Goal**: A research run produces findings that cannot assert a number no source actually
 printed, runs on this box's own stack rather than an external Codex call, and never writes
@@ -230,6 +252,9 @@ Plans:
       engine-parity test, `local`-kind findings from bench output
 - [ ] 06-04: Rule/finding separation — rules reference finding ids, research loses KB write
       access, stale-and-inert reporting on the recommendations API
+
+**Status (verified 2026-10-18)**: Not started. There is no `phases/06-*` directory and no
+RESEARCH.md, and none of criteria 1–9 is implemented.
 
 **Not covered here, deliberately**: `_eval_profile_match` still greps raw script text, so a
 commented-out flag can fire a rule and `model_absent` is suppressed by an incidental mention

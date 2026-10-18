@@ -260,14 +260,15 @@ Centralized configuration for all 7 service URLs and API key management. One-cli
 
 ## Security
 
-API key authentication is **optional** and can be enabled from the Settings tab.
+An API key is optional on a loopback-only bind and can be set from the Settings tab. On any other bind, mutating requests are refused until a key is set or open access is explicitly acknowledged.
 
 - When set, all mutating operations and sensitive read endpoints require the key via `Authorization: Bearer <key>`
 - Basic status, inventory, and profile endpoints remain accessible without auth
 - The key is stored in `config.json` as a SHA-256 hash — the plaintext is never written to disk
 - Verification uses constant-time `hmac.compare_digest()` to prevent timing attacks
 - Legacy plaintext keys from older versions are auto-upgraded to hashes on first load
-- If the app starts bound to a non-loopback address with no key set, it emits a warning to the systemd journal and waits 10 seconds before accepting connections. Set `MODEL_MANAGER_ALLOW_UNAUTH=1` to suppress this.
+- With no key set and a non-loopback bind, every mutating endpoint returns **503** (fail closed). Startup also logs a warning and waits 10 seconds before accepting connections. Because of the 503, the first key cannot be installed remotely. Set it in `config.json` (`app.api_key`) or from the UI over loopback.
+- Setting `MODEL_MANAGER_ALLOW_UNAUTH=1` accepts the risk: mutating requests are allowed without a key and each one is logged. The startup delay is skipped. The shipped `deploy/dgx-model-manager.service` sets this variable for a Tailscale-only bind. Remove it if the bind is reachable from anything you do not trust.
 
 ---
 
