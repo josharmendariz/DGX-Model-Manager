@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -5181,7 +5181,7 @@ def _container_model_mount(launch_dir: Path, slug: str) -> tuple[list[str], str]
         # shell expanding $HOME at launch time. Quoting would make $HOME a literal and
         # break every cache-backed profile. No untrusted value is interpolated here.
         return [
-            f'  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
+            '  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \\',
         ], "/root/.cache/huggingface/" + str(rel).replace(os.sep, "/")
     # HF-layout repo outside HF_CACHE_DIR (i.e. under a custom dir such as
     # /opt/models or /mnt/models). Entries in snapshots/<rev>/ are relative

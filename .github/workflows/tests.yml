@@ -3,6 +3,17 @@ name: tests
 on: [push, pull_request]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned so a ruff release cannot turn CI red without a code change.
+      - run: pip install ruff==0.14.0
+      - run: ruff check --output-format=github .
+
   pytest:
     runs-on: ubuntu-latest
     steps:

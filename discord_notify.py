@@ -8,7 +8,6 @@ import sys
 import urllib.request
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 # Discord's edge (Cloudflare) 403s the default "Python-urllib/*" User-Agent,
 # so a real POST silently fails even when the webhook is valid. Send an
