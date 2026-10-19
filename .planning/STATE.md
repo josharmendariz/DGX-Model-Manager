@@ -4,7 +4,7 @@ milestone: v1.0
 milestone_name: milestone
 status: executing
 last_updated: "2026-10-18T00:00:00-05:00"
-last_activity: 2026-10-18 -- API key verified live; authentication cleanup and drift check prepared locally
+last_activity: 2026-10-18 -- approved authentication and drift-check rollout deployed and verified on gb10
 progress:
   total_phases: 7
   completed_phases: 6
@@ -20,25 +20,22 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-02)
 
 **Core value:** Switching the active vLLM model must be safe and correct.
-**Current focus:** Finish authentication hardening and deploy the verified startup drift check after approval. Profile tuning needs a separate model-switching window. Phase 6 remains optional.
+**Current focus:** Authentication hardening and startup drift detection are deployed and verified. Profile tuning needs a separate model-switching window. Phase 6 remains optional.
 
 ## Current Position
 
-Updated 2026-10-18 (America/Chicago) against GitHub `main` 2315f4f and live read-only
-checks of gb10. PR #26 (`docs/phase5-status`, 9d213c8) is still open; this follow-up
-builds on its Phase 5 reconciliation. The dated Claude handoff is historical evidence.
+Updated 2026-10-18 (America/Chicago) against GitHub `main` c005e60 and live checks
+of gb10. PRs #26, #27 and #28 are merged. The dated Claude handoff is historical evidence.
 
 - Phases 1, 1.1, 2, 3, 4 and 5 are complete.
 - **Phase 5 (admission truth)** shipped in #23 and #24 (follow-ups #22, #25) and is
-  deployed to gb10 at 1c2d785. Per-criterion status and the still-open items (util
+  included in gb10's release c005e60. Per-criterion status and the still-open items (util
   measurement for five profiles, refusal smoke test, Qwen3.6 label check) are in ROADMAP.md.
 - **Phase 6 (verifiable research capture)** has not started. It is independent of the launch
   path and low value unless the Advisor's recommendations are relied on.
-- Suite: 673 passed, 4 skipped (`.venv/bin/python -m pytest -q`, about 2.5 s). The skips
-  are host-dependent tests (litellm config, which also skip in CI).
-- Candidate implementation `30a5c1d` on `fix/auth-default-and-litellm-drift`:
+- Released implementation (#27) and startup-journal follow-up (#28):
   **692 passed, 4 skipped**, Ruff 0.14.0 passed, and systemd accepted the template
-  plus authentication drop-in. This candidate has not been published or deployed.
+  plus authentication drop-in. The merged tree matches the tested candidate.
 - CI (`.github/workflows/tests.yml`) runs pytest plus a ruff E9/F correctness lint (#19).
 
 ## Off-roadmap work since Phase 4 (on main)
@@ -51,25 +48,26 @@ vLLM model on boot + load-log tail (db32241), Qwen Flash host-headroom fix (6730
 
 - **Authentication is active.** Josh installed a key through Settings. The live API
   reports `api_key_set: true`; the persisted key hash is present. Protected reads reject
-  both missing and invalid tokens with 401. The token/hash was not printed. A successful
-  authenticated browser read still needs operator confirmation.
-- **Remove the unauthenticated exception after approval.** The running process still has
-  `MODEL_MANAGER_ALLOW_UNAUTH=1`, but it does not bypass a configured key. Candidate
-  `deploy/require-auth.conf` removes it without replacing the customized installed unit.
-  Installing the drop-in, reloading systemd, and restarting DMM require approval.
-- **LiteLLM startup drift check is prepared, not deployed.** The existing
-  `_restart_litellm_backend` explicitly syncs the file into the ConfigMap. The candidate
+  both missing and invalid tokens with 401. The token/hash was not printed. Josh confirmed
+  System Overview works in his browser before the approved restart, then confirmed
+  Logs & Debug works after refresh following rollout. Browser verification is complete.
+- **Unauthenticated exception removed.** The reviewed `require-auth.conf` drop-in is
+  installed; the running process has no `MODEL_MANAGER_ALLOW_UNAUTH` variable. The
+  customized unit and saved configuration are byte-for-byte unchanged. DMM was
+  restarted once with Josh's explicit approval; no engine was restarted.
+- **LiteLLM startup drift check is deployed.** The existing
+  `_restart_litellm_backend` explicitly syncs the file into the ConfigMap. The release
   adds a read-only startup comparison with bounded Kubernetes lookup and redacted
-  diagnostics. The live source and ConfigMap currently match; no sync was performed.
-- Next: approve the authentication-only rollout; publish/review the candidate after
-  #26; approve its merge and deployment separately. Profile tuning, refusal smoke,
+  diagnostics. The new invocation journal reports `LiteLLM config drift startup result: match`.
+  No ConfigMap sync or LiteLLM rollout was performed.
+- Next: profile tuning in an approved model-switching window. Refusal smoke,
   modularization, and Phase 6 remain outside this session's implementation scope.
 
 ## Environment Notes
 
 - **Live state, 2026-10-18 (gb10):**
-  - **Service:** `dgx-model-manager.service` is active; checkout is clean at 1c2d785.
-    This session did not deploy, restart, or launch/stop an engine.
+  - **Service:** `dgx-model-manager.service` is active at deployed code c005e60.
+    Git fast-forwarded from 1c2d785; only DMM was restarted after validation.
   - **Inference:** direct `/v1/models` responds with `qwen3.8-flash-next`,
     `nvidia--Qwen3.8-Flash-Next-NVFP4`, and `vllm-active`. These are observed API IDs;
     the handoff's `qwen38-flash-dgx` label was not used as current model proof.
@@ -78,8 +76,14 @@ vLLM model on boot + load-log tail (db32241), Qwen Flash host-headroom fix (6730
   - **LiteLLM:** Kubernetes mode enabled. Source
     `/home/josh/dgx-stack/litellm-config-prod.yaml` is YAML-equivalent to
     `llm-inference/litellm-config`, key `config.yaml`. No contents were printed.
-  - **Unit:** installed user unit differs from the repository template; no drop-ins
-    were installed. Preserve it and use the prepared minimal authentication drop-in.
+  - **Unit:** the customized installed unit is unchanged. The new authentication
+    drop-in removes the exception. DMM still listens only on `100.115.54.83:8090`.
+  - **Inference continuity:** container `4c4f68ed11cd` retained its full identity and
+    `2026-10-16T03:18:53.41314325Z` start time. Direct inference returned 200 both on
+    GB10 and from controlplane after the DMM restart.
+  - **Recovery:** private configuration/unit backups and nonsecret verification
+    evidence are under GB10's
+    `~/.local/state/dgx-model-manager/rollouts/20261019T022354Z-auth-and-drift`.
 
 Historical hardware sizing/profile settings in the Claude handoff were not remeasured
 this session. Do not use them as current memory or capacity measurements.
