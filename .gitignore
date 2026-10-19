@@ -36,3 +36,7 @@ image_drift.json
 # cleanup, 2026-09-21): not source, safe to keep on disk, noisy in git status.
 *.bak-*
 .last-session.json
+
+# Pre-rewrite backups the parameterize/apply endpoint writes beside each profile
+# script (start_*.sh.bak). Local safety copies, never source.
+*.bak
