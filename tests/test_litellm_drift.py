@@ -111,7 +111,7 @@ def test_missing_kubectl_is_nonfatal_and_redacted(router, caplog):
     assert "exception-secret" not in caplog.text
 
 
-def test_startup_runs_check_once_even_when_unavailable(monkeypatch):
+def test_startup_runs_check_once_even_when_unavailable(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(appmod, "APP_HOST", "127.0.0.1")
     monkeypatch.setattr(appmod, "_http", appmod._http)
@@ -133,3 +133,4 @@ def test_startup_runs_check_once_even_when_unavailable(monkeypatch):
 
     asyncio.run(startup())
     assert calls == ["drift"]
+    assert "LiteLLM config drift startup result: unavailable" in capsys.readouterr().out

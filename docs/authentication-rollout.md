@@ -61,3 +61,8 @@ application logs. The result should be `source file matches ConfigMap`, a drift
 warning, or an unavailable warning. Never dump the router file, ConfigMap contents,
 complete unit environment, or unfiltered logs. A drift warning does not authorize
 syncing either side or rolling the LiteLLM deployment.
+
+The startup output also emits `LiteLLM config drift startup result: match`, `drift`,
+or `unavailable` to the service journal so rollout checks do not need the API token.
+Disabled Kubernetes mode emits no drift result. Detailed diagnostics remain in the
+authenticated application log.
