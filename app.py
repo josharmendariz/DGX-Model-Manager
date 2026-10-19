@@ -4178,6 +4178,13 @@ def _preflight_static(text: str, cfg: dict) -> list:
         out.append(_pf("ok", "shape", "Recipe-backed profile",
                        f"Delegates to run-recipe.sh recipe '{facts['recipe']}'. "
                        "Launch flags are owned by the recipe YAML, not by this script."))
+    elif not facts["image"]:
+        # A wrapper script (e.g. one that delegates to another repo's serve.sh) names no
+        # image of its own, so the entrypoint contract can't be judged. Reporting `fail`
+        # here would block the launch gate on a profile that works — degrade to skip.
+        out.append(_pf("skip", "entrypoint", "No image parsed from the script",
+                       "The script does not run `docker run <image>` itself, so the "
+                       "`vllm serve` entrypoint contract cannot be checked."))
     else:
         expected = _vllm_serve_command(facts["image"], cfg)
         if expected and not facts["has_serve"]:
