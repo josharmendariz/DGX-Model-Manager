@@ -47,39 +47,52 @@ async def test_credit_prefers_dgx_profile_label_over_name_match(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_credit_falls_back_to_name_match_when_label_absent(tmp_path, monkeypatch):
+async def test_unlabeled_container_earns_no_credit_even_if_name_matches(tmp_path, monkeypatch):
+    """05-02 fail-closed: the served name appears verbatim in a script, which the old
+    fallback treated as identification. Every profile aliases `vllm-active`, so that
+    was a guess — and a guessed credit can admit a launch the pool cannot hold."""
     profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n")]
     monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
         "running": True, "model": "qwen3-coder",
         "instances": [{"name": "vllm_node", "running": True}],
     }))
     monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label(None))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 60.0
-    assert pid == "start_big"
-
-@pytest.mark.asyncio
-async def test_credit_matches_served_name_in_script(tmp_path, monkeypatch):
-    profiles = [
-        _profile(tmp_path, "start_small", 20, "--served-model-name other-model\n"),
-        _profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n"),
-    ]
-    monkeypatch.setattr(appmod, "_engine_status",
-                        _mock_engine_status({"running": True, "model": "qwen3-coder"}))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 60.0
-    assert pid == "start_big"
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
 
 
 @pytest.mark.asyncio
-async def test_credit_fuzzy_fallback_on_profile_id(tmp_path, monkeypatch):
-    # Served name not verbatim in any script — falls back to token matching.
+async def test_no_fuzzy_credit_without_a_container_label(tmp_path, monkeypatch):
     profiles = [_profile(tmp_path, "start_qwen3_coder", 45)]
     monkeypatch.setattr(appmod, "_engine_status",
                         _mock_engine_status({"running": True, "model": "qwen3_coder-fp8"}))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 45.0
-    assert pid == "start_qwen3_coder"
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
+
+
+@pytest.mark.asyncio
+async def test_label_hit_on_unmetered_profile_does_not_fall_through(tmp_path, monkeypatch):
+    """The latent 9410656 bug: the label named a profile with no footprint, the loop
+    `continue`d, and name matching then credited a DIFFERENT profile's 60 GiB."""
+    profiles = [
+        _profile(tmp_path, "start_labelled", None, "--served-model-name vllm-active\n"),
+        _profile(tmp_path, "start_other", 60, "--served-model-name vllm-active\n"),
+    ]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("labelled"))
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "start_labelled")
+
+
+@pytest.mark.asyncio
+async def test_label_naming_no_known_profile_earns_no_credit(tmp_path, monkeypatch):
+    profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name vllm-active\n")]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("retired_profile"))
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
 
 
 @pytest.mark.asyncio
