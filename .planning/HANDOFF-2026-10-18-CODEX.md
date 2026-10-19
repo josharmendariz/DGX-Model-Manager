@@ -24,8 +24,8 @@ publication, merges, deployment, and the DMM-only restart. The rollout below is 
 - Private backup directory on GB10:
   `~/.local/state/dgx-model-manager/rollouts/20261019T022354Z-auth-and-drift`.
   It contains protected unit/config backups and nonsecret `verification.json`.
-- Remaining operator check: refresh Logs & Debug to confirm the browser session
-  still succeeds after restart. Do not share the token.
+- Josh confirmed Logs & Debug works after refresh following restart. The authenticated
+  browser verification is complete; no token was shared.
 
 The following sections preserve the preparation snapshot; their pending-approval
 language was superseded by the explicit approval and completed rollout above.

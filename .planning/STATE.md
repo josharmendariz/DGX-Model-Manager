@@ -49,8 +49,8 @@ vLLM model on boot + load-log tail (db32241), Qwen Flash host-headroom fix (6730
 - **Authentication is active.** Josh installed a key through Settings. The live API
   reports `api_key_set: true`; the persisted key hash is present. Protected reads reject
   both missing and invalid tokens with 401. The token/hash was not printed. Josh confirmed
-  System Overview works in his browser before the approved restart. Refresh the browser
-  after rollout to confirm the operator session still works.
+  System Overview works in his browser before the approved restart, then confirmed
+  Logs & Debug works after refresh following rollout. Browser verification is complete.
 - **Unauthenticated exception removed.** The reviewed `require-auth.conf` drop-in is
   installed; the running process has no `MODEL_MANAGER_ALLOW_UNAUTH` variable. The
   customized unit and saved configuration are byte-for-byte unchanged. DMM was
