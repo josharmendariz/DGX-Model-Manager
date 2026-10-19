@@ -1460,8 +1460,9 @@
         <div class="eyebrow">10 — System</div>
         <h2>Security</h2>
 
-        <p>API key authentication is optional and can be enabled from the Settings tab. When a key is set, all mutating
-          operations require the key.</p>
+        <p>API key authentication can be enabled from the Settings tab. On a non-loopback bind, protected operations
+          fail closed unless a key is configured or open access is explicitly acknowledged. When a key is set, all
+          protected operations require the key, even if the open-access exception remains enabled.</p>
 
         <h3>What's Protected</h3>
         <table class="param-table">
@@ -1480,16 +1481,17 @@
         <h3>First-Boot Warning</h3>
         <p>If the app starts with no API key set and is binding to a non-loopback address (anything other than
           <code>127.0.0.1</code>), it emits a loud warning to the systemd journal and waits 10 seconds before accepting
-          connections. This gives you time to notice the open-access condition before the app is reachable. Set
-          <code>MODEL_MANAGER_ALLOW_UNAUTH=1</code> in the service environment to suppress the warning and delay if you
-          intentionally want open access.
+          connections. Protected requests return 503 until a key is configured. Set
+          <code>MODEL_MANAGER_ALLOW_UNAUTH=1</code> in the service environment only if you intentionally want open
+          access; this also suppresses the warning and delay. The shipped service does not enable this exception.
         </p>
 
         <h3>How It Works</h3>
         <p>The API key is sent as an <code>Authorization: Bearer &lt;key&gt;</code> header with every request that
           requires authentication.
-          The app stores only the SHA-256 hash of the key in <code>config.json</code> — the plaintext key is never
-          written to disk. Verification uses constant-time <code>hmac.compare_digest()</code> on the hashes to prevent
+          The server stores only the SHA-256 hash of the key in <code>config.json</code>. The dashboard stores the
+          plaintext key in browser <code>localStorage</code> for subsequent requests. Keep a separate copy in your
+          password manager. Verification uses constant-time <code>hmac.compare_digest()</code> on the hashes to prevent
           timing attacks.</p>
 
         <div class="callout warn">

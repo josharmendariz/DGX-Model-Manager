@@ -8,10 +8,8 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=%h/DGX-Model-Manager
-# Tailnet-private deployment: bound to the Tailscale IP only (config.json
-# app.host), same trust model as hermes-webui — so unauthenticated access
-# inside the tailnet is acknowledged.
-Environment=MODEL_MANAGER_ALLOW_UNAUTH=1
+# Bind to the Tailscale IP in config.json (app.host), and configure app.api_key.
+# Without a key, protected endpoints fail closed on a non-loopback bind.
 # Wait for tailscale0 to carry an IPv4 address before binding to it (tailscaled
 # is a system service we can't order against from a --user unit). Give up after
 # ~60s and let the bind fail — Restart=always will retry.

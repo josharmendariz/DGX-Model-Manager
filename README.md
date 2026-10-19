@@ -264,11 +264,14 @@ An API key is optional on a loopback-only bind and can be set from the Settings 
 
 - When set, all mutating operations and sensitive read endpoints require the key via `Authorization: Bearer <key>`
 - Basic status, inventory, and profile endpoints remain accessible without auth
-- The key is stored in `config.json` as a SHA-256 hash — the plaintext is never written to disk
+- The server stores the key in `config.json` as a SHA-256 hash. The dashboard stores the plaintext key in browser `localStorage` to authenticate subsequent requests; keep a separate copy in your password manager.
 - Verification uses constant-time `hmac.compare_digest()` to prevent timing attacks
 - Legacy plaintext keys from older versions are auto-upgraded to hashes on first load
 - With no key set and a non-loopback bind, every mutating endpoint returns **503** (fail closed). Startup also logs a warning and waits 10 seconds before accepting connections. Because of the 503, the first key cannot be installed remotely. Set it in `config.json` (`app.api_key`) or from the UI over loopback.
-- Setting `MODEL_MANAGER_ALLOW_UNAUTH=1` accepts the risk: mutating requests are allowed without a key and each one is logged. The startup delay is skipped. The shipped `deploy/dgx-model-manager.service` sets this variable for a Tailscale-only bind. Remove it if the bind is reachable from anything you do not trust.
+- Setting `MODEL_MANAGER_ALLOW_UNAUTH=1` accepts the risk: protected requests are allowed without a configured key and each one is logged. The startup delay is skipped. A configured key always requires a valid bearer token, even with this variable set. The shipped service does not enable this exception.
+- For existing customized user units, install `deploy/require-auth.conf` as `~/.config/systemd/user/dgx-model-manager.service.d/require-auth.conf` after configuring the key, then reload systemd and restart DMM during an approved deployment. This removes the exception from the process environment without replacing the unit. Verify a protected read such as `GET /api/debug/config` succeeds with the key and returns 401 without it; basic status endpoints remain public.
+
+When `litellm_k8s.enabled` is true, startup compares `paths.litellm_config` with the configured ConfigMap key using parsed YAML. A mismatch or unavailable comparison produces a warning in the application logs without logging config contents. The check is read-only and does not block startup on drift or reconcile either side; inspect the intended source before using the existing explicit sync/restart action. It runs once per startup, not continuously.
 
 ---
 

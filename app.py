@@ -472,6 +472,50 @@ async def _restart_litellm_backend() -> tuple[bool, str]:
     return True, "systemd unit restarted"
 
 
+async def _check_litellm_config_drift() -> str:
+    """Report startup drift without syncing, restarting, or exposing config values.
+
+    Compare parsed YAML so comments and mapping order do not create false alarms.
+    An unavailable comparison must not be reported as a match. Kubernetes failures
+    may contain credentials or config text, so only fixed diagnostics are logged.
+    """
+    if not _litellm_k8s.get("enabled"):
+        return "disabled"
+    try:
+        source = yaml.safe_load(LITELLM_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(source, dict) or not source:
+            _logger.warning("LiteLLM config drift check unavailable: source is not a nonempty YAML mapping")
+            return "unavailable"
+        result = await _run(
+            "kubectl", "get", "configmap",
+            _litellm_k8s.get("configmap", "litellm-config"),
+            "-n", _litellm_k8s.get("namespace", "default"),
+            "-o", "json", timeout=5,
+        )
+        if result.returncode != 0:
+            _logger.warning("LiteLLM config drift check unavailable: ConfigMap read failed")
+            return "unavailable"
+        text = json.loads(result.stdout).get("data", {}).get(
+            _litellm_k8s.get("configmap_key", "config.yaml"))
+        if not isinstance(text, str):
+            _logger.warning("LiteLLM config drift check unavailable: ConfigMap key is missing or invalid")
+            return "unavailable"
+        deployed = yaml.safe_load(text)
+        if not isinstance(deployed, dict) or not deployed:
+            _logger.warning("LiteLLM config drift check unavailable: ConfigMap value is not a nonempty YAML mapping")
+            return "unavailable"
+        if source != deployed:
+            _logger.warning("LiteLLM config drift detected: source file differs from ConfigMap; "
+                            "no changes applied. Review the intended source before an explicit sync/restart.")
+            return "drift"
+    except Exception:
+        # Parser errors can embed config lines; never include exception text.
+        _logger.warning("LiteLLM config drift check unavailable: source or ConfigMap could not be read or parsed")
+        return "unavailable"
+    _logger.info("LiteLLM config drift check: source file matches ConfigMap")
+    return "match"
+
+
 def _regen_source_dir(text: str) -> str | None:
     """The `# Auto-generated … from:` launch dir, read from text we already hold.
 
@@ -1493,6 +1537,7 @@ async def _lifespan(app):
             msg = "SECURITY NOTICE: no API key set and MODEL_MANAGER_ALLOW_UNAUTH=1 — open access acknowledged."
             _logger.warning(msg)
             print(msg, flush=True)
+    await _check_litellm_config_drift()
     alert_task = asyncio.create_task(_alert_loop())
     pin_task = asyncio.create_task(_pinned_autostart())
     _logger.info("App started on port %s", APP_PORT)
