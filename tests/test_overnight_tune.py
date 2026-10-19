@@ -129,7 +129,7 @@ def test_schedule_local_zone_nonpersistent_restore_on_all_exits(tmp_path, monkey
     worker = (tmp_path / 'dmm-overnight-worker.service').read_text()
     assert '02:00:00 America/Chicago' in timer and 'Persistent=false' in timer
     assert 'ExecStopPost=/usr/bin/python3 /home/josh/DGX-Model-Manager/scripts/overnight_tune.py restore' in worker
-    assert 'RuntimeMaxSec=16200' in worker and 'TimeoutStopSec=1800' in worker
+    assert 'RuntimeMaxSec=15300' in worker and 'TimeoutStopSec=1800' in worker
     assert 'DMM_EXPECTED_COMMIT=abc123' in worker
 
 
@@ -249,7 +249,7 @@ def test_tool_smoke_validates_arguments_without_executing(monkeypatch):
 @pytest.mark.parametrize('valid', [True, False])
 def test_rehearsal_never_launches_engine(tmp_path, monkeypatch, valid):
     monkeypatch.setattr(tune, 'STATE', tmp_path)
-    monkeypatch.setattr(tune, 'precheck', lambda: None)
+    monkeypatch.setattr(tune, 'precheck', lambda **kw: None)
     monkeypatch.setattr(tune, 'ensure_idle', lambda: None)
     monkeypatch.setattr(tune, 'container', lambda: {'id': 'original'})
     monkeypatch.setattr(tune, 'launch', lambda *a: pytest.fail('rehearsal must not replace engine'))
@@ -307,3 +307,155 @@ def test_empty_recent_kernel_journal_is_clean_when_journal_readable(monkeypatch)
                     subprocess.CompletedProcess([], 0, 'Older kernel message', '')])
     monkeypatch.setattr(tune.subprocess, 'run', lambda *a, **kw: next(replies))
     assert tune.kernel_faults(123) == 0
+
+
+def test_engine_drain_waits_until_idle_without_forcing(tmp_path, monkeypatch):
+    monkeypatch.setattr(tune, 'STATE', tmp_path)
+    states = iter([{'running': 3, 'waiting': 1}, {'running': 1, 'waiting': 0}, {'running': 0, 'waiting': 0}])
+    clock = [0]
+    monkeypatch.setattr(tune, 'activity', lambda: next(states))
+    monkeypatch.setattr(tune.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(tune.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    result = tune.wait_for_idle(900, allow_busy=True)
+    assert result['idle'] and not result['forced_replacement'] and result['elapsed_s'] == 10
+
+
+@pytest.mark.parametrize('allow_busy', [True, False])
+def test_busy_deadline_is_bounded_and_requires_explicit_policy(tmp_path, monkeypatch, allow_busy):
+    monkeypatch.setattr(tune, 'STATE', tmp_path)
+    monkeypatch.setattr(tune, 'activity', lambda: {'running': 3, 'waiting': 0})
+    clock = [0]
+    monkeypatch.setattr(tune.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(tune.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0]+seconds))
+    if allow_busy:
+        result = tune.wait_for_idle(900, allow_busy=True, interval=300)
+        assert result['forced_replacement'] and not result['idle']
+    else:
+        with pytest.raises(RuntimeError, match='Drain deadline: running=3'):
+            tune.wait_for_idle(900, allow_busy=False, interval=300)
+    result = json.loads((tmp_path/'admission.json').read_text())
+    assert clock[0] == 900 and result['elapsed_s'] == 900
+    assert result['forced_replacement'] is allow_busy
+
+
+def test_missing_monitoring_never_authorizes_busy_replacement(tmp_path, monkeypatch):
+    monkeypatch.setattr(tune, 'STATE', tmp_path)
+    monkeypatch.setattr(tune, 'activity', lambda: (_ for _ in ()).throw(RuntimeError('Required activity metrics missing')))
+    with pytest.raises(RuntimeError, match='metrics missing'):
+        tune.wait_for_idle(900, allow_busy=True)
+    assert not (tmp_path/'admission.json').exists()
+
+
+def test_remote_failure_preserves_safe_reason_and_does_not_copy_stderr(tmp_path, monkeypatch):
+    monkeypatch.setattr(tune, 'STATE', tmp_path)
+    output='DMM_EVENT '+json.dumps({'event':'failure','mode':'admit','reason':'DMM has a pending launch'})+'\n'
+    monkeypatch.setattr(tune.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([],1,output,'PRIVATE TOKEN DO NOT COPY'))
+    with pytest.raises(RuntimeError, match='DMM has a pending launch'):
+        tune.command(['ssh','test'])
+    evidence=(tmp_path/'command-failure.json').read_text()
+    assert 'pending launch' in evidence and 'PRIVATE TOKEN' not in evidence
+
+
+@pytest.mark.parametrize('endpoint,binding', [('NORMAL_API','8000'),('BENCH_API','127.0.0.1:18000')])
+def test_launch_isolates_benchmark_port_and_restores_normal_binding(tmp_path, monkeypatch, endpoint, binding):
+    monkeypatch.setattr(tune, 'API', getattr(tune,endpoint))
+    calls=[]
+    monkeypatch.setattr(tune.subprocess,'Popen',lambda *a,**kw:calls.append(kw))
+    tune.launch({'profile':tune.FLASH,'util':.76,'context':262144,'seqs':8},tmp_path/'launch.log')
+    assert calls[0]['env']['VLLM_PUBLISH_BINDING']==binding
+
+
+@pytest.mark.parametrize('profile', [tune.FLASH,tune.QWEN])
+def test_profiles_reject_unreviewed_network_binding_before_docker(profile):
+    import os
+    script=Path(__file__).parents[1]/'profiles/vLLM'/f'start_{profile}.sh'
+    result=subprocess.run(['bash',str(script)],env={**os.environ,'VLLM_PUBLISH_BINDING':'0.0.0.0:18000'},capture_output=True,text=True)
+    assert result.returncode==2 and 'Invalid VLLM_PUBLISH_BINDING' in result.stderr
+
+
+def test_first_candidate_uses_existing_admission_not_pre_snapshot_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(tune,'API',tune.BENCH_API)
+    (tmp_path/'snapshot.json').write_text('{}')
+    monkeypatch.setattr(tune,'precheck',lambda **kw:pytest.fail('snapshot already created; do not repeat precheck'))
+    monkeypatch.setattr(tune,'check_manager_idle',lambda:None)
+    monkeypatch.setattr(tune,'container',lambda:{'id':'original'})
+    class Process:
+        def poll(self):return 0
+    calls=[]
+    monkeypatch.setattr(tune,'launch',lambda *a:calls.append(tune.API) or Process())
+    monkeypatch.setattr(tune,'wait_ready',lambda *a:'model')
+    monkeypatch.setattr(tune,'kernel_faults',lambda *a:0)
+    monkeypatch.setattr(tune,'tool_smoke',lambda *a:{'passed':True})
+    monkeypatch.setattr(tune.subprocess,'run',lambda *a,**kw:subprocess.CompletedProcess([],0,'GPU KV cache size: 405,625 tokens',''))
+    result=tune.qualify({'profile':tune.QWEN,'util':.49,'context':262144,'seqs':2},tmp_path,tune.time.monotonic()+100,first_replacement=True)
+    assert 'failure_reason' not in result
+    assert calls==[tune.BENCH_API]
+
+
+def test_restore_forces_normal_serving_api(tmp_path, monkeypatch):
+    fixture_snapshot(tmp_path,monkeypatch)
+    monkeypatch.setattr(tune,'API',tune.BENCH_API)
+    monkeypatch.setattr(tune,'container',lambda:{'id':'candidate','profile':tune.QWEN})
+    calls=[]
+    monkeypatch.setattr(tune,'launch',lambda *a:calls.append(tune.API))
+    monkeypatch.setattr(tune,'wait_ready',lambda *a:None)
+    monkeypatch.setattr(tune,'smoke',lambda:None)
+    tune.restore()
+    assert calls==[tune.NORMAL_API]
+
+
+@pytest.mark.parametrize('binding',['8000','127.0.0.1:18000'])
+@pytest.mark.parametrize('profile',[tune.FLASH,tune.QWEN])
+def test_real_profile_shell_passes_exact_docker_binding(tmp_path,profile,binding):
+    import os
+    home=tmp_path/'home';home.mkdir()
+    bin_path=tmp_path/'bin';bin_path.mkdir()
+    output=tmp_path/'argv.jsonl'
+    fake=bin_path/'docker'
+    fake.write_text('#!/usr/bin/python3\nimport json,os,sys\nwith open(os.environ["TEST_DOCKER_ARGS"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+    fake.chmod(0o755)
+    if profile==tune.FLASH:
+        serve=home/'qwen3.8-Flash-DGX/scripts/serve.sh';serve.parent.mkdir(parents=True)
+        serve.write_text('#!/bin/bash\nexec docker run -p "${PORT}:8000" example-image\n');serve.chmod(0o755)
+        snap=home/'.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/fake-fp8hybrid';snap.mkdir(parents=True)
+    script=Path(__file__).parents[1]/'profiles/vLLM'/f'start_{profile}.sh'
+    result=subprocess.run(['bash',str(script)],env={**os.environ,'HOME':str(home),'PATH':str(bin_path)+':'+os.environ['PATH'],
+        'TEST_DOCKER_ARGS':str(output),'SKIP_DROP_CACHES':'1','VLLM_PUBLISH_BINDING':binding},capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    invocations=[json.loads(line) for line in output.read_text().splitlines()]
+    run=next(args for args in invocations if args[0]=='run')
+    assert run[run.index('-p')+1]==binding+':8000'
+
+
+@pytest.mark.parametrize('allow',[True,False])
+def test_schedule_requires_explicit_busy_replacement_policy(tmp_path,monkeypatch,allow):
+    monkeypatch.setattr(tune,'command',lambda *a:'abc123')
+    tune.schedule('2027-10-20',tmp_path,allow_busy=allow)
+    for name in ('dmm-overnight.service','dmm-overnight-worker.service'):
+        assert f'DMM_ALLOW_BUSY_REPLACEMENT={int(allow)}' in (tmp_path/name).read_text()
+
+
+def test_restore_handles_missing_container_with_sanitized_command_failure(tmp_path,monkeypatch):
+    fixture_snapshot(tmp_path,monkeypatch)
+    monkeypatch.setattr(tune,'container',lambda:(_ for _ in ()).throw(tune.CommandFailure('docker exited 1')))
+    calls=[]
+    monkeypatch.setattr(tune,'launch',lambda settings,log:calls.append(settings['profile']))
+    monkeypatch.setattr(tune,'wait_ready',lambda *args:None)
+    monkeypatch.setattr(tune,'smoke',lambda:None)
+    tune.restore()
+    assert calls==[tune.FLASH]
+    assert json.loads((tmp_path/'snapshot.json').read_text())['restored']
+
+
+def test_wait_ready_tolerates_container_replacement_gap(monkeypatch):
+    states=iter([None,{'id':'new','status':'running','profile':tune.QWEN}])
+    def current():
+        value=next(states)
+        if value is None:raise tune.CommandFailure('docker exited 1')
+        return value
+    monkeypatch.setattr(tune,'container',current)
+    monkeypatch.setattr(tune,'request',lambda _: {'data':[{'id':'new-model'}]})
+    monkeypatch.setattr(tune.time,'sleep',lambda _:None)
+    class Process:
+        def poll(self):return 0
+    assert tune.wait_ready(Process(),10,'original',tune.QWEN)=='new-model'

@@ -19,7 +19,11 @@
 # Details and smoke-test limits: docs/profile-measurements-2026-10-18.md.
 set -euo pipefail
 
-docker rm -f vllm_node 2>/dev/null || true
+# The overnight runner isolates inference without changing normal serving defaults.
+case "${VLLM_PUBLISH_BINDING:-8000}" in
+  8000|127.0.0.1:18000) ;;
+  *) echo "Invalid VLLM_PUBLISH_BINDING" >&2; exit 2 ;;
+esac
 
 # Override guard — these expand into docker argv.
 for _dmm_var in VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS; do
@@ -37,7 +41,9 @@ if [[ -n "${VLLM_GPU_MEMORY_UTILIZATION:-}" \
 fi
 unset _dmm_var _dmm_val
 
-docker run -d --name vllm_node --gpus all -p 8000:8000 \
+docker rm -f vllm_node 2>/dev/null || true
+
+docker run -d --name vllm_node --gpus all -p "${VLLM_PUBLISH_BINDING:-8000}:8000" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
   -e HF_HUB_OFFLINE=1 \
   -e CUDA_DEVICE_MAX_CONNECTIONS=8 \

@@ -1,10 +1,10 @@
 # Fleet-informed overnight comparison
 
-Prepared 2026-10-19. **Not deployed or armed.** Josh chose Qwen3.8-27B-FP8
-and Flash Next, 02:00–07:30 **America/Chicago**, with controller pause after
-active work drains and controller resume after verified serving restoration.
-For October 19 this is 07:00–12:30 UTC. The schedule generator rejects past dates;
-missed runs do not catch up. Generate a new date if review misses this window.
+The comparison runs 02:00–07:30 **America/Chicago**, with agent-control pause
+after active jobs drain and resume after verified Flash restoration. The next
+approved window is October 20, 2026 (07:00–12:30 UTC). Deployment and activation
+evidence stays in local `.planning/` artifacts rather than this generic runbook.
+The schedule generator rejects past dates and missed runs do not catch up.
 
 ## Workload audit
 
@@ -81,8 +81,26 @@ reservation (rolled back without changing data) spans the final ledger check and
 service-cgroup freeze, preventing new recorded admissions during that transition.
 Freezing the idle controller preserves process state; queued jobs remain queued.
 The runner refuses a controller with an enabled systemd watchdog or an existing
-freeze. After serving restoration it thaws the controller and ensures it is active. Other applications and Kubernetes schedules are not
-paused. The runner aborts rather than killing active inference requests.
+freeze. After serving restoration it thaws the controller and ensures it is active.
+Known caller pause/resume hooks may be supplied as a local service drop-in, with
+identity checks and an independent resume failsafe. They are not a substitute for
+checking engine activity: pausing a caller does not cancel its pending inference.
+
+Admission records running/waiting counts under the GB10 run directory and waits
+up to **15 minutes** for the engine to drain. The explicitly approved deadline
+policy may then replace the original engine even with requests outstanding;
+those requests will be interrupted. Without `DMM_ALLOW_BUSY_REPLACEMENT=1`, a busy
+engine still causes an abort. Missing metrics, a DMM launch conflict, source or
+image drift, and active controller jobs are never overridden by this policy.
+The schedule generator enables that policy only with the explicit
+`--allow-busy-replacement` flag; its default remains abort-on-busy.
+
+Benchmark engines publish **127.0.0.1:18000** on GB10 instead of normal serving
+port 8000. All measurements use that private endpoint. Applications using 8000
+cannot reach the benchmark models, so retries do not contaminate the sweep.
+The profile override accepts only normal port 8000 or this exact loopback mapping.
+Restoration explicitly returns Flash Next to port 8000 before callers resume.
+No firewall, routing, credentials or persistent application endpoints change.
 
 GB10 executes the maintained DMM profiles from its deployed Git revision in a
 separate user systemd unit. This is the explicit host-maintenance path, not the
@@ -93,10 +111,10 @@ restart DMM during the experiment.** Existing image tags and maintained Flash
 serve script are fingerprinted; no image pull/build or source synchronization is
 performed. Normal profile page-cache reclamation remains part of each launch.
 
-The worker has `RuntimeMaxSec=16200` (4h30) and an **independent systemd
+The worker has `RuntimeMaxSec=15300` (4h15) and an **independent systemd
 ExecStopPost restore**, with `TimeoutStopSec=1800`. Its internal cutoff reserves
 45 minutes before 07:30 for restoration and starts no new candidate with less
-than 30 minutes remaining before that cutoff. The worker refuses starts more than 15 minutes after 02:00. That start bound,
+than 30 minutes remaining before that cutoff. The worker refuses starts more than 30 minutes after 02:00. That start bound,
 plus the hard worker maximum and restoration allowance, fit within 5.5 hours.
 Restoration allows 25 minutes startup plus a bounded smoke within the 30-minute
 outer allowance. This covers ordinary process errors, timeout, cancellation and
@@ -109,7 +127,10 @@ confirmation plus another serving smoke, and occurs only if it was originally
 active. Failed restoration leaves the controller paused for operator recovery.
 Private state is under `~/.local/state/dmm-overnight/<UTC-run-id>/` on each owning
 host. `report.json`, candidate `result.json` and restoration `snapshot.json` are
-metadata artifacts; raw launcher logs stay private on GB10.
+metadata artifacts; raw launcher logs stay private on GB10. Admission failures
+persist `failure.json`, safe remote diagnostics persist `command-failure.json`,
+and structured journal events retain the original precheck reason without copying
+raw stderr, environment, prompts or credentials.
 
 ## Small live rehearsal
 
@@ -121,6 +142,9 @@ separate run ID and a short deadline, before installing the overnight units.
 That exercises the real controller drain/freeze, SSH coordination, exit hooks,
 serving verification and controller thaw. It qualifies orchestration and the
 current inference protocol; it does not measure either model's cold startup.
+A busy-engine rehearsal uses a shortened drain deadline and validates the approved
+fallback without actually replacing the engine; background completions are marked
+as expected traffic, not treated as isolated performance measurements.
 
 ## Prepare, review, then deploy
 
@@ -129,7 +153,7 @@ No timer is installed by the schedule generator:
 ```bash
 python3 scripts/analyze_fleet_workload.py > /tmp/fleet-workload.json
 python3 scripts/overnight_tune.py plan
-python3 scripts/overnight_tune.py schedule --date 2026-10-19
+python3 scripts/overnight_tune.py schedule --date 2026-10-20 --allow-busy-replacement
 systemd-analyze --user verify .planning/overnight-units/*.service .planning/overnight-units/*.timer
 ```
 
@@ -143,7 +167,7 @@ switched to qualify this new runner. Complete review before arming it.
 
 After approval of the concrete revision and schedule:
 
-1. Publish the reviewed commit through Git. Deploy that exact revision through
+1. Transfer the reviewed commit through private Git transport. Deploy that exact revision through
    Git on GB10 at `/home/josh/DGX-Model-Manager`; preserve generated/untracked
    profiles and all unrelated state. Do not restart DMM for this script change.
 2. Generate units locally from the same revision. Install only

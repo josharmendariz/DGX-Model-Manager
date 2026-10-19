@@ -68,6 +68,12 @@
 # other profile in this directory.
 set -euo pipefail
 
+# The overnight runner isolates inference without changing normal serving defaults.
+case "${VLLM_PUBLISH_BINDING:-8000}" in
+  8000|127.0.0.1:18000) ;;
+  *) echo "Invalid VLLM_PUBLISH_BINDING" >&2; exit 2 ;;
+esac
+
 # Validate bounded measurement overrides before touching the running engine/cache.
 for _dmm_var in VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS; do
   _dmm_val="${!_dmm_var:-}"
@@ -122,7 +128,7 @@ fi
 # notes): a restart policy on a launch that may be wrong turns a bad script into a
 # persistent outage. vllm-default-model.service owns boot recovery instead.
 cd "$FLASH_REPO"
-NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=0 \
+NAME=vllm_node PORT="${VLLM_PUBLISH_BINDING:-8000}" IMAGE=qwen38-flash-dgx MODE=hybrid YARN=0 \
   CTX="${VLLM_MAX_MODEL_LEN:-262144}" SEQS="${VLLM_MAX_NUM_SEQS:-8}" MTP=2 \
   GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" ./scripts/serve.sh
 docker update --restart no vllm_node

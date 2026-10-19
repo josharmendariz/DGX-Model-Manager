@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -28,7 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FLASH = 'hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid'
 QWEN = 'hf_qwen_qwen3.8-27b-fp8'
 PROFILES = {FLASH: 'qwen38-flash-dgx', QWEN: 'eugr/spark-vllm:latest'}
-API = 'http://127.0.0.1:8000'
+NORMAL_API = 'http://127.0.0.1:8000'
+BENCH_API = 'http://127.0.0.1:18000'
+API = NORMAL_API
 DMM = 'http://100.115.54.83:8090'
 REMOTE_SCRIPT = '/home/josh/DGX-Model-Manager/scripts/overnight_tune.py'
 RUN_ID = os.environ.get('DMM_RUN_ID', 'manual')
@@ -45,8 +48,34 @@ def candidates():
         (FLASH, .74, 262144, 4), (FLASH, .72, 262144, 4), (FLASH, .76, 196608, 4)]]
 
 
+class CommandFailure(RuntimeError):
+    """Sanitized command failure; distinguish expected Docker startup gaps."""
+
+
+def event(value):
+    print('DMM_EVENT ' + json.dumps(value), flush=True)
+
+
 def command(argv, timeout=30, check=True):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=check).stdout
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        write(STATE / 'command-failure.json', {'command': argv[0], 'timeout_s': timeout})
+        raise CommandFailure(f'{argv[0]} command timed out after {timeout}s') from None
+    if check and result.returncode:
+        diagnostics = []
+        for line in result.stdout.splitlines():
+            if line.startswith('DMM_EVENT '):
+                try:
+                    value = json.loads(line[len('DMM_EVENT '):])
+                    diagnostics.append({k: value[k] for k in ('event', 'mode', 'reason', 'running', 'waiting') if k in value})
+                except ValueError:
+                    pass
+        failure = {'command': argv[0], 'exit_code': result.returncode, 'diagnostics': diagnostics}
+        write(STATE / 'command-failure.json', failure)
+        reason = diagnostics[-1].get('reason', 'no structured diagnostic') if diagnostics else 'no structured diagnostic'
+        raise CommandFailure(f'{argv[0]} exited {result.returncode}: {reason}')
+    return result.stdout
 
 
 def request(path, data=None, timeout=15):
@@ -115,18 +144,68 @@ def pins():
                        for p, i in PROFILES.items()}}
 
 
-def ensure_idle():
+def check_manager_idle():
     with urllib.request.urlopen(DMM + '/api/vllm/status', timeout=10) as r:
-        status = json.load(r)
-    if status.get('launch', {}).get('in_flight'):
-        raise RuntimeError('DMM has a pending launch')
+        if json.load(r).get('launch', {}).get('in_flight'):
+            raise RuntimeError('DMM has a pending launch')
+
+
+def activity():
+    check_manager_idle()
     text = urllib.request.urlopen(API + '/metrics', timeout=10).read().decode()
-    for name in ('num_requests_running', 'num_requests_waiting'):
+    counts = {}
+    for key, name in (('running', 'num_requests_running'), ('waiting', 'num_requests_waiting')):
         values = re.findall(r'^vllm:' + name + r'(?:\{[^\n]*\})?\s+(\S+)', text, re.M)
         if not values:
             raise RuntimeError('Required activity metrics missing')
-        if sum(float(v) for v in values):
-            raise RuntimeError('Inference consumers have not drained')
+        total = sum(float(v) for v in values)
+        if not math.isfinite(total) or total < 0:
+            raise RuntimeError('Invalid activity metric')
+        counts[key] = total
+    return counts
+
+
+def ensure_idle():
+    counts = activity()
+    if counts['running'] or counts['waiting']:
+        raise RuntimeError(f"Inference consumers have not drained: running={counts['running']:g}, waiting={counts['waiting']:g}")
+
+
+def wait_for_idle(timeout=900, allow_busy=False, interval=5):
+    begin = time.monotonic()
+    last = None
+    while True:
+        counts = activity()
+        elapsed = time.monotonic() - begin
+        report = {**counts, 'elapsed_s': elapsed, 'idle': not any(counts.values()),
+                  'forced_replacement': False}
+        if report['idle']:
+            write(STATE / 'admission.json', report)
+            event({'event': 'drained', **report})
+            return report
+        if elapsed >= timeout:
+            report['forced_replacement'] = allow_busy
+            write(STATE / 'admission.json', report)
+            if allow_busy:
+                event({'event': 'drain_deadline_replacement_authorized', **report})
+                return report
+            raise RuntimeError(f"Drain deadline: running={counts['running']:g}, waiting={counts['waiting']:g}")
+        write(STATE / 'admission.json', report)
+        if counts != last:
+            event({'event': 'draining', **report})
+            last = counts
+        time.sleep(min(interval, timeout - elapsed))
+
+
+def admit():
+    precheck(require_idle=False)
+    original = container()
+    report = wait_for_idle(float(os.environ.get('DMM_DRAIN_TIMEOUT', '900')),
+                           os.environ.get('DMM_ALLOW_BUSY_REPLACEMENT') == '1')
+    if container()['id'] != original['id']:
+        raise RuntimeError('Engine changed during drain')
+    report.update(container_id=original['id'], admitted_at=time.time(), revision=pins()['commit'])
+    write(STATE / 'admission.json', report)
 
 
 def baseline_settings(args):
@@ -145,7 +224,8 @@ def baseline_settings(args):
 
 def launch(settings, log):
     env = os.environ.copy()
-    env.update(VLLM_GPU_MEMORY_UTILIZATION=str(settings['util']),
+    env.update(VLLM_PUBLISH_BINDING='127.0.0.1:18000' if API == BENCH_API else '8000',
+               VLLM_GPU_MEMORY_UTILIZATION=str(settings['util']),
                VLLM_MAX_MODEL_LEN=str(settings['context']), VLLM_MAX_NUM_SEQS=str(settings['seqs']))
     path = ROOT / 'profiles/vLLM' / ('start_' + settings['profile'] + '.sh')
     # Already in a dedicated systemd unit, outside DMM's service cgroup.
@@ -208,7 +288,7 @@ def wait_ready(proc, timeout, prior_id, expected_profile, monitor=None):
             if (models and current['id'] != prior_id and current['status'] == 'running'
                     and current['profile'] == expected_profile):
                 return models[0]['id']
-        except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+        except (OSError, ValueError, KeyError, subprocess.CalledProcessError, CommandFailure):
             pass
         time.sleep(5)
     raise RuntimeError('Startup deadline exceeded')
@@ -304,14 +384,18 @@ def kernel_faults(since):
     return len(re.findall(r'NV_ERR_NO_MEMORY|Out of memory:|oom-kill:', r.stdout))
 
 
-def qualify(settings, directory, cutoff):
+def qualify(settings, directory, cutoff, first_replacement=False):
     result = {'settings': settings, 'batches': [], 'status': 'failed'}
     monitor = Monitor()
     monitor.thread.start()
     proc = None
     started_at = time.time()
     try:
-        ensure_idle()
+        if first_replacement:
+            # Admission already drained the original engine or reached the approved deadline.
+            check_manager_idle()
+        else:
+            ensure_idle()
         begin = time.monotonic()
         prior_id = container()['id']
         proc = launch(settings, directory / 'launch.log')
@@ -343,6 +427,9 @@ def qualify(settings, directory, cutoff):
             if any(len(t) + 8192 > settings['context'] for t in tokens):
                 raise RuntimeError('Calibrated prompt exceeds context safety budget')
             # Parallelize requests only after exact token counts satisfy the KV bound.
+            if sum(map(len, tokens)) + len(tokens) * 8192 > result['kv_tokens'] * .9:
+                result['batches'].append({'sizes': sizes, 'skipped': 'calibrated tokens exceed KV budget'})
+                continue
             before = completed_requests()
             deadline = min(cutoff, time.monotonic() + 570)
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(tokens)) as pool:
@@ -365,7 +452,7 @@ def qualify(settings, directory, cutoff):
     except Exception as exc:
         # Avoid serializing exceptions that may contain request URLs/configuration.
         result['failure_type'] = type(exc).__name__
-        result['failure_reason'] = str(exc) if type(exc) is RuntimeError else type(exc).__name__
+        result['failure_reason'] = str(exc) if type(exc) in (RuntimeError, CommandFailure) else type(exc).__name__
         result['failure_stage'] = 'startup' if 'startup_s' not in result else 'inference'
         result['abort_sweep'] = bool(monitor.fault or result['failure_stage'] == 'startup'
                                      or result.get('contaminated') or result.get('kernel_fault_count'))
@@ -408,6 +495,8 @@ def smoke():
 
 
 def restore():
+    global API
+    API = NORMAL_API
     if not (STATE / 'snapshot.json').exists():
         return  # Pre-switch validation failed; nothing was replaced.
     with (STATE / 'worker.lock').open('a') as lock:
@@ -422,7 +511,7 @@ def restore():
             raise RuntimeError('Pinned source/image drift; manual restore required')
         try:
             current = container()
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, CommandFailure):
             current = None
         if current and current['profile'] not in PROFILES:
             raise RuntimeError('Unexpected engine; manual restore required')
@@ -445,24 +534,32 @@ def restore():
 
 def rehearse():
     """Tiny live rehearsal on the existing engine; never launches/replaces it."""
-    precheck()
+    admission_path = STATE / 'admission.json'
+    admission = json.loads(admission_path.read_text()) if admission_path.exists() else {}
+    busy_rehearsal = bool(admission.get('forced_replacement'))
+    precheck(require_idle=not busy_rehearsal)
     original = container()
     model = request('/v1/models')['data'][0]['id']
-    result = {'mode': 'rehearsal', 'engine_replaced': False, 'batches': [], 'passed': False}
+    result = {'mode': 'rehearsal', 'engine_replaced': False, 'batches': [], 'passed': False,
+              'busy_admission_tested': busy_rehearsal, 'admission': admission}
     monitor = Monitor()
     monitor.thread.start()
     try:
         result['tool_smoke'] = tool_smoke(model)
         for parallel in (1, 2):
-            ensure_idle()
+            if not busy_rehearsal:
+                ensure_idle()
             tokens = [synthetic_tokens(model, 512, f'{RUN_ID}-{parallel}-{i}')
                       for i in range(parallel)]
             before = completed_requests()
             deadline = time.monotonic() + 60
             with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
                 records = list(pool.map(lambda t: infer(model, t, deadline, monitor), tokens))
-            if completed_requests() - before != parallel:
+            delta = completed_requests() - before
+            if delta != parallel and not busy_rehearsal:
                 raise RuntimeError('Rehearsal contaminated by other requests')
+            if delta != parallel:
+                result['background_completions_observed'] = True
             result['batches'].append({'parallel': parallel, 'requests': records})
             if not all(r['needle_pass'] for r in records):
                 raise RuntimeError('Rehearsal inference failed')
@@ -475,6 +572,7 @@ def rehearse():
 
 
 def worker():
+    global API
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (STATE / 'worker.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -484,11 +582,17 @@ def worker():
         if not os.environ.get('DMM_OVERNIGHT_SYSTEMD'):
             raise RuntimeError('Run through the prepared systemd unit')
         start = float(os.environ['DMM_WINDOW_START'])
-        if not start <= time.time() <= start + 900:
+        if not start <= time.time() <= start + 1800:
             raise RuntimeError('Outside the reviewed worker start window')
-        ensure_idle()
-        precheck()
+        precheck(require_idle=False)
         original = container()
+        admission = json.loads((STATE / 'admission.json').read_text())
+        if (admission.get('container_id') != original['id']
+                or admission.get('revision') != pins()['commit']
+                or not 0 <= time.time() - admission.get('admitted_at', 0) <= 120):
+            raise RuntimeError('Missing or stale engine admission')
+        if admission.get('forced_replacement') and os.environ.get('DMM_ALLOW_BUSY_REPLACEMENT') != '1':
+            raise RuntimeError('Busy replacement not authorized')
         if original['profile'] != FLASH or original['status'] != 'running':
             raise RuntimeError('Expected serving Flash Next baseline')
         snapshot = {'pins': pins(), 'container': {k: v for k, v in original.items() if k != 'args'}, 'baseline': baseline_settings(original['args']),
@@ -508,7 +612,9 @@ def worker():
                 raise RuntimeError('Unexpected engine identity; refusing replacement')
             directory = STATE / f'candidate-{index}'
             directory.mkdir(mode=0o700)
-            results.append(qualify(settings, directory, cutoff))
+            # The first launch moves from serving port 8000 to private benchmark port 18000.
+            API = BENCH_API
+            results.append(qualify(settings, directory, cutoff, first_replacement=index == 0))
             owned_id = container()['id']
             write(STATE / 'report.json', {'results': results, 'recommendation':
                 'Review measured tradeoffs. No persistent defaults or fleet concurrency changed.',
@@ -522,7 +628,7 @@ def worker():
     # ExecStopPost runs restoration after normal exit, failure, timeout, or cancellation.
 
 
-def precheck():
+def precheck(require_idle=True):
     if (STATE / 'snapshot.json').exists():
         raise RuntimeError('Previous snapshot exists; archive it after review')
     if command(['git', '-C', str(ROOT), 'diff', 'HEAD', '--', 'scripts', 'profiles/vLLM']).strip():
@@ -530,7 +636,10 @@ def precheck():
     expected = os.environ.get('DMM_EXPECTED_COMMIT')
     if expected and pins()['commit'] != expected:
         raise RuntimeError('Deployed commit differs from reviewed schedule')
-    ensure_idle()
+    if require_idle:
+        ensure_idle()
+    else:
+        check_manager_idle()
     current = container()
     if current['profile'] != FLASH or current['status'] != 'running':
         raise RuntimeError('Flash baseline not serving')
@@ -618,7 +727,14 @@ def coordinate():
     write(state, {'was_active': was_active, 'paused': False})
     freeze_after_drain(was_active, time.monotonic() + 600)
     write(state, {'was_active': was_active, 'paused': was_active})
-    command(['ssh', 'gb10', 'env', 'DMM_RUN_ID=' + RUN_ID, 'DMM_EXPECTED_COMMIT=' + expected, '/usr/bin/python3', REMOTE_SCRIPT, 'precheck'], timeout=150)
+    event({'event': 'engine_admission_started', 'run_id': RUN_ID, 'drain_timeout_s': os.environ.get('DMM_DRAIN_TIMEOUT', '900')})
+    admission_output = command(['ssh', 'gb10', 'env', 'DMM_RUN_ID=' + RUN_ID, 'DMM_EXPECTED_COMMIT=' + expected,
+             'DMM_ALLOW_BUSY_REPLACEMENT=' + os.environ.get('DMM_ALLOW_BUSY_REPLACEMENT', '0'),
+             'DMM_DRAIN_TIMEOUT=' + os.environ.get('DMM_DRAIN_TIMEOUT', '900'),
+             '/usr/bin/python3', REMOTE_SCRIPT, 'admit'], timeout=1050)
+    for line in admission_output.splitlines():
+        if line.startswith('DMM_EVENT '):
+            print(line, flush=True)
     command(['ssh', 'gb10', 'systemctl', '--user', 'start', 'dmm-overnight-worker.service'])
     until = time.monotonic() + 5.5 * 3600
     while time.monotonic() < until:
@@ -645,7 +761,7 @@ def resume():
     write(path, {**prior, 'resumed': True})
 
 
-def schedule(date, output):
+def schedule(date, output, allow_busy=False):
     day = dt.date.fromisoformat(date)
     when = dt.datetime.combine(day, dt.time(2), ZoneInfo('America/Chicago'))
     if when <= dt.datetime.now(dt.timezone.utc):
@@ -663,6 +779,7 @@ Description=Bounded GB10 overnight comparison; restore on every exit
 [Service]
 Type=exec
 Environment=DMM_OVERNIGHT_SYSTEMD=1
+Environment=DMM_ALLOW_BUSY_REPLACEMENT={int(allow_busy)}
 Environment=DMM_RUN_ID={run_id}
 Environment=DMM_EXPECTED_COMMIT={commit}
 Environment=DMM_WINDOW_END={end}
@@ -670,7 +787,7 @@ Environment=DMM_WINDOW_START={when.timestamp()}
 UMask=0077
 ExecStart={python} {remote} worker
 ExecStopPost={python} {remote} restore
-RuntimeMaxSec=16200
+RuntimeMaxSec=15300
 TimeoutStopSec=1800
 KillMode=control-group
 Restart=no
@@ -680,6 +797,8 @@ Description=Drain fleet and coordinate bounded GB10 comparison
 [Service]
 Type=exec
 Environment=DMM_WINDOW_START={when.timestamp()}
+Environment=DMM_ALLOW_BUSY_REPLACEMENT={int(allow_busy)}
+Environment=DMM_DRAIN_TIMEOUT=900
 Environment=DMM_EXPECTED_COMMIT={commit}
 Environment=DMM_RUN_ID={run_id}
 UMask=0077
@@ -703,19 +822,22 @@ WantedBy=timers.target
                         ('dmm-overnight.service', controller_unit), ('dmm-overnight.timer', timer)]:
         (output / name).write_text(value)
     print(json.dumps({'start': when.isoformat(), 'end': (when + dt.timedelta(hours=5.5)).isoformat(),
-                      'directory': str(output), 'armed': False, 'candidates': candidates()}, indent=2))
+                      'directory': str(output), 'armed': False, 'revision': commit, 'run_id': run_id,
+                      'allow_busy_replacement': allow_busy, 'drain_timeout_s': 900, 'candidates': candidates()}, indent=2))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['plan', 'schedule', 'worker', 'restore', 'coordinate', 'resume', 'verify', 'precheck', 'rehearse'])
+    parser.add_argument('mode', choices=['plan', 'schedule', 'worker', 'restore', 'coordinate', 'resume', 'verify', 'precheck', 'rehearse', 'admit'])
     parser.add_argument('--date')
+    parser.add_argument('--allow-busy-replacement', action='store_true',
+                        help='explicitly allow replacing outstanding inference after the 15-minute drain')
     parser.add_argument('--output', type=Path, default=ROOT / '.planning/overnight-units')
     args = parser.parse_args()
     if args.mode == 'plan':
         print(json.dumps(candidates(), indent=2))
     elif args.mode == 'schedule':
-        schedule(args.date, args.output)
+        schedule(args.date, args.output, args.allow_busy_replacement)
     elif args.mode == 'verify':
         if not (STATE / 'snapshot.json').exists():
             current = container()
@@ -734,6 +856,8 @@ if __name__ == '__main__':
         try:
             globals()[args.mode]()
         except Exception as exc:
-            reason = str(exc) if type(exc) is RuntimeError else type(exc).__name__
+            reason = str(exc) if type(exc) in (RuntimeError, CommandFailure) else type(exc).__name__
+            event({'event': 'failure', 'mode': args.mode, 'reason': reason})
+            write(STATE / 'failure.json', {'mode': args.mode, 'reason': reason, 'at': time.time()})
             print(f'{args.mode} failed: {reason}; inspect private state on the owning host', file=sys.stderr)
             sys.exit(1)
