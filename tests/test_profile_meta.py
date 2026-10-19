@@ -428,7 +428,6 @@ def test_parse_script_flags_uses_no_third_party_import():
 # ── parameterize preview / apply (04-03) ──────────────────────────────────────
 
 import hashlib
-import shutil
 import subprocess
 
 _LEGACY = ("#!/bin/bash\n"

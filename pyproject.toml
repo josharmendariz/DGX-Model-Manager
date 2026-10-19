@@ -1,0 +1,11 @@
+# Tool configuration only — this project is not packaged.
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [".venv", "venv", "backup", "misc"]
+
+[tool.ruff.lint]
+# Correctness only: syntax errors (E9) and pyflakes (F: undefined names, unused
+# imports/variables, redefinitions, f-string mistakes). Deliberately no style
+# rules and no formatter — this config must never force a mass reformat.
+select = ["E9", "F"]
