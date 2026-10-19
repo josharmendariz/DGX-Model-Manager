@@ -864,6 +864,9 @@ FORBIDDEN_SOURCE_TOKENS = (
     "Path(",
     "_get_total_memory_gb",
     "_get_available_memory_gb",
+    "_get_available_memory_gib",
+    "_mem_total_gib",
+    "_meminfo_gib",
     "import vllm",
     "docker",
 )

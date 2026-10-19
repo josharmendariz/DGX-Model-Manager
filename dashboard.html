@@ -2611,7 +2611,7 @@ async function loadWarmModels() {
       const isActive = p.id === activeProfile;
       const isSelected = p.id === warmSelectedProfile;
       const cls = 'warm-profile' + (isActive ? ' active' : '') + (isSelected ? ' selected' : '');
-      const vram = p.vram_gb != null ? p.vram_gb + ' GB' : '--';
+      const vram = p.vram_gb != null ? p.vram_gb + ' GiB' : '--';
       return '<div class="' + cls + '" onclick="warmSelectProfile(\'' + p.id.replace(/'/g, "\\'") + '\')">'
         + '<div class="warm-profile-head"><div class="warm-profile-name">' + _escHtml(p.name || p.id) + '</div>'
         + '<span class="warm-pill ' + (isActive ? 'ok' : '') + '">' + _escHtml(vram) + '</span></div>'
@@ -2801,7 +2801,7 @@ async function loadRecipes(eng) {
     const r = eng.recipes[n];
     return '<option value="' + _escHtml(n) + '"' +
            (n === eng.selectedRecipe ? ' selected' : '') + '>' +
-           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GB') +
+           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GiB') +
            '</option>';
   }).join('');
   bar.style.display = 'flex';
@@ -2875,7 +2875,7 @@ function renderEngineProfiles(eng) {
             ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
           <div class="p-desc">${esc(p.description)}</div>
         </div>
-        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
+        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GiB' : '\u2014'}</div>
         <div class="p-actions" onclick="event.stopPropagation()">
           ${p.model_dir
             ? `<button class="btn-icon-del" title="Delete model weights from disk${

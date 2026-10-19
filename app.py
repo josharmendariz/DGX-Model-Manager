@@ -322,8 +322,36 @@ def _get_total_memory_gb() -> int:
     return 0
 
 
-def _get_available_memory_gb() -> float:
-    """Currently-available system memory in GB, from /proc/meminfo MemAvailable.
+# Admission works in ONE unit: binary GiB (2**30 bytes). /proc/meminfo reports KiB, so
+# `kB / 1024 / 1024` is already GiB; vLLM's own logs ("Available KV cache memory: N GiB")
+# use the same unit. Decimal-GB sizes (file sizes / 1e9) must never meet these numbers.
+_GIB = 1024 ** 3
+
+# GB10 MemTotal (127535252 kB, measured on gb10 2026-10-18). Used only when
+# /proc/meminfo cannot be read, so a footprint is never computed against zero.
+_POOL_GIB_FALLBACK = 121.6
+
+
+def _meminfo_gib(key: str) -> Optional[float]:
+    """One /proc/meminfo field in GiB, or None if unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return None
+
+
+def _mem_total_gib() -> float:
+    """MemTotal in GiB — the pool vLLM's --gpu-memory-utilization is a fraction of."""
+    total = _meminfo_gib("MemTotal")
+    return total if total else _POOL_GIB_FALLBACK
+
+
+def _get_available_memory_gib() -> float:
+    """Currently-available system memory in GiB, from /proc/meminfo MemAvailable.
 
     On the GB10 (DGX Spark) the GPU and system RAM are ONE ~121 GB unified pool,
     and nvidia-smi reports memory as N/A on this hardware — so MemAvailable is
@@ -333,14 +361,7 @@ def _get_available_memory_gb() -> float:
     a running engine's real footprint is unmeasurable and must be estimated from
     profile metadata (see _vram_admission_check).
     """
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / 1024 / 1024
-    except Exception:
-        pass
-    return 0.0
+    return _meminfo_gib("MemAvailable") or 0.0
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -508,10 +529,13 @@ def _parse_script_meta(script_path: Path) -> dict:
             elif line.startswith("# Description:"):
                 description = line[14:].strip()
             elif line.startswith("# VRAM:"):
-                try:
-                    vram_gb = int(line[7:].strip().upper().rstrip("GB").strip())
-                except Exception:
-                    pass
+                # GiB by convention (05-01). Decimals are accepted: an int()-only
+                # parse silently dropped a `# VRAM: 91.2` header to "unmetered".
+                raw = line[7:].strip().upper().removesuffix("GIB").rstrip("GB").strip()
+                if _re.fullmatch(r"[0-9]+", raw):
+                    vram_gb = int(raw)
+                elif _re.fullmatch(r"[0-9]+\.[0-9]+", raw):
+                    vram_gb = float(raw)
             elif line.startswith("# Derived:"):
                 parsed = _json_header("# Derived:", line[10:].strip())
                 derived = parsed if isinstance(parsed, dict) else derived
@@ -3169,13 +3193,87 @@ async def _engine_stop(base_url: str, engine_name: str, docker_filter: str | Non
     return {"ok": ok, "output": output}
 
 
+# ── Executor-budget footprint (Phase 05-01) ──────────────────────────────────
+# vLLM reserves `--gpu-memory-utilization × MemTotal` up front, whatever the weights
+# or the context. So a vLLM profile's footprint is THAT number, read from the script
+# it will actually run — never a weights estimate. Measured 2026-10-18: generated
+# headers declared 20 GiB for scripts that launch at util 0.75 (≈91 GiB), and admission
+# admitted them on the header.
+
+_HEADER_DRIFT_WARN_GIB = 5.0
+
+
+def _script_util(text: str) -> Optional[float]:
+    """The `--gpu-memory-utilization` a script launches with by default, or None.
+
+    A literal flag wins; otherwise the default baked into a
+    `${VLLM_GPU_MEMORY_UTILIZATION:-N}` placeholder (generated scripts, and hand
+    scripts like flash-next's `GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}"`).
+    Anything outside (0, 1] is treated as unparseable rather than trusted.
+    """
+    util = _parse_script_flags(text).get("util")
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        util = _parse_templated_defaults(text).get("gpu_memory_utilization")
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        return None
+    return float(util) if 0 < util <= 1 else None
+
+
+def _profile_footprint_gib(profile: dict, override_env: Optional[dict] = None,
+                           mem_total_gib: Optional[float] = None
+                           ) -> tuple[Optional[float], str]:
+    """(GiB this launch will reserve, source) — or (None, "unknown").
+
+    Precedence, most authoritative first:
+      override-util  a VLLM_GPU_MEMORY_UTILIZATION override the script actually reads
+      script-util    the script's own default util (literal flag or placeholder)
+      recipe-util    a recipe-backed script's run-recipe YAML util
+      header         the `# VRAM:` comment (GiB) — llama.cpp, or no util anywhere
+    A context-only override never changes the footprint: vLLM reserves util × total
+    regardless of --max-model-len (a context that does not fit fails engine init; it
+    does not overcommit the pool).
+    """
+    total = mem_total_gib if mem_total_gib is not None else _mem_total_gib()
+    try:
+        text = Path(os.path.expanduser(profile.get("script", ""))).read_text(errors="ignore")
+    except Exception:
+        text = ""
+    code = _script_code(text)
+    override = (override_env or {}).get("VLLM_GPU_MEMORY_UTILIZATION")
+    # Only an override the script actually reads moves the reservation; a legacy
+    # script that ignores the env var still launches at its own util.
+    if override is not None and "VLLM_GPU_MEMORY_UTILIZATION" in code:
+        try:
+            util = float(override)
+        except (TypeError, ValueError):
+            util = None
+        if util and 0 < util <= 1:
+            return round(util * total, 1), "override-util"
+    util = _script_util(text)
+    if util:
+        return round(util * total, 1), "script-util"
+    recipe = _parse_launch_script(text).get("recipe") if code.strip() else ""
+    if recipe:
+        try:
+            r_util = _recipe_util(recipe)
+        except Exception:
+            r_util = None
+        if isinstance(r_util, (int, float)) and not isinstance(r_util, bool) \
+                and 0 < r_util <= 1:
+            return round(float(r_util) * total, 1), "recipe-util"
+    header = profile.get("vram_gb")
+    if isinstance(header, (int, float)) and not isinstance(header, bool):
+        return float(header), "header"
+    return None, "unknown"
+
+
 async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple[float, str]:
-    """VRAM (GB) to credit back for the profile currently running on an engine.
+    """VRAM (GiB) to credit back for the profile currently running on an engine.
 
     A new profile's start script does `docker rm -f <container>`, so whatever is
     running now will be torn down and its unified memory freed before the new one
     loads. Because a running engine's real footprint is unmeasurable on the GB10
-    (see _get_available_memory_gb), we identify WHICH profile is live primarily
+    (see _get_available_memory_gib), we identify WHICH profile is live primarily
     via the running container's own `dgx.profile` label (set at launch), falling
     back to matching the engine's reported served-model-name against each
     profile's start script for profiles that don't set the label yet. Returns
@@ -3202,41 +3300,45 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
         label = await _docker_label(container_name, "dgx.profile")
         if label:
             for p in profiles:
-                if p.get("vram_gb") is None:
+                if p["id"].removeprefix("start_") != label:
                     continue
-                if p["id"].removeprefix("start_") == label:
-                    return float(p["vram_gb"]), p["id"]
+                gib = _profile_footprint_gib(p)[0]
+                if gib is None:
+                    continue
+                return gib, p["id"]
     # Primary match: served name appears verbatim in a profile's start script.
     for p in profiles:
-        if p.get("vram_gb") is None:
+        gib = _profile_footprint_gib(p)[0]
+        if gib is None:
             continue
         try:
             content = Path(os.path.expanduser(p.get("script", ""))).read_text()
         except Exception:
             content = ""
         if served in content:
-            return float(p["vram_gb"]), p["id"]
+            return gib, p["id"]
     # Fallback heuristic: fuzzy token match on served name vs profile id/name.
     sv = served.lower()
     for p in profiles:
-        if p.get("vram_gb") is None:
+        gib = _profile_footprint_gib(p)[0]
+        if gib is None:
             continue
         pid = p["id"].lower()
         if pid.startswith("start_"):
             pid = pid[6:]
         if sv in pid or pid in sv or sv in p.get("name", "").lower():
-            return float(p["vram_gb"]), p["id"]
+            return gib, p["id"]
     return 0.0, ""
 
 
-# Safety margin (GB) reserved for the OS and other services on the unified pool.
-_VRAM_SAFETY_MARGIN_GB = 8
+# Safety margin (GiB) reserved for the OS and other services on the unified pool.
+_VRAM_SAFETY_MARGIN_GIB = 8
 
-# Minimum projected headroom (GB, on top of the safety margin) required to admit a
+# Minimum projected headroom (GiB, on top of the safety margin) required to admit a
 # profile whose VRAM need is unknown (no `# VRAM:` header). We cannot math an
 # unmetered launch, so instead of skipping the check we refuse to launch onto a
 # nearly-full pool — the case that actually hangs the box.
-_VRAM_UNKNOWN_MIN_HEADROOM_GB = 24
+_VRAM_UNKNOWN_MIN_HEADROOM_GIB = 24
 
 
 async def _other_running_engines(exclude_key: str) -> list[str]:
@@ -3279,55 +3381,62 @@ async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                                 scan_fn=None) -> None:
     """Reject a profile launch that would overcommit the GB10 unified-memory pool.
 
-    GB10 reasoning: GPU and system RAM share one ~121 GB pool and nvidia-smi
+    GB10 reasoning: GPU and system RAM share one ~121.6 GiB pool and nvidia-smi
     can't report memory here, so we admit based on /proc/meminfo MemAvailable
     plus a "reclaim credit" for the profile about to be torn down and replaced
     by this one (its start script runs `docker rm -f` first). Engine-generic:
-    works for any engine in _ENGINES. Profiles without a declared vram_gb, and
-    force=true launches, skip the check.
+    works for any engine in _ENGINES.
+
+    `profile["vram_gb"]` is the launch's footprint in GiB, already resolved by
+    `_profile_footprint_gib` (`_engine_start` does that); every quantity compared
+    here — MemAvailable, the reclaim credit, the margin — is GiB too.
+    `profile["footprint_source"]`, when present, says where the number came from.
     """
     if force:
         _logger.warning("VRAM admission check SKIPPED (force=true) for profile '%s'",
                         profile.get("id"))
         return
     vram = profile.get("vram_gb")
+    source = profile.get("footprint_source")
     profiles = scan_fn() if scan_fn else _scan_profiles(engine_key)
-    available = _get_available_memory_gb()
+    available = _get_available_memory_gib()
     credit, credit_id = await _running_profile_vram_credit(engine_key, profiles)
     projected = available + credit
-    margin = _VRAM_SAFETY_MARGIN_GB
+    margin = _VRAM_SAFETY_MARGIN_GIB
     if vram is None:
         # Unknown need: can't math it, but still refuse to launch onto a
         # nearly-full pool. Require a healthy headroom floor above the margin.
         headroom = projected - margin
-        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GB:
-            credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GIB:
+            credit_note = (f"{credit:.0f} GiB reclaimed from running profile '{credit_id}'"
                            if credit else "no reclaimable running profile identified")
             raise HTTPException(
                 409,
                 f"Refusing to start '{profile.get('id')}': it declares no VRAM "
-                f"footprint (add a '# VRAM: NN' header to its start script), and only "
-                f"{headroom:.0f} GB of unified memory headroom is projected available "
-                f"({available:.0f} GB free + {credit_note}, minus a {margin} GB "
-                f"safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GB} GB floor "
+                f"footprint (no parseable --gpu-memory-utilization and no '# VRAM: NN' "
+                f"header), and only "
+                f"{headroom:.0f} GiB of unified memory headroom is projected available "
+                f"({available:.0f} GiB free + {credit_note}, minus a {margin} GiB "
+                f"safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GIB} GiB floor "
                 f"required for an unmetered launch."
                 f"{await _other_engines_note(engine_key)} Pass force=true to override.")
         _logger.warning(
-            "Profile '%s' has no VRAM metadata — admitted on %.0f GB headroom floor; "
+            "Profile '%s' has no VRAM metadata — admitted on %.0f GiB headroom floor; "
             "add a '# VRAM: NN' header for a precise check",
             profile.get("id"), headroom)
         return
     if vram > projected - margin:
-        credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+        credit_note = (f"{credit:.0f} GiB reclaimed from running profile '{credit_id}'"
                        if credit else
                        "no running profile could be identified, so a conservative "
-                       "0 GB reclaim credit was used")
+                       "0 GiB reclaim credit was used")
+        source_note = f" [{source}]" if source else ""
         raise HTTPException(
             409,
             f"Insufficient unified memory to start '{profile.get('id')}': needs "
-            f"{vram} GB but only {projected:.0f} GB is projected available "
-            f"({available:.0f} GB free + {credit_note}), and {margin} GB is held "
-            f"back as an OS/services safety margin."
+            f"{vram:g} GiB{source_note} but only {projected:.0f} GiB is projected "
+            f"available ({available:.0f} GiB free + {credit_note}), and {margin} GiB "
+            f"is held back as an OS/services safety margin."
             f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
@@ -3585,78 +3694,6 @@ def _classify_script(text: str) -> str:
     return "legacy"
 
 
-def _profile_source_dir(script: str) -> Path | None:
-    """The launch dir a generated profile was built from, per its own header.
-
-    The header is the only link back to config.json: profiles are scanned as scripts,
-    not as models. Hand-written scripts carry no marker and return None.
-    """
-    try:
-        lines = Path(script).read_text().splitlines()[:20]
-    except Exception:
-        return None
-    for idx, line in enumerate(lines):
-        if line.strip().startswith(_GENERATED_FROM_MARKER):
-            if idx + 1 < len(lines) and lines[idx + 1].startswith("# "):
-                candidate = Path(os.path.expanduser(lines[idx + 1][2:].strip()))
-                return candidate if candidate.is_dir() else None
-    return None
-
-
-def _overridden_vram_gb(profile: dict, override_env: dict[str, str],
-                        force: bool) -> float | None:
-    """Footprint of an OVERRIDDEN launch, or None when nothing footprint-affecting changed.
-
-    Admitting an overridden launch against the script header's static `# VRAM:` comment
-    is the same trap the llama.cpp recipe ladder already sprang: the header describes the
-    launch the generator intended, not the one being asked for.
-    """
-    ctx = override_env.get("VLLM_MAX_MODEL_LEN")
-    util = override_env.get("VLLM_GPU_MEMORY_UTILIZATION")
-    if ctx is None and util is None:
-        return None
-
-    launch_dir = _profile_source_dir(profile.get("script", ""))
-    config = None
-    if launch_dir is not None:
-        try:
-            parsed = json.loads((launch_dir / "config.json").read_text())
-            config = parsed if isinstance(parsed, dict) else None
-        except Exception:
-            config = None
-    if config is None:
-        # Never silently fall back to the stale header: an unverifiable override is
-        # exactly the case where admission matters most.
-        if not force:
-            raise HTTPException(
-                400, "Cannot verify this override against the model config "
-                     f"({profile.get('id')}): no readable config.json for the profile. "
-                     "Re-send with force=true to launch unchecked.")
-        _logger.warning("override footprint underived for '%s' — forced launch",
-                        profile.get("id"))
-        return None
-
-    pool_gb = 121.0
-    if util is not None:
-        # vLLM reserves this share of the pool up front, whatever the KV math says.
-        return round(pool_gb * float(util), 1)
-
-    info = None
-    try:
-        info = _profile_model_info(launch_dir, None)
-    except Exception:
-        info = None
-    weights_gb = float((info or {}).get("size_gb") or 0.0)
-    kv_dtype = _kv_dtype_from_config(config)
-    spec = _derive_launch_spec(
-        config, weights_gb=weights_gb, pool_gb=pool_gb,
-        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2,
-        requested_context=int(ctx))
-    for warning in spec.get("warnings") or []:
-        _logger.info("override derive warning for '%s': %s", profile.get("id"), warning)
-    return round(spec["weights_gb"] + spec["kv_gb"] + spec["overhead_gb"], 1)
-
-
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
                         engine_key: str | None = None, force: bool = False,
                         recipe: str | None = None,
@@ -3678,13 +3715,15 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         if r_vram is not None:
             profile = {**profile, "vram_gb": r_vram}
 
-    # Same ordering rule as the recipe block: an override that raises the real footprint
-    # must be admitted against that footprint, not the script header's static comment.
+    # Same ordering rule as the recipe block: the footprint admitted is the one THIS
+    # launch reserves — util × MemTotal from the override or the script itself — not
+    # the header comment (05-01). A llama.cpp recipe already set an explicit need.
     override_env = _resolve_overrides(overrides)
-    if override_env:
-        _over_vram = _overridden_vram_gb(profile, override_env, force)
-        if _over_vram is not None:
-            profile = {**profile, "vram_gb": _over_vram}
+    if recipe and profile.get("vram_gb") is not None:
+        profile = {**profile, "footprint_source": "llamacpp-recipe"}
+    else:
+        _gib, _source = _profile_footprint_gib(profile, override_env)
+        profile = {**profile, "vram_gb": _gib, "footprint_source": _source}
 
     await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
     script = os.path.expanduser(profile.get("script", ""))
@@ -3738,7 +3777,7 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
 #     buff/cache ~25 GB  ->  Available KV cache memory  0.19 GiB  (refused to start)
 #     buff/cache  ~2 GB  ->  Available KV cache memory 25.97 GiB  (ready in 165s)
 #
-# This is why admission based on MemAvailable (see _get_available_memory_gb) can
+# This is why admission based on MemAvailable (see _get_available_memory_gib) can
 # pass while the launch still dies in engine init: MemAvailable counts the page
 # cache as free, and CUDA does not.
 
@@ -4044,6 +4083,41 @@ def _preflight_static(text: str, cfg: dict) -> list:
     return out
 
 
+def _preflight_footprint(profile: dict, mem_total_gib: Optional[float] = None) -> list:
+    """Does the `# VRAM:` header tell the truth about what this launch reserves?
+
+    Admission no longer trusts the header when a util is parseable (05-01), but the
+    header is still what the profile card shows and what a recipe/llama.cpp launch
+    falls back to — a stale one misleads the operator even when admission is right.
+    """
+    gib, source = _profile_footprint_gib(profile, mem_total_gib=mem_total_gib)
+    header = profile.get("vram_gb")
+    if gib is None:
+        return [_pf("warn", "footprint", "No VRAM footprint known",
+                    "No parseable --gpu-memory-utilization and no '# VRAM:' header, so "
+                    "admission can only apply its unmetered headroom floor.",
+                    "Add a '# VRAM: NN' header (GiB) to the start script.")]
+    if source == "header":
+        return [_pf("ok", "footprint", f"Footprint {gib:g} GiB from the '# VRAM:' header",
+                    "No util is parseable from the script, so the header is the "
+                    "declared need. Keep it in GiB and in step with the real launch.")]
+    expected = round(gib)
+    if header is None:
+        return [_pf("warn", "footprint", "Start script has no '# VRAM:' header",
+                    f"It reserves {gib:g} GiB ({source}); admission uses that, but the "
+                    f"profile card shows no footprint.",
+                    f"Add '# VRAM: {expected}' to the script header.")]
+    if abs(float(header) - gib) > _HEADER_DRIFT_WARN_GIB:
+        return [_pf("warn", "footprint",
+                    f"'# VRAM: {header:g}' disagrees with the real reservation",
+                    f"The launch reserves {gib:g} GiB ({source}: util × MemTotal). "
+                    f"Admission uses {gib:g}; the header only misleads the card.",
+                    f"Set the header to '# VRAM: {expected}'.")]
+    return [_pf("ok", "footprint", f"Footprint {gib:g} GiB ({source})",
+                f"'# VRAM: {header:g}' matches util × MemTotal within "
+                f"{_HEADER_DRIFT_WARN_GIB:g} GiB.")]
+
+
 def _preflight_memory(util: Optional[float]) -> list:
     """The budget check. `util` None means the script did not declare one."""
     mem = _cuda_visible_memory()
@@ -4226,6 +4300,7 @@ async def vllm_preflight(req: EngineStartRequest):
     util = facts["util"]
     if util is None and facts["recipe_backed"]:
         util = _recipe_util(facts["recipe"])
+    checks += _preflight_footprint(profile)
     checks += _preflight_memory(util)
     checks += await _preflight_runtime(facts, text)
     checks += await _preflight_smoke(facts, text)
@@ -5467,6 +5542,24 @@ def _script_meta_headers(info: dict, resolved: Optional[dict]) -> str:
     )
 
 
+def _generated_vram_header(info: dict, resolved: Optional[dict]) -> float | int:
+    """The `# VRAM:` value a generated script declares: what vLLM will reserve.
+
+    `round(util × MemTotal GiB)` whenever the launch util is known — the docker shape's
+    placeholder default, or a recipe's `--gpu-memory-utilization`. Only when no util
+    is knowable does it fall back to the weights estimate, which admission then treats
+    as the `header` source of last resort (05-01).
+    """
+    util = None
+    if resolved and resolved.get("shape") == "recipe":
+        util = (resolved.get("record") or {}).get("gpu_memory_utilization")
+    elif resolved:
+        util = _launch_defaults(resolved)["util"]
+    if isinstance(util, (int, float)) and not isinstance(util, bool) and 0 < util <= 1:
+        return round(float(util) * _mem_total_gib())
+    return info["vram_gb"]
+
+
 def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool,
                           resolved: Optional[dict] = None) -> str:
     """The single shared owner of generated profile metadata and collision cleanup."""
@@ -5479,7 +5572,7 @@ def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool,
     return f"""#!/bin/bash
 # Name: HF {_one_line(info['name'])}
 # Description: Local HF snapshot via vLLM ({_one_line(info['dtype'])}, {info['size_gb']:.1f} GB on disk)
-# VRAM: {info['vram_gb']}
+# VRAM: {_generated_vram_header(info, resolved)}
 #
 # Auto-generated by DGX Model Manager from:
 # {_one_line(launch_dir)}

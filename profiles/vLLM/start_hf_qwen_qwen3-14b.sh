@@ -1,7 +1,7 @@
 #!/bin/bash
 # Name: HF Qwen/Qwen3-14B
 # Description: Qwen3-14B dense BF16 via vLLM (helix test model, ~30 GB on disk)
-# VRAM: 34
+# VRAM: 91
 #
 # helix candidate. eugr/spark-vllm:latest (SM121-correct vLLM 0.23.1). Dense BF16
 # does not touch the Marlin MXFP4 path, but this is the known-good GB10 image.
