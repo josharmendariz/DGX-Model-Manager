@@ -1,0 +1,119 @@
+{
+  "qualified_at": "2026-10-19T04:50:21.119561+00:00",
+  "probe_sha256": "03ff266ed68de49f2a49e60752b194491645bcfa195dae932e61802f6f50ab76",
+  "scope": "CLI syntax only; no GPU access, model load, or engine readiness qualification",
+  "image_default_runtime": "runc",
+  "application_deployed": false,
+  "serving_identity_unchanged": true,
+  "private_evidence_directory": "/home/josh/.local/state/dgx-model-manager/qualifications/20261019T044740Z-preflight-cli",
+  "results": [
+    {
+      "profile": "start_nemotron_nano",
+      "image": "vllm/vllm-openai:cu130-nightly",
+      "image_id": "sha256:ffa30d66ff5c9346c6389507cc529827fc9934a6d2ee37855934f94fe1061cdc",
+      "case": "profile",
+      "returncode": 0,
+      "syntax_accepted": true,
+      "diagnostic": "W1019 04:47:48.843000 1 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'"
+    },
+    {
+      "profile": "start_nemotron_nano",
+      "image": "vllm/vllm-openai:cu130-nightly",
+      "image_id": "sha256:ffa30d66ff5c9346c6389507cc529827fc9934a6d2ee37855934f94fe1061cdc",
+      "case": "unknown_flag",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: unrecognized arguments: --dmm-intentionally-invalid-qualification-flag"
+    },
+    {
+      "profile": "start_nemotron_nano",
+      "image": "vllm/vllm-openai:cu130-nightly",
+      "image_id": "sha256:ffa30d66ff5c9346c6389507cc529827fc9934a6d2ee37855934f94fe1061cdc",
+      "case": "invalid_value",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: argument --gpu-memory-utilization: invalid float value: 'not-a-number'"
+    },
+    {
+      "profile": "start_nemotron_super",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "profile",
+      "returncode": 0,
+      "syntax_accepted": true,
+      "diagnostic": "W1019 04:48:19.058000 1 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'"
+    },
+    {
+      "profile": "start_nemotron_super",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "unknown_flag",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: unrecognized arguments: --dmm-intentionally-invalid-qualification-flag"
+    },
+    {
+      "profile": "start_nemotron_super",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "invalid_value",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: argument --gpu-memory-utilization: invalid float value: 'not-a-number'"
+    },
+    {
+      "profile": "start_hf_qwen3-vl-4b-fp8",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "profile",
+      "returncode": 0,
+      "syntax_accepted": true,
+      "diagnostic": "W1019 04:48:50.026000 1 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'"
+    },
+    {
+      "profile": "start_hf_qwen3-vl-4b-fp8",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "unknown_flag",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: unrecognized arguments: --dmm-intentionally-invalid-qualification-flag"
+    },
+    {
+      "profile": "start_hf_qwen3-vl-4b-fp8",
+      "image": "vllm/vllm-openai:v0.20.0",
+      "image_id": "sha256:bf05c8a0d56f7ed2fe279e0c0c876dd2bb813dd34702d975fa6ab640860ce825",
+      "case": "invalid_value",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: argument --gpu-memory-utilization: invalid float value: 'not-a-number'"
+    },
+    {
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "image": "eugr/spark-vllm:latest",
+      "image_id": "sha256:6208462fec6ae77e87f3e8023f04946109561cc82a475d87d01eefcff8ae901c",
+      "case": "profile",
+      "returncode": 0,
+      "syntax_accepted": true,
+      "diagnostic": "W1019 04:49:27.613000 1 torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'"
+    },
+    {
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "image": "eugr/spark-vllm:latest",
+      "image_id": "sha256:6208462fec6ae77e87f3e8023f04946109561cc82a475d87d01eefcff8ae901c",
+      "case": "unknown_flag",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: unrecognized arguments: --dmm-intentionally-invalid-qualification-flag"
+    },
+    {
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "image": "eugr/spark-vllm:latest",
+      "image_id": "sha256:6208462fec6ae77e87f3e8023f04946109561cc82a475d87d01eefcff8ae901c",
+      "case": "invalid_value",
+      "returncode": 2,
+      "syntax_accepted": false,
+      "diagnostic": "-c: error: argument --gpu-memory-utilization: invalid float value: 'not-a-number'"
+    }
+  ]
+}

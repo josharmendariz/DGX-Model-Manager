@@ -31,6 +31,11 @@ Summarised from `git log v0.2.0..main` (2026-05-14 → 2026-10-13). Planning-onl
 
 ### Fixed
 
+- **Preflight memory context and CLI syntax checks** — distinguish resident-state
+  balances from estimated label-based replacement credit. Isolated CLI probes use
+  a guarded CPU device default for parser construction, allowing GPU-free syntax
+  checks while keeping GPU/model readiness explicitly unqualified.
+
 - **Profile readiness preflight** — correctly parse read-only mount destinations,
   resolve Hub IDs through the offline image cache, and validate arguments for
   entrypoint-style vLLM profiles. Container probes cannot pull images or create
