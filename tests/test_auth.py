@@ -95,3 +95,69 @@ def test_runtime_key_change_takes_effect_immediately(monkeypatch):
         call(_Req())
     assert exc.value.status_code == 401
     assert call(_Req("newkey")) is None
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", "", "  ", "nope"])
+def test_falsy_allow_unauth_still_fails_closed(monkeypatch, value):
+    """`MODEL_MANAGER_ALLOW_UNAUTH=0` must not mean "accept the risk"."""
+    monkeypatch.setattr(appmod, "_API_KEY_HASH", "")
+    monkeypatch.setattr(appmod, "APP_HOST", "100.115.54.83")
+    monkeypatch.setenv("MODEL_MANAGER_ALLOW_UNAUTH", value)
+    with pytest.raises(HTTPException) as exc:
+        call(_Req())
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "YES", "on", " 1 "])
+def test_truthy_allow_unauth_allows(monkeypatch, value):
+    monkeypatch.setattr(appmod, "_API_KEY_HASH", "")
+    monkeypatch.setattr(appmod, "APP_HOST", "100.115.54.83")
+    monkeypatch.setenv("MODEL_MANAGER_ALLOW_UNAUTH", value)
+    assert call(_Req()) is None
+
+
+def _lifespan_sleeps(monkeypatch, host, env=None):
+    """Run _lifespan's startup half and report whether it imposed the 10 s delay."""
+    import asyncio
+    slept = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr(appmod, "_API_KEY_HASH", "")
+    monkeypatch.setattr(appmod, "APP_HOST", host)
+    if env is None:
+        monkeypatch.delenv("MODEL_MANAGER_ALLOW_UNAUTH", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_MANAGER_ALLOW_UNAUTH", env)
+    monkeypatch.setattr(appmod.asyncio, "sleep", fake_sleep)
+    # _lifespan rebinds and then closes the module-global client; restore it after.
+    monkeypatch.setattr(appmod, "_http", appmod._http)
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr(appmod, "_alert_loop", noop)
+    monkeypatch.setattr(appmod, "_pinned_autostart", noop)
+
+    async def run():
+        cm = appmod._lifespan(appmod.app)
+        await cm.__aenter__()
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    asyncio.run(run())
+    return 10 in slept
+
+
+def test_lifespan_uses_the_shared_loopback_list(monkeypatch):
+    monkeypatch.setattr(appmod, "_LOOPBACK_HOSTS", ("127.0.0.1", "::1", "localhost", "lo-test"))
+    assert _lifespan_sleeps(monkeypatch, "lo-test") is False
+
+
+def test_lifespan_delays_on_open_bind_and_honours_only_truthy_ack(monkeypatch):
+    assert _lifespan_sleeps(monkeypatch, "100.115.54.83") is True
+    assert _lifespan_sleeps(monkeypatch, "100.115.54.83", env="0") is True
+    assert _lifespan_sleeps(monkeypatch, "100.115.54.83", env="1") is False

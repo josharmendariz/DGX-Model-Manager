@@ -239,6 +239,19 @@ for _ek, _ev in _ENGINES.items():
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
+_TRUTHY_ENV = ("1", "true", "yes", "on")
+
+
+def _allow_unauth() -> bool:
+    """True only when MODEL_MANAGER_ALLOW_UNAUTH is an explicit truthy value.
+
+    A bare presence test treated `=0`, `=false` and `=` as "accept the risk" — the
+    opposite of what anyone writing those means. Anything outside the allow-list is
+    "not acknowledged", so a typo fails closed.
+    """
+    return os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH", "").strip().lower() in _TRUTHY_ENV
+
+
 def _auth_open_unauthenticated() -> bool:
     """True when no key is set AND we are bound somewhere other than loopback.
 
@@ -265,7 +278,7 @@ async def verify_auth(request: Request):
     if not _API_KEY_HASH:
         if not _auth_open_unauthenticated():
             return  # loopback-only deployment
-        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+        if not _allow_unauth():
             raise HTTPException(
                 503,
                 f"Refusing to serve a mutating request: bound to {APP_HOST} with no API "
@@ -1443,8 +1456,8 @@ _http: httpx.AsyncClient = None  # type: ignore[assignment]
 async def _lifespan(app):
     global _http
     _http = httpx.AsyncClient(timeout=10.0)
-    if APP_HOST not in ("127.0.0.1", "::1", "localhost") and not _API_KEY_HASH:
-        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+    if APP_HOST not in _LOOPBACK_HOSTS and not _API_KEY_HASH:
+        if not _allow_unauth():
             msg = (f"SECURITY WARNING: binding to {APP_HOST} with no API key set — "
                    "the management UI is open to anyone on this network. "
                    "Set an API key in Settings, or set MODEL_MANAGER_ALLOW_UNAUTH=1 to suppress this warning. "
