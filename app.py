@@ -1537,7 +1537,11 @@ async def _lifespan(app):
             msg = "SECURITY NOTICE: no API key set and MODEL_MANAGER_ALLOW_UNAUTH=1 — open access acknowledged."
             _logger.warning(msg)
             print(msg, flush=True)
-    await _check_litellm_config_drift()
+    drift_status = await _check_litellm_config_drift()
+    if drift_status != "disabled":
+        # The dgx logger's handler feeds the authenticated UI ring buffer. Emit
+        # only the fixed result to stdout as well for systemd rollout verification.
+        print(f"LiteLLM config drift startup result: {drift_status}", flush=True)
     alert_task = asyncio.create_task(_alert_loop())
     pin_task = asyncio.create_task(_pinned_autostart())
     _logger.info("App started on port %s", APP_PORT)
