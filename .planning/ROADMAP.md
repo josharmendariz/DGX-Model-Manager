@@ -23,7 +23,7 @@ printed, and so synthesis runs on this box rather than an external service.
 - [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [x] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [x] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls (completed 2026-08-21)
-- [ ] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label (partial: label reclaim shipped in 9410656; see status below)
+- [x] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label (implemented in #23/#24, deployed to gb10 2026-10-19; live util measurements pending, see status below)
 - [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
 
 ## Phase Details
@@ -180,30 +180,46 @@ right profile.
 **Plans**: 2 plans
 
 Plans:
-- [ ] 05-01: Executor-budget metadata + unit-consistent admission math
-- [ ] 05-02: Label-based reclaim identification, launch lock, and failure surfacing
+- [x] 05-01: Executor-budget metadata + unit-consistent admission math (#23)
+- [x] 05-02: Label-based reclaim identification, launch lock, and failure surfacing (#24)
 
-**Status (verified against code 2026-10-18, origin/main 56bdfb5)**: Not formally planned or
-executed. Parts shipped outside the phase. Draft plan:
-`phases/05-admission-truth/05-PLAN-DRAFT.md`.
-  1. Executor budget: **open**. Generated scripts write `# VRAM:` as a weights estimate
-     (`size_gb × mult + 12`, `_profile_model_info`). Only the util-override path
-     (`_overridden_vram_gb`) uses `util × pool`, and it uses a hard-coded `121.0`, not live
-     MemTotal. Hand-written profiles happen to use `util × 121` by convention only.
-  2. Binary GiB units: **open**. MemAvailable is read as GiB (`/1024/1024`). Weights, KV and
-     overhead in `_derive_launch_spec` and `_profile_model_info` are decimal GB (`/1e9`).
-     Both are compared in `_vram_admission_check`.
-  3. Docker-label reclaim: **mostly done** (9410656). `_running_profile_vram_credit` and
-     `_identify_active_profile` read `dgx.profile` first. Substring/fuzzy name-match fallback
-     remains for unlabeled containers. `start_hf_qwen_qwen3.6-35b-a3b-fp8.sh`
-     (recipe-backed) still sets no label.
-  4. Concurrent starts: **open**. `_engine_start` has no lock or in-flight reservation.
-     Two starts (UI + pinned autostart, or two engines) can both pass admission against
-     the same MemAvailable.
-  5. Exit code / OOM: **partial**. `_load_progress_events` reports `State.ExitCode` on the
-     SSE stream when the container exits, and the UI shows it (`dashboard.html`). There is
-     no `OOMKilled` read and no test on that path. The verdict exists only while a client
-     is watching the stream.
+**Status (2026-10-19)**: Implemented in #23 (05-01) and #24 (05-02), plus #22 and #25 as
+follow-ups. Deployed to gb10 (service restarted, engines untouched). No separate PLAN.md
+exists: the draft plan (PR #21) was closed as superseded once the work shipped; the design
+is recorded in the #23/#24 PR descriptions.
+  1. Executor budget: **done**. A launch's footprint is `util × live MemTotal`, with util
+     taken from, in order, an override the script reads, the script's own util, the recipe
+     YAML's util, and only then the `# VRAM:` header. Generated headers are written as
+     `round(util × total)`, the 14 tracked headers were corrected, and preflight warns when
+     a header drifts more than 5 GiB.
+  2. Binary GiB units: **done**. All admission math is GiB; the old decimal-GB override path
+     and its hard-coded `121.0` are gone.
+  3. Docker-label reclaim: **done**. Credit goes only to a container whose `dgx.profile`
+     label names a known profile. Name and fuzzy matching are removed; an unlabeled running
+     container earns no credit and preflight warns. Generated and recipe-backed scripts now
+     emit the label (recipe-backed via `VLLM_SPARK_EXTRA_DOCKER_ARGS`).
+  4. Concurrent starts: **done**. One asyncio lock covers settle, in-progress check,
+     preflight, admission and spawn. Each launch leaves a reservation that other admissions
+     subtract until the container is healthy or dead, its script fails, or 15 minutes pass.
+     A second start on the same engine during a launch gets 409; `force` supersedes it.
+  5. Exit code / OOM: **done**. `OOMKilled` is read and exit codes 137/139/143 are
+     explained. The reason appears in the progress stream, the UI and
+     `/api/{engine}/status` under `launch.in_flight` / `launch.last`.
+
+Also landed: a mandatory preflight gate on every unforced vLLM start (absorbing
+`b6d1f00`), and #25, which makes a wrapper script with no parseable image a `skip` instead
+of a false `fail` (found during the deploy: the gate would otherwise have refused the pinned
+flash-next profile).
+
+**Still open after the deploy:**
+  - The five profiles that launch at util 0.75 (qwen3-8b, qwen3-vl-4b, qwen3-14b,
+    qwen2.5-14b-gptq, deepseek-14b) are refused alongside a running engine. Their utils are
+    unchanged; proposed starting points (0.35, 0.20, 0.45, 0.30, 0.40) need measuring on
+    gb10, which replaces the serving model.
+  - The refusal smoke test (start llama.cpp while flash-next serves; expect 409) was not run.
+  - `dgx.profile` on the Qwen3.6 recipe profile is confirmed only after its next launch.
+  - `OOMKilled` for a host-wide OOM kill on GB10 is from the docker docs, not observed here;
+    gb10's memory failures appear as `NV_ERR_NO_MEMORY` driver errors.
 
 ### Phase 6: Verifiable research capture
 **Goal**: A research run produces findings that cannot assert a number no source actually
