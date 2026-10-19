@@ -4178,6 +4178,10 @@ def _expand_script_vars(value: str, text: str) -> str:
     env = {k: os.environ[k] for k in _PF_ENV_ALLOWED if k in os.environ}
     for m in _PF_ASSIGN_RE.finditer(text):
         env[m.group(1)] = next((g for g in m.groups()[1:] if g is not None), "")
+    # Only numeric defaults for the three documented launch overrides are safe to
+    # resolve without executing shell code or reading arbitrary environment values.
+    value = _TEMPLATED_DEFAULT_RE.sub(
+        lambda m: m.group(2) if m.group(1) in _ENV_TO_OVERRIDE_KEY else m.group(0), value)
     return _PF_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), value)
 
 
@@ -4216,6 +4220,54 @@ def _parse_launch_script(text: str) -> dict:
         "has_serve": bool(_re.search(r"^\s*vllm serve\b", code, _re.M)),
         "clears_container": "docker rm -f vllm_node" in code,
     }
+
+
+
+def _preflight_hub_id(model: str) -> bool:
+    """vLLM accepts Hub IDs as well as absolute local model paths."""
+    return bool(_re.fullmatch(r"[A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?", model))
+
+
+def _preflight_mount_parts(mount: str) -> tuple[str, str]:
+    parts = mount.split(":", 2)
+    return (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+
+
+def _preflight_probe_mounts(mounts: list) -> tuple[list[str], str]:
+    """Use read-only binds that fail if a source vanishes, rather than creating it."""
+    args = []
+    for mount in mounts:
+        source, target = _preflight_mount_parts(mount)
+        if "$" in mount or not source.startswith("/") or not target.startswith("/"):
+            return [], "Mount paths are dynamic or are not absolute bind paths"
+        if not Path(source).exists():
+            return [], f"Mount source does not exist: {source}"
+        # Docker --mount uses commas as separators; do not reinterpret such paths.
+        if "," in source or "," in target:
+            return [], "Mount path contains an unsupported comma"
+        args += ["--mount", f"type=bind,src={source},dst={target},readonly"]
+    return args, ""
+
+
+def _preflight_server_flags(facts: dict, script: str) -> list[str]:
+    """Read only the command following the parsed image, never execute a script."""
+    code = facts.get("code") or _script_code(script)
+    image = facts.get("image")
+    match = next((m for m in _PF_IMAGE_RE.finditer(code) if m.group(1) == image), None)
+    if not match:
+        return []
+    command = code[match.end():].lstrip("\r\n").replace("\\\n", " ").split("\n", 1)[0]
+    try:
+        flags = [_expand_script_vars(a, code) for a in shlex.split(command, comments=True)]
+    except ValueError:
+        return []
+    if flags[:2] == ["vllm", "serve"]:
+        flags = flags[2:]
+    # Unknown shell expressions cannot be expanded safely. In particular do not
+    # pass unresolved ${VAR:-value} to argparse and report a false invalid-number error.
+    if any("$" in a or a in (";", "&&", "||", "|", ">", "<") for a in flags):
+        return []
+    return flags
 
 
 def _preflight_static(text: str, cfg: dict) -> list:
@@ -4271,9 +4323,12 @@ def _preflight_static(text: str, cfg: dict) -> list:
             "the port, and the launch either fails or is silently skipped.",
             "Add `docker rm -f vllm_node 2>/dev/null || true` before launching."))
 
-    if facts["model"] and not facts["recipe_backed"]:
-        under_mount = any(facts["model"].startswith(m.split(":", 1)[-1].rstrip("/"))
-                          for m in facts["mounts"] if ":" in m)
+    if (facts["model"] and not facts["recipe_backed"]
+            and not _preflight_hub_id(facts["model"])):
+        model = facts["model"]
+        targets = [_preflight_mount_parts(m)[1] for m in facts["mounts"]]
+        under_mount = any(model == t.rstrip("/") or model.startswith(t.rstrip("/") + "/")
+                          for t in targets if t.startswith("/"))
         if not under_mount:
             out.append(_pf(
                 "warn", "mount_scope", "Model path is not under any bind mount",
@@ -4392,6 +4447,33 @@ _PF_ARGPARSE_PROBE = (
 )
 
 
+_PF_MODEL_CONFIG_PROBE = """
+import sys
+from pathlib import Path
+try:
+    model, revision = sys.argv[1:]
+    if model.startswith("/"):
+        path = str(Path(model) / "config.json")
+    else:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+        except ImportError:
+            print("CONFIG_PROBE_UNAVAILABLE")
+            sys.exit(0)
+        path = try_to_load_from_cache(model, "config.json", revision=revision)
+        if not isinstance(path, str):
+            print("CONFIG_MISSING")
+            sys.exit(0)
+    with open(path, "rb") as stream:
+        stream.read(1)
+    print("CONFIG_READABLE")
+except OSError:
+    print("CONFIG_MISSING")
+except Exception:
+    print("CONFIG_PROBE_UNAVAILABLE")
+"""
+
+
 async def _preflight_runtime(facts: dict, script: str) -> list:
     """Checks that need docker. Each degrades to `skip` rather than a false failure."""
     out = []
@@ -4407,6 +4489,7 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
             "docker rm -f vllm_node"))
 
     image = facts.get("image")
+    image_present = False
     if image:
         insp = await _run("docker", "image", "inspect", image, "--format", "{{.Id}}",
                           timeout=20)
@@ -4416,6 +4499,7 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
                 "The launch will pull it first, which can take several minutes and will "
                 "look like a hung load.", f"docker pull {image}"))
         else:
+            image_present = True
             out.append(_pf("ok", "image", f"Image '{image}' present", insp.stdout.strip()[:19]))
 
     # Docker's short `-v host:container` syntax CREATES a missing host directory.
@@ -4424,7 +4508,7 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
     missing_mounts = []
     for mount in facts.get("mounts", []):
         source = mount.split(":", 1)[0]
-        if source and "$" not in source and not Path(source).exists():
+        if source.startswith("/") and "$" not in source and not Path(source).exists():
             missing_mounts.append(source)
             out.append(_pf(
                 "fail", "mount_source", "Model mount source does not exist",
@@ -4432,37 +4516,55 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
                 "directory there, hiding the stale profile path until vLLM starts.",
                 "Regenerate the profile from the model's current Inventory path."))
 
-    # The mount-scope test from 2026-07-30, run for real: read the model's own
-    # config.json through the exact bind mounts the launch will use. A dangling
-    # symlink fails here in about a second instead of after a 3-minute load.
-    if "$" in (facts.get("model") or "") or any("$" in m for m in facts.get("mounts", [])):
-        # Scripts compute paths at runtime (`HASH=$(basename "$SNAP_HOST")`), and
-        # command substitution cannot be resolved without executing the script.
-        # An unresolved path is "unknown", never "broken" — reporting it as a
-        # failure would train the reader to ignore this check.
-        out.append(_pf(
-            "skip", "mount_readable", "Model path is computed at runtime",
-            f"{facts.get('model')} contains a shell substitution, so the files could "
-            f"not be read ahead of the launch. Static checks still apply."))
-    elif (facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]
-          and not missing_mounts):
-        args = ["docker", "run", "--rm", "--entrypoint", "/bin/sh"]
-        for m in facts["mounts"]:
-            args += ["-v", m]
-        target = facts["model"].rstrip("/") + "/config.json"
-        args += [image or "busybox", "-c", f"cat {shlex.quote(target)} >/dev/null"]
+    model = facts.get("model") or ""
+    if model and not facts["recipe_backed"] and not missing_mounts:
+        mount_args, issue = _preflight_probe_mounts(facts.get("mounts", []))
+        if "$" in model or issue or not image_present:
+            out.append(_pf("skip", "mount_readable", "Model configuration probe unavailable",
+                           issue or ("Model path is computed at runtime" if "$" in model
+                                     else "No local image available for an offline probe")))
+            return out
+        if not model.startswith("/") and not _preflight_hub_id(model):
+            out.append(_pf("skip", "mount_readable", "Model path is unresolved", model))
+            return out
+        flags = _preflight_server_flags(facts, script)
+        if _preflight_hub_id(model) and (
+                _re.search(r"\b(?:HF_HOME|HF_HUB_CACHE|HUGGINGFACE_HUB_CACHE|TRANSFORMERS_CACHE)\b"
+                           r"|--download-dir\b", facts.get("code") or _script_code(script))
+                or ("--revision" in (facts.get("code") or _script_code(script)) and not flags)):
+            out.append(_pf("skip", "mount_readable", "Hub cache layout or revision is unresolved",
+                           "Custom cache paths and dynamic revision arguments need a launch-specific"
+                           " check; the default cache lookup would be inconclusive."))
+            return out
+        revision = "main"
+        for index, flag in enumerate(flags):
+            if flag == "--revision" and index + 1 < len(flags):
+                revision = flags[index + 1]
+            elif flag.startswith("--revision="):
+                revision = flag.split("=", 1)[1]
+        args = ["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                "--entrypoint", "python3", "-e", "HF_HUB_OFFLINE=1"]
+        args += mount_args + [image, "-c", _PF_MODEL_CONFIG_PROBE, model, revision]
         probe = await _run(*args, timeout=60)
-        if probe.returncode == 0:
-            out.append(_pf("ok", "mount_readable", "Model files readable inside the container",
-                           f"Read {target} through the configured bind mounts."))
+        result = (probe.stdout or "").strip().splitlines()
+        if probe.returncode == 0 and "CONFIG_READABLE" in result:
+            out.append(_pf("ok", "mount_readable", "Model configuration readable in container",
+                           f"Read config.json for {model} through the configured mounts"
+                           " using offline cache lookup for Hub IDs. Weight files are not checked."))
+        elif probe.returncode == 0 and "CONFIG_MISSING" in result:
+            hub = _preflight_hub_id(model)
+            offline = bool(_re.search(r"\bHF_HUB_OFFLINE=(?:1|true|yes|on)\b",
+                                      facts.get("code") or _script_code(script), _re.I))
+            level = "fail" if not hub or offline else "warn"
+            out.append(_pf(level, "mount_readable", "Model configuration is not locally readable",
+                           f"Could not read config.json for {model} through these mounts"
+                           f" at revision {revision}. " +
+                           ("An online launch may download it." if hub and not offline else
+                            "Check the model location, cache revision, and snapshot symlinks.")))
         else:
-            out.append(_pf(
-                "fail", "mount_readable", "Model files are NOT readable inside the container",
-                f"Reading {target} through the configured mounts failed: "
-                f"{(probe.stderr or probe.stdout or '').strip()[:300]}. This reads like a "
-                f"corrupt download but is almost always mount scope — HF snapshot entries "
-                f"are relative symlinks into ../../blobs/.",
-                "Mount the models--*/ root so blobs/ and snapshots/ are both in scope."))
+            out.append(_pf("skip", "mount_readable", "Model configuration probe could not run",
+                           "The offline image probe was unavailable; this does not establish"
+                           " whether the model configuration exists."))
     return out
 
 
@@ -4492,21 +4594,22 @@ async def _preflight_smoke(facts: dict, script: str) -> list:
 
     if not facts.get("image"):
         return [_pf("skip", "smoke", "No image parsed from the script", "")]
-    # Everything after the `vllm serve` line is a server flag; feed exactly those
-    # to vLLM's own parser inside the image.
-    code = facts.get("code") or _script_code(script)
-    body = code.split("vllm serve", 1)[1] if facts["has_serve"] else ""
-    flags = [_expand_script_vars(a, code)
-             for a in shlex.split(body.replace("\\\n", " "))] if body else []
+    flags = _preflight_server_flags(facts, script)
     if not flags:
-        return [_pf("skip", "smoke", "No server flags parsed from the script", "")]
-    args = ["docker", "run", "--rm", "--entrypoint", "python3"]
-    for m in facts["mounts"]:
-        args += ["-v", m]
+        return [_pf("skip", "smoke", "Server arguments could not be resolved statically", "")]
+    mount_args, issue = _preflight_probe_mounts(facts.get("mounts", []))
+    if issue:
+        return [_pf("skip", "smoke", "Argument probe mounts unavailable", issue)]
+    image = await _run("docker", "image", "inspect", facts["image"], "--format", "{{.Id}}",
+                       timeout=20)
+    if image.returncode != 0:
+        return [_pf("skip", "smoke", "No local image available for an offline argument probe", "")]
+    args = ["docker", "run", "--rm", "--pull", "never", "--network", "none",
+            "--entrypoint", "python3", "-e", "HF_HUB_OFFLINE=1"] + mount_args
     args += [facts["image"], "-c", _PF_ARGPARSE_PROBE] + flags
     probe = await _run(*args, timeout=_PF_SMOKE_TIMEOUT_S)
     combined = ((probe.stdout or "") + (probe.stderr or "")).strip()
-    if "ARGS_OK" in combined:
+    if probe.returncode == 0 and "ARGS_OK" in combined.splitlines():
         return [_pf("ok", "smoke", "vLLM accepted every flag",
                     f"{len(flags)} arguments parsed by vLLM's own argument parser "
                     f"inside {facts['image']}, without loading weights.")]
