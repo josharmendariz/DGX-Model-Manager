@@ -111,6 +111,17 @@ Private state is under `~/.local/state/dmm-overnight/<UTC-run-id>/` on each owni
 host. `report.json`, candidate `result.json` and restoration `snapshot.json` are
 metadata artifacts; raw launcher logs stay private on GB10.
 
+## Small live rehearsal
+
+The `rehearse` mode uses the current Flash engine, tokenizer, monitoring and
+streaming inference path with 512-token synthetic prompts at parallelism 1 and 2,
+plus a tool-call schema smoke. It never invokes a profile or replaces a container.
+Run it through temporary versions of the same coordinator/worker units with a
+separate run ID and a short deadline, before installing the overnight units.
+That exercises the real controller drain/freeze, SSH coordination, exit hooks,
+serving verification and controller thaw. It qualifies orchestration and the
+current inference protocol; it does not measure either model's cold startup.
+
 ## Prepare, review, then deploy
 
 No timer is installed by the schedule generator:

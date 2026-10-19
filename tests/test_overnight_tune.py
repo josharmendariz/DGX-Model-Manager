@@ -180,9 +180,7 @@ def test_streaming_latency_usage_and_retrieval(monkeypatch):
         sock = Socket()
         def __init__(self, *args, **kwargs):
             pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
+        def close(self):
             pass
         def request(self, *args, **kwargs):
             pass
@@ -246,3 +244,66 @@ def test_tool_smoke_validates_arguments_without_executing(monkeypatch):
     monkeypatch.setattr(tune, 'request', lambda *a, **kw: {'choices': [{'message': {'content': 'no call'}}]})
     with pytest.raises(RuntimeError, match='Tool-call schema'):
         tune.tool_smoke('test')
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_rehearsal_never_launches_engine(tmp_path, monkeypatch, valid):
+    monkeypatch.setattr(tune, 'STATE', tmp_path)
+    monkeypatch.setattr(tune, 'precheck', lambda: None)
+    monkeypatch.setattr(tune, 'ensure_idle', lambda: None)
+    monkeypatch.setattr(tune, 'container', lambda: {'id': 'original'})
+    monkeypatch.setattr(tune, 'launch', lambda *a: pytest.fail('rehearsal must not replace engine'))
+    monkeypatch.setattr(tune, 'request', lambda *a: {'data': [{'id': 'test'}]})
+    monkeypatch.setattr(tune, 'tool_smoke', lambda *a: {'passed': True})
+    monkeypatch.setattr(tune, 'synthetic_tokens', lambda *a: [1, 2])
+    counts = iter([0, 1, 1, 3])
+    monkeypatch.setattr(tune, 'completed_requests', lambda: next(counts))
+    monkeypatch.setattr(tune, 'infer', lambda *a: {'needle_pass': valid})
+    if valid:
+        tune.rehearse()
+    else:
+        with pytest.raises(RuntimeError, match='Rehearsal inference failed'):
+            tune.rehearse()
+    report = json.loads((tmp_path / 'rehearsal.json').read_text())
+    assert report['passed'] is valid
+    assert not report['engine_replaced']
+
+
+def test_infer_uses_real_http_connection_and_stream_parser(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            events = [{'choices': [{'text': 'AMBER731', 'finish_reason': 'stop'}]},
+                      {'choices': [], 'usage': {'completion_tokens': 3}}]
+            body = (''.join('data: ' + json.dumps(v) + '\n\n' for v in events) + 'data: [DONE]\n\n').encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(tune, 'API', 'http://127.0.0.1:' + str(server.server_port))
+    class Monitor:
+        def check(self):
+            pass
+    try:
+        result = tune.infer('test', [1], tune.time.monotonic() + 5, Monitor())
+        assert result['needle_pass'] and result['output_tokens'] == 3
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_empty_recent_kernel_journal_is_clean_when_journal_readable(monkeypatch):
+    replies = iter([subprocess.CompletedProcess([], 0, '-- No entries --', ''),
+                    subprocess.CompletedProcess([], 0, 'Older kernel message', '')])
+    monkeypatch.setattr(tune.subprocess, 'run', lambda *a, **kw: next(replies))
+    assert tune.kernel_faults(123) == 0

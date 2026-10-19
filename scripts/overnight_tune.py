@@ -6,6 +6,7 @@ fleet concurrency changes. Host-maintenance launches use maintained DMM profiles
 """
 import argparse
 import concurrent.futures
+from contextlib import closing
 import datetime as dt
 import fcntl
 import hashlib
@@ -237,8 +238,9 @@ def infer(model, tokens, deadline, monitor, decode=False):
         'model': model, 'prompt': tokens, 'max_tokens': 128, 'temperature': 0,
         'stream': True, 'add_special_tokens': False, 'stream_options': {'include_usage': True}}).encode()
     first, usage, output, finish = None, {}, '', None
-    with http.client.HTTPConnection('127.0.0.1', 8000,
-                                   timeout=max(.01, deadline - time.monotonic())) as connection:
+    endpoint = urllib.parse.urlsplit(API)
+    with closing(http.client.HTTPConnection(endpoint.hostname, endpoint.port,
+                 timeout=max(.01, deadline - time.monotonic()))) as connection:
         connection.request('POST', '/v1/completions', body=payload,
                            headers={'Content-Type': 'application/json'})
         r = connection.getresponse()
@@ -291,8 +293,14 @@ def kernel_faults(since):
     # Inspect in memory; publish counts only. Non-readable journals are a coverage gap.
     r = subprocess.run(['journalctl', '-k', '--since', '@' + str(int(since)), '--no-pager'],
                        capture_output=True, text=True, timeout=15)
-    if r.returncode or 'No entries' in r.stdout or 'permission' in r.stderr.lower():
+    if r.returncode or 'permission' in r.stderr.lower():
         return None
+    if 'No entries' in r.stdout:
+        access = subprocess.run(['journalctl', '-k', '-n', '1', '--no-pager'],
+                                capture_output=True, text=True, timeout=15)
+        if access.returncode or 'No entries' in access.stdout or 'permission' in access.stderr.lower():
+            return None
+        return 0
     return len(re.findall(r'NV_ERR_NO_MEMORY|Out of memory:|oom-kill:', r.stdout))
 
 
@@ -433,6 +441,37 @@ def restore():
         snapshot['restored'] = True
         snapshot['restored_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
         write(STATE / 'snapshot.json', snapshot)
+
+
+def rehearse():
+    """Tiny live rehearsal on the existing engine; never launches/replaces it."""
+    precheck()
+    original = container()
+    model = request('/v1/models')['data'][0]['id']
+    result = {'mode': 'rehearsal', 'engine_replaced': False, 'batches': [], 'passed': False}
+    monitor = Monitor()
+    monitor.thread.start()
+    try:
+        result['tool_smoke'] = tool_smoke(model)
+        for parallel in (1, 2):
+            ensure_idle()
+            tokens = [synthetic_tokens(model, 512, f'{RUN_ID}-{parallel}-{i}')
+                      for i in range(parallel)]
+            before = completed_requests()
+            deadline = time.monotonic() + 60
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as pool:
+                records = list(pool.map(lambda t: infer(model, t, deadline, monitor), tokens))
+            if completed_requests() - before != parallel:
+                raise RuntimeError('Rehearsal contaminated by other requests')
+            result['batches'].append({'parallel': parallel, 'requests': records})
+            if not all(r['needle_pass'] for r in records):
+                raise RuntimeError('Rehearsal inference failed')
+        if container()['id'] != original['id']:
+            raise RuntimeError('Engine identity changed during rehearsal')
+        result['passed'] = True
+    finally:
+        result['memory'] = monitor.finish()
+        write(STATE / 'rehearsal.json', result)
 
 
 def worker():
@@ -669,7 +708,7 @@ WantedBy=timers.target
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=['plan', 'schedule', 'worker', 'restore', 'coordinate', 'resume', 'verify', 'precheck'])
+    parser.add_argument('mode', choices=['plan', 'schedule', 'worker', 'restore', 'coordinate', 'resume', 'verify', 'precheck', 'rehearse'])
     parser.add_argument('--date')
     parser.add_argument('--output', type=Path, default=ROOT / '.planning/overnight-units')
     args = parser.parse_args()
