@@ -6,6 +6,94 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+Summarised from `git log v0.2.0..main` (2026-05-14 → 2026-10-13). Planning-only
+(`.planning/`) and test-only commits are omitted.
+
+### Security
+
+- **Mutating endpoints fail closed on an open bind** — with no API key and a
+  non-loopback bind, `verify_auth` now returns 503 for every mutating request
+  instead of allowing it. `MODEL_MANAGER_ALLOW_UNAUTH=1` restores open access and
+  logs each unauthenticated mutation. The 10-second startup warning remains.
+- **Shell-quoted profile generation** — every dynamic value written into a
+  generated start script is shell-quoted, so a model name cannot inject commands.
+- **Allow-listed launch overrides** — `max_model_len`, `gpu_memory_utilization`
+  and `max_num_seqs` are the only overrides accepted, range-checked before they
+  reach the script environment.
+- **Escaped UI rendering** — one `esc()` helper is applied at every enumerated
+  DOM sink (e.g. HF-browse results).
+
+### Added
+
+- **llama.cpp engine** — GGUF profiles driven by a config-owned quant ladder
+  (`llamacpp.recipes`), run in the upstream `server-cuda` container.
+- **Derived launch spec** — `_derive_launch_spec` computes attention topology,
+  KV bytes/token, fitting context and recommended `--gpu-memory-utilization`,
+  hybrid-attention aware; curated `vllm.recipes` override derived values.
+- **Explicit capability map** (`model_capabilities.json`) for tool/reasoning
+  parsers instead of substring guessing.
+- **Parameterized profile scripts** — generated scripts read `VLLM_*` env
+  placeholders; profile cards expose context/utilization/seqs overrides with
+  derived defaults; legacy scripts can be parameterized via preview/apply with a
+  sha256 confirm token.
+- **Launch preflight** and `POST /api/vllm/reclaim-cache`; a live SSE
+  load-progress stream with a determinate bar; a load-log tail view.
+- **Pinned vLLM model** — a pinned profile is launched once per boot when nothing
+  else holds vLLM.
+- **VRAM admission control** before every engine launch, with reclaim credit for
+  the profile being replaced and a headroom floor for profiles with no
+  `# VRAM:` header.
+- **Advisor tab** — recommendations knowledge base, research-refresh job, and
+  approve/apply actions for model and tuning recommendations.
+- **Dashboards tab** (discovers running web UIs; named hosts, k8s dedup) and a
+  **Homelab** tab listing nodes with local and Tailscale IPs.
+- **Unified-memory gauge** with sparkline in the header.
+- **Config-driven alerting** with a pluggable notifier registry (Discord) and
+  persisted cooldown state.
+- **Unified background-job runner** with progress and history.
+- **Nightly container image drift checker** (`image_updates.py`).
+- **k8s-mode LiteLLM restart** — sync the ConfigMap and roll the deployment.
+- Stable `vllm-active` alias served by every profile; systemd unit for the default
+  model; new GB10 vLLM start profiles.
+- pytest suite and a CI workflow running it on push/PR.
+
+### Changed
+
+- **Engines launch outside DMM's cgroup** (`systemd-run --user --scope`), so
+  restarting the manager no longer stops a running model. Generated profiles use
+  `docker run -d` and carry no `--restart` policy.
+- **Active profile is identified by the `dgx.profile` docker label**, falling back
+  to served-name matching only for unlabeled containers.
+- **Overridden launches are admitted against the overridden footprint**, not the
+  script header's static `# VRAM:` value; llama.cpp recipes resolve before
+  admission for the same reason.
+- Dashboard frontend extracted from `app.py` into `dashboard.html`.
+- HF downloads use `hf_transfer` and filter out formats GB10 cannot serve.
+- Profile tuning: Qwen3.6 util lowered to reclaim stranded KV; host headroom kept
+  for Qwen Flash; the `lyf` profile retired.
+
+### Fixed
+
+- HF download worker crash (`NameError: _HF_XFER`); every download stream now
+  emits exactly one terminal event.
+- `vllm serve` subcommand treated as an image property; DeepSeek profiles no
+  longer mount only `snapshots/<rev>`; HF repos in custom dirs generate working
+  profiles.
+- gpt-oss-120b Harmony token-soup on GB10 (sm_121).
+- llama.cpp serves on the port its image healthcheck probes; `llamacpp_base`
+  probes host port 8081.
+- systemd start-limit settings placed in the correct unit section.
+- Model directories that fail to parse are surfaced in the inventory.
+- vLLM tab hook moved out of `switchTab`'s else-if chain.
+- Discord 403 (explicit User-Agent); header memory-gauge rendering.
+
+### Removed
+
+- Two stale `.sh.bak` profile backups from the repository; `*.bak` is now
+  gitignored.
+
 ## [0.2.0] - 2026-05-14
 
 ### Security

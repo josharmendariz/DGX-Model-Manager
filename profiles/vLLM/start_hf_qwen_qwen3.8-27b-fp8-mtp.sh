@@ -1,7 +1,7 @@
 #!/bin/bash
 # Name: HF Qwen/Qwen3.8-27B-FP8 (MTP)
 # Description: Qwen3.8-27B-FP8 with the checkpoint's own MTP head + prefix caching
-# VRAM: 92
+# VRAM: 88
 #
 # Supersedes the plain FP8 launch. Measured on gb10 2026-09-08 over a 15-config
 # exclusive sweep (harness and raw JSON in ~/vllm-sweep/ on the box):

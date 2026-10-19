@@ -1,7 +1,7 @@
 #!/bin/bash
 # Name: Nemotron-3 Nano 30B (NVFP4)
 # Description: 18G weights + 21G KV cache @ util 0.35 — 256K ctx, tool calling
-# VRAM: 42
+# VRAM: 43
 #
 # Proven config (2026-07-10): cu130-nightly, marlin NVFP4 backend.
 # Serves as "nemotron-3-nano" on :8000. Weights from HF cache (offline).

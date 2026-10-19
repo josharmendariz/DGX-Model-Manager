@@ -2611,7 +2611,7 @@ async function loadWarmModels() {
       const isActive = p.id === activeProfile;
       const isSelected = p.id === warmSelectedProfile;
       const cls = 'warm-profile' + (isActive ? ' active' : '') + (isSelected ? ' selected' : '');
-      const vram = p.vram_gb != null ? p.vram_gb + ' GB' : '--';
+      const vram = p.vram_gb != null ? p.vram_gb + ' GiB' : '--';
       return '<div class="' + cls + '" onclick="warmSelectProfile(\'' + p.id.replace(/'/g, "\\'") + '\')">'
         + '<div class="warm-profile-head"><div class="warm-profile-name">' + _escHtml(p.name || p.id) + '</div>'
         + '<span class="warm-pill ' + (isActive ? 'ok' : '') + '">' + _escHtml(vram) + '</span></div>'
@@ -2664,6 +2664,14 @@ function warmSelectProfile(id) {
   loadWarmModels();
 }
 
+// 409s from /start that `force: true` overrides: memory admission, the mandatory vLLM
+// preflight, and a launch already in flight on the same engine (05-02).
+function isForceable409(e) {
+  const msg = String((e && e.message) || '');
+  return msg.includes('unified memory') || msg.includes('preflight blocked') ||
+         msg.includes('already in progress');
+}
+
 async function warmStartSelected() {
   if (!warmSelectedProfile) { toast('Select a vLLM profile first', 'err'); return; }
   try {
@@ -2671,8 +2679,8 @@ async function warmStartSelected() {
     toast('vLLM profile starting', 'ok');
     setTimeout(loadWarmModels, 2500);
   } catch(e) {
-    if (String(e.message || '').includes('unified memory') &&
-        confirm(e.message + '\n\nForce start anyway?')) {
+    // Every one of these 409s is force-overridable server-side; ask before overriding.
+    if (isForceable409(e) && confirm(e.message + '\n\nForce start anyway?')) {
       try {
         await apiFetch('/api/vllm/start', 'POST', {profile: warmSelectedProfile, force: true});
         toast('vLLM profile force-started', 'ok');
@@ -2801,7 +2809,7 @@ async function loadRecipes(eng) {
     const r = eng.recipes[n];
     return '<option value="' + _escHtml(n) + '"' +
            (n === eng.selectedRecipe ? ' selected' : '') + '>' +
-           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GB') +
+           _escHtml(n + '  —  ' + r.quant + ', ' + (r.ctx / 1024) + 'K ctx, ~' + r.vram_gb + ' GiB') +
            '</option>';
   }).join('');
   bar.style.display = 'flex';
@@ -2875,7 +2883,7 @@ function renderEngineProfiles(eng) {
             ? ' <span class="inv-no" title="No matching model directory on disk">weights missing</span>' : ''}</div>
           <div class="p-desc">${esc(p.description)}</div>
         </div>
-        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GB' : '\u2014'}</div>
+        <div class="p-vram">${p.vram_gb != null ? p.vram_gb + ' GiB' : '\u2014'}</div>
         <div class="p-actions" onclick="event.stopPropagation()">
           ${p.model_dir
             ? `<button class="btn-icon-del" title="Delete model weights from disk${
@@ -3287,12 +3295,9 @@ function vllmLogTailToggle() {
 
 async function startEngine(eng) {
   if (!eng.selectedProfile) { toast('Select a profile first', 'err'); return; }
-  // A FAILED PREFLIGHT is launch evidence, not a preflight-endpoint error. Only when this
-  // engine's last Dry Run came back verdict=fail do we hold Start for a confirm, and the
-  // block is force-overridable (mirrors the 'unified memory' force path below). The recheck
-  // below throws? We fall through and start unforced — a dead preflight endpoint must not be
-  // able to block the only GPU. Runs before any button state is touched, so declining leaves
-  // the UI exactly as it was.
+  // A remembered failed Dry Run lets the UI explain the problem before sending Start.
+  // The server independently runs the authoritative preflight on every unforced vLLM
+  // launch (05-02), because a refresh or a direct API client must not bypass it.
   let forceFromGate = false;
   if (eng.key === 'vllm' && eng._preflightVerdict === 'fail') {
     try {
@@ -3308,7 +3313,7 @@ async function startEngine(eng) {
         forceFromGate = true;
       }
     } catch (e) {
-      toast('Preflight recheck failed (' + e.message + '); starting ungated', 'err');
+      toast('Preflight recheck failed (' + e.message + '); the server will recheck on Start', 'err');
     }
   }
   const btn  = document.getElementById(eng.ids.start);
@@ -3340,8 +3345,8 @@ async function startEngine(eng) {
   try {
     beginPoll(await startWith(forceFromGate));
   } catch(e) {
-    if (String(e.message || '').includes('unified memory') &&
-        confirm(e.message + '\n\nForce start anyway?')) {
+    // Every one of these 409s is force-overridable server-side; ask before overriding.
+    if (isForceable409(e) && confirm(e.message + '\n\nForce start anyway?')) {
       try {
         beginPoll(await startWith(true));
       } catch(forceErr) {
@@ -3432,6 +3437,8 @@ function followLoadProgress(eng, d) {
       // textContent, never innerHTML — this string is container output.
       log.textContent = 'LOAD FAILED\n\n' + (e.error || 'unknown cause')
         + (e.exit_code != null ? '\n\nContainer exit code: ' + e.exit_code : '')
+        + (e.oom_killed ? '\nOOMKilled: true' : '')
+        + (e.cause ? '\nCause: ' + e.cause : '')
         + (e.hint ? '\n\n→ ' + e.hint : '');
       finish(false, eng.name + ' failed to load');
       return;

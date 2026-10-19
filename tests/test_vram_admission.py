@@ -47,39 +47,52 @@ async def test_credit_prefers_dgx_profile_label_over_name_match(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_credit_falls_back_to_name_match_when_label_absent(tmp_path, monkeypatch):
+async def test_unlabeled_container_earns_no_credit_even_if_name_matches(tmp_path, monkeypatch):
+    """05-02 fail-closed: the served name appears verbatim in a script, which the old
+    fallback treated as identification. Every profile aliases `vllm-active`, so that
+    was a guess — and a guessed credit can admit a launch the pool cannot hold."""
     profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n")]
     monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
         "running": True, "model": "qwen3-coder",
         "instances": [{"name": "vllm_node", "running": True}],
     }))
     monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label(None))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 60.0
-    assert pid == "start_big"
-
-@pytest.mark.asyncio
-async def test_credit_matches_served_name_in_script(tmp_path, monkeypatch):
-    profiles = [
-        _profile(tmp_path, "start_small", 20, "--served-model-name other-model\n"),
-        _profile(tmp_path, "start_big", 60, "--served-model-name qwen3-coder\n"),
-    ]
-    monkeypatch.setattr(appmod, "_engine_status",
-                        _mock_engine_status({"running": True, "model": "qwen3-coder"}))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 60.0
-    assert pid == "start_big"
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
 
 
 @pytest.mark.asyncio
-async def test_credit_fuzzy_fallback_on_profile_id(tmp_path, monkeypatch):
-    # Served name not verbatim in any script — falls back to token matching.
+async def test_no_fuzzy_credit_without_a_container_label(tmp_path, monkeypatch):
     profiles = [_profile(tmp_path, "start_qwen3_coder", 45)]
     monkeypatch.setattr(appmod, "_engine_status",
                         _mock_engine_status({"running": True, "model": "qwen3_coder-fp8"}))
-    credit, pid = await appmod._running_profile_vram_credit("vllm", profiles)
-    assert credit == 45.0
-    assert pid == "start_qwen3_coder"
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
+
+
+@pytest.mark.asyncio
+async def test_label_hit_on_unmetered_profile_does_not_fall_through(tmp_path, monkeypatch):
+    """The latent 9410656 bug: the label named a profile with no footprint, the loop
+    `continue`d, and name matching then credited a DIFFERENT profile's 60 GiB."""
+    profiles = [
+        _profile(tmp_path, "start_labelled", None, "--served-model-name vllm-active\n"),
+        _profile(tmp_path, "start_other", 60, "--served-model-name vllm-active\n"),
+    ]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("labelled"))
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "start_labelled")
+
+
+@pytest.mark.asyncio
+async def test_label_naming_no_known_profile_earns_no_credit(tmp_path, monkeypatch):
+    profiles = [_profile(tmp_path, "start_big", 60, "--served-model-name vllm-active\n")]
+    monkeypatch.setattr(appmod, "_engine_status", _mock_engine_status({
+        "running": True, "model": "vllm-active",
+        "instances": [{"name": "vllm_node", "running": True}],
+    }))
+    monkeypatch.setattr(appmod, "_docker_label", _mock_docker_label("retired_profile"))
+    assert await appmod._running_profile_vram_credit("vllm", profiles) == (0.0, "")
 
 
 @pytest.mark.asyncio
@@ -114,7 +127,7 @@ async def test_credit_unknown_engine_key():
 # ── _vram_admission_check ─────────────────────────────────────────────────────
 
 def _patch_memory(monkeypatch, available_gb, credit=(0.0, ""), others=None):
-    monkeypatch.setattr(appmod, "_get_available_memory_gb", lambda: available_gb)
+    monkeypatch.setattr(appmod, "_get_available_memory_gib", lambda: available_gb)
 
     async def stub_credit(engine_key, profiles):
         return credit
@@ -194,54 +207,96 @@ async def test_admission_unmetered_force_bypasses(monkeypatch):
     await appmod._vram_admission_check("vllm", profile, force=True, scan_fn=lambda: [])
 
 
-# ── Phase 04-01: overrides resolve BEFORE admission ───────────────────────────
+# ── Overrides resolve BEFORE admission (04-01), as util × MemTotal (05-01) ───
 
-def _generated_profile(tmp_path, pid="start_hf_over", vram_gb=8):
-    """A profile whose script carries the generator's launch-dir header, so the
-    override footprint can actually be re-derived from config.json."""
-    import json
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    model_dir.joinpath("config.json").write_text(json.dumps({
-        "model_type": "qwen3", "torch_dtype": "bfloat16",
-        "max_position_embeddings": 131072, "num_hidden_layers": 64,
-        "num_attention_heads": 64, "num_key_value_heads": 8, "hidden_size": 8192,
-    }))
-    model_dir.joinpath("model.safetensors").write_bytes(b"weights")
+def _parameterized_profile(tmp_path, pid="start_hf_over", vram_gb=8, util="0.75"):
+    """A generated-style script whose util is a `${VLLM_GPU_MEMORY_UTILIZATION:-N}`
+    placeholder, with a stale `# VRAM: 8` header like the real generated scripts."""
     script = tmp_path / f"{pid}.sh"
     script.write_text("#!/bin/bash\n"
                       "# VRAM: 8\n"
-                      "# Auto-generated by DGX Model Manager from:\n"
-                      f"# {model_dir}\n"
-                      "exit 0\n")
+                      "docker run -d --name vllm_node img \\\n"
+                      f"  --gpu-memory-utilization ${{VLLM_GPU_MEMORY_UTILIZATION:-{util}}} \\\n"
+                      "  --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}\n")
     return {"id": pid, "name": "Over", "script": str(script),
             "description": "", "vram_gb": vram_gb}
 
 
-def test_override_before_admission_raises_the_seen_footprint(tmp_path, monkeypatch):
-    """The header declares 8 GB. A 128K-context override is not an 8 GB launch, and
-    admitting it as one is how the pool gets overcommitted."""
-    import asyncio
-    profile = _generated_profile(tmp_path)
+def _capture_admission(monkeypatch):
     seen = {}
 
     async def _admit(engine_key, prof, force, scan_fn=None):
-        seen["vram_gb"] = prof.get("vram_gb")
+        seen.update(vram_gb=prof.get("vram_gb"), source=prof.get("footprint_source"))
 
     monkeypatch.setattr(appmod, "_vram_admission_check", _admit)
     monkeypatch.setattr(appmod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(appmod.subprocess, "Popen", lambda *a, **kw: None)
+    monkeypatch.setattr(appmod, "_mem_total_gib", lambda: 121.6)
+    return seen
 
+
+def test_admission_sees_script_util_not_the_stale_header(tmp_path, monkeypatch):
+    """The header says 8; the script launches at 0.75 × 121.6 = 91.2 GiB. Admitting
+    on the header is exactly the overcommit Phase 5 exists to stop."""
+    import asyncio
+    profile = _parameterized_profile(tmp_path)
+    seen = _capture_admission(monkeypatch)
+    asyncio.run(appmod._engine_start(
+        "start_hf_over", lambda: [profile], "vLLM", engine_key="vllm"))
+    assert seen == {"vram_gb": 91.2, "source": "script-util"}
+
+
+def test_util_override_sets_the_admitted_footprint(tmp_path, monkeypatch):
+    import asyncio
+    profile = _parameterized_profile(tmp_path)
+    seen = _capture_admission(monkeypatch)
+    asyncio.run(appmod._engine_start(
+        "start_hf_over", lambda: [profile], "vLLM", engine_key="vllm",
+        overrides={"gpu_memory_utilization": 0.5}))
+    assert seen == {"vram_gb": 60.8, "source": "override-util"}
+
+
+def test_context_only_override_does_not_change_the_footprint(tmp_path, monkeypatch):
+    """vLLM reserves util × total whatever --max-model-len is."""
+    import asyncio
+    profile = _parameterized_profile(tmp_path)
+    seen = _capture_admission(monkeypatch)
     asyncio.run(appmod._engine_start(
         "start_hf_over", lambda: [profile], "vLLM", engine_key="vllm",
         overrides={"max_model_len": 131072}))
+    assert seen == {"vram_gb": 91.2, "source": "script-util"}
 
-    assert seen["vram_gb"] is not None
-    assert seen["vram_gb"] > 8, f"admission still saw the stale header: {seen}"
+
+def test_util_override_ignored_when_the_script_does_not_read_it(tmp_path, monkeypatch):
+    """A legacy script with a literal util launches at ITS util; the env var is inert,
+    so the footprint must not shrink to the override."""
+    import asyncio
+    script = tmp_path / "start_legacy.sh"
+    script.write_text("#!/bin/bash\n# VRAM: 8\nvllm serve m --gpu-memory-utilization 0.75\n")
+    profile = {"id": "start_legacy", "name": "L", "script": str(script), "vram_gb": 8}
+    seen = _capture_admission(monkeypatch)
+    asyncio.run(appmod._engine_start(
+        "start_legacy", lambda: [profile], "vLLM", engine_key="vllm",
+        overrides={"gpu_memory_utilization": 0.2}))
+    assert seen == {"vram_gb": 91.2, "source": "script-util"}
+
+
+def test_context_override_on_header_only_script_admits_on_header(tmp_path, monkeypatch):
+    """No util anywhere: the header is the honest fallback, and a context override no
+    longer needs force (it cannot change the reservation)."""
+    import asyncio
+    profile = _profile(tmp_path, "start_legacy", 8, "#!/bin/bash\nexit 0\n")
+    seen = _capture_admission(monkeypatch)
+    res = asyncio.run(appmod._engine_start(
+        "start_legacy", lambda: [profile], "vLLM", engine_key="vllm",
+        overrides={"max_model_len": 131072}))
+    assert res["ok"] is True
+    assert seen == {"vram_gb": 8.0, "source": "header"}
 
 
 def test_admission_runs_once_and_before_popen_for_an_overridden_launch(tmp_path, monkeypatch):
     import asyncio
-    profile = _generated_profile(tmp_path)
+    profile = _parameterized_profile(tmp_path)
     order = []
 
     async def _admit(*a, **kw):
@@ -261,38 +316,12 @@ def test_admission_runs_once_and_before_popen_for_an_overridden_launch(tmp_path,
     assert order == ["admit", "popen"]
 
 
-def test_underivable_override_requires_force_instead_of_stale_header(tmp_path, monkeypatch):
-    """A hand-written script has no launch-dir header; admitting its override on the
-    header comment would be a guess dressed as a check."""
-    import asyncio
-    profile = _profile(tmp_path, "start_legacy", 8, "#!/bin/bash\nexit 0\n")
-
-    async def _admit(*a, **kw):
-        return None
-
-    monkeypatch.setattr(appmod, "_vram_admission_check", _admit)
-    monkeypatch.setattr(appmod.shutil, "which", lambda name: None)
-
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(appmod._engine_start(
-            "start_legacy", lambda: [profile], "vLLM", engine_key="vllm",
-            overrides={"max_model_len": 131072}))
-    assert exc.value.status_code == 400
-    assert "force=true" in exc.value.detail
-
-    # ...and force=true lets it through, unchecked and logged
-    res = asyncio.run(appmod._engine_start(
-        "start_legacy", lambda: [profile], "vLLM", engine_key="vllm", force=True,
-        overrides={"max_model_len": 131072}))
-    assert res["ok"] is True
-
-
-def test_override_resolution_precedes_admission_in_source():
+def test_footprint_resolution_precedes_admission_in_source():
     """Source-level guard: the ordering is a comment away from silently regressing."""
     import inspect
     src = inspect.getsource(appmod._engine_start)
     assert src.index("_resolve_overrides(") < src.index("await _vram_admission_check")
-    assert src.index("_overridden_vram_gb(") < src.index("await _vram_admission_check")
+    assert src.index("_profile_footprint_gib(") < src.index("await _vram_admission_check")
 
 
 # ── _identify_active_profile ────────────────────────────────────────────────

@@ -94,6 +94,23 @@ def test_vllm_serve_against_a_self_serving_image_is_a_failure():
     assert _levels(checks, "entrypoint") == ["fail"]
 
 
+WRAPPER_SCRIPT = """#!/bin/bash
+set -euo pipefail
+FLASH_REPO="$HOME/qwen3.8-Flash-DGX"
+cd "$FLASH_REPO"
+NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid ./scripts/serve.sh
+"""
+
+
+def test_wrapper_script_with_no_image_is_a_skip_not_a_failure():
+    # Regression: the flash-next profile delegates to serve.sh and names no image. The
+    # entrypoint check used to report `fail` ("Image '(unparsed)' ..."), which the
+    # launch gate turned into a 409 for an unforced start and for pinned autostart.
+    checks = appmod._preflight_static(WRAPPER_SCRIPT, {})
+    assert _levels(checks, "entrypoint") == ["skip"]
+    assert not [c for c in checks if c["level"] == "fail"]
+
+
 def test_recipe_backed_script_skips_the_entrypoint_check():
     checks = appmod._preflight_static(RECIPE_SCRIPT, {})
     assert _levels(checks, "entrypoint") == []

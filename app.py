@@ -239,6 +239,19 @@ for _ek, _ev in _ENGINES.items():
 _LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
+_TRUTHY_ENV = ("1", "true", "yes", "on")
+
+
+def _allow_unauth() -> bool:
+    """True only when MODEL_MANAGER_ALLOW_UNAUTH is an explicit truthy value.
+
+    A bare presence test treated `=0`, `=false` and `=` as "accept the risk" — the
+    opposite of what anyone writing those means. Anything outside the allow-list is
+    "not acknowledged", so a typo fails closed.
+    """
+    return os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH", "").strip().lower() in _TRUTHY_ENV
+
+
 def _auth_open_unauthenticated() -> bool:
     """True when no key is set AND we are bound somewhere other than loopback.
 
@@ -265,7 +278,7 @@ async def verify_auth(request: Request):
     if not _API_KEY_HASH:
         if not _auth_open_unauthenticated():
             return  # loopback-only deployment
-        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+        if not _allow_unauth():
             raise HTTPException(
                 503,
                 f"Refusing to serve a mutating request: bound to {APP_HOST} with no API "
@@ -309,8 +322,36 @@ def _get_total_memory_gb() -> int:
     return 0
 
 
-def _get_available_memory_gb() -> float:
-    """Currently-available system memory in GB, from /proc/meminfo MemAvailable.
+# Admission works in ONE unit: binary GiB (2**30 bytes). /proc/meminfo reports KiB, so
+# `kB / 1024 / 1024` is already GiB; vLLM's own logs ("Available KV cache memory: N GiB")
+# use the same unit. Decimal-GB sizes (file sizes / 1e9) must never meet these numbers.
+_GIB = 1024 ** 3
+
+# GB10 MemTotal (127535252 kB, measured on gb10 2026-10-18). Used only when
+# /proc/meminfo cannot be read, so a footprint is never computed against zero.
+_POOL_GIB_FALLBACK = 121.6
+
+
+def _meminfo_gib(key: str) -> Optional[float]:
+    """One /proc/meminfo field in GiB, or None if unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(key + ":"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return None
+
+
+def _mem_total_gib() -> float:
+    """MemTotal in GiB — the pool vLLM's --gpu-memory-utilization is a fraction of."""
+    total = _meminfo_gib("MemTotal")
+    return total if total else _POOL_GIB_FALLBACK
+
+
+def _get_available_memory_gib() -> float:
+    """Currently-available system memory in GiB, from /proc/meminfo MemAvailable.
 
     On the GB10 (DGX Spark) the GPU and system RAM are ONE ~121 GB unified pool,
     and nvidia-smi reports memory as N/A on this hardware — so MemAvailable is
@@ -320,14 +361,7 @@ def _get_available_memory_gb() -> float:
     a running engine's real footprint is unmeasurable and must be estimated from
     profile metadata (see _vram_admission_check).
     """
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / 1024 / 1024
-    except Exception:
-        pass
-    return 0.0
+    return _meminfo_gib("MemAvailable") or 0.0
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 
@@ -495,10 +529,13 @@ def _parse_script_meta(script_path: Path) -> dict:
             elif line.startswith("# Description:"):
                 description = line[14:].strip()
             elif line.startswith("# VRAM:"):
-                try:
-                    vram_gb = int(line[7:].strip().upper().rstrip("GB").strip())
-                except Exception:
-                    pass
+                # GiB by convention (05-01). Decimals are accepted: an int()-only
+                # parse silently dropped a `# VRAM: 91.2` header to "unmetered".
+                raw = line[7:].strip().upper().removesuffix("GIB").rstrip("GB").strip()
+                if _re.fullmatch(r"[0-9]+", raw):
+                    vram_gb = int(raw)
+                elif _re.fullmatch(r"[0-9]+\.[0-9]+", raw):
+                    vram_gb = float(raw)
             elif line.startswith("# Derived:"):
                 parsed = _json_header("# Derived:", line[10:].strip())
                 derived = parsed if isinstance(parsed, dict) else derived
@@ -1443,8 +1480,8 @@ _http: httpx.AsyncClient = None  # type: ignore[assignment]
 async def _lifespan(app):
     global _http
     _http = httpx.AsyncClient(timeout=10.0)
-    if APP_HOST not in ("127.0.0.1", "::1", "localhost") and not _API_KEY_HASH:
-        if not os.environ.get("MODEL_MANAGER_ALLOW_UNAUTH"):
+    if APP_HOST not in _LOOPBACK_HOSTS and not _API_KEY_HASH:
+        if not _allow_unauth():
             msg = (f"SECURITY WARNING: binding to {APP_HOST} with no API key set — "
                    "the management UI is open to anyone on this network. "
                    "Set an API key in Settings, or set MODEL_MANAGER_ALLOW_UNAUTH=1 to suppress this warning. "
@@ -3156,18 +3193,95 @@ async def _engine_stop(base_url: str, engine_name: str, docker_filter: str | Non
     return {"ok": ok, "output": output}
 
 
+# ── Executor-budget footprint (Phase 05-01) ──────────────────────────────────
+# vLLM reserves `--gpu-memory-utilization × MemTotal` up front, whatever the weights
+# or the context. So a vLLM profile's footprint is THAT number, read from the script
+# it will actually run — never a weights estimate. Measured 2026-10-18: generated
+# headers declared 20 GiB for scripts that launch at util 0.75 (≈91 GiB), and admission
+# admitted them on the header.
+
+_HEADER_DRIFT_WARN_GIB = 5.0
+
+
+def _script_util(text: str) -> Optional[float]:
+    """The `--gpu-memory-utilization` a script launches with by default, or None.
+
+    A literal flag wins; otherwise the default baked into a
+    `${VLLM_GPU_MEMORY_UTILIZATION:-N}` placeholder (generated scripts, and hand
+    scripts like flash-next's `GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}"`).
+    Anything outside (0, 1] is treated as unparseable rather than trusted.
+    """
+    util = _parse_script_flags(text).get("util")
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        util = _parse_templated_defaults(text).get("gpu_memory_utilization")
+    if isinstance(util, bool) or not isinstance(util, (int, float)):
+        return None
+    return float(util) if 0 < util <= 1 else None
+
+
+def _profile_footprint_gib(profile: dict, override_env: Optional[dict] = None,
+                           mem_total_gib: Optional[float] = None
+                           ) -> tuple[Optional[float], str]:
+    """(GiB this launch will reserve, source) — or (None, "unknown").
+
+    Precedence, most authoritative first:
+      override-util  a VLLM_GPU_MEMORY_UTILIZATION override the script actually reads
+      script-util    the script's own default util (literal flag or placeholder)
+      recipe-util    a recipe-backed script's run-recipe YAML util
+      header         the `# VRAM:` comment (GiB) — llama.cpp, or no util anywhere
+    A context-only override never changes the footprint: vLLM reserves util × total
+    regardless of --max-model-len (a context that does not fit fails engine init; it
+    does not overcommit the pool).
+    """
+    total = mem_total_gib if mem_total_gib is not None else _mem_total_gib()
+    try:
+        text = Path(os.path.expanduser(profile.get("script", ""))).read_text(errors="ignore")
+    except Exception:
+        text = ""
+    code = _script_code(text)
+    override = (override_env or {}).get("VLLM_GPU_MEMORY_UTILIZATION")
+    # Only an override the script actually reads moves the reservation; a legacy
+    # script that ignores the env var still launches at its own util.
+    if override is not None and "VLLM_GPU_MEMORY_UTILIZATION" in code:
+        try:
+            util = float(override)
+        except (TypeError, ValueError):
+            util = None
+        if util and 0 < util <= 1:
+            return round(util * total, 1), "override-util"
+    util = _script_util(text)
+    if util:
+        return round(util * total, 1), "script-util"
+    recipe = _parse_launch_script(text).get("recipe") if code.strip() else ""
+    if recipe:
+        try:
+            r_util = _recipe_util(recipe)
+        except Exception:
+            r_util = None
+        if isinstance(r_util, (int, float)) and not isinstance(r_util, bool) \
+                and 0 < r_util <= 1:
+            return round(float(r_util) * total, 1), "recipe-util"
+    header = profile.get("vram_gb")
+    if isinstance(header, (int, float)) and not isinstance(header, bool):
+        return float(header), "header"
+    return None, "unknown"
+
+
 async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple[float, str]:
-    """VRAM (GB) to credit back for the profile currently running on an engine.
+    """VRAM (GiB) to credit back for the profile currently running on an engine.
 
     A new profile's start script does `docker rm -f <container>`, so whatever is
     running now will be torn down and its unified memory freed before the new one
-    loads. Because a running engine's real footprint is unmeasurable on the GB10
-    (see _get_available_memory_gb), we identify WHICH profile is live primarily
-    via the running container's own `dgx.profile` label (set at launch), falling
-    back to matching the engine's reported served-model-name against each
-    profile's start script for profiles that don't set the label yet. Returns
-    (0.0, "") if nothing is running or the running profile cannot be identified
-    — a deliberately conservative credit.
+    loads. A running engine's real footprint is unmeasurable on the GB10 (see
+    _get_available_memory_gib), so the credit is the footprint of the profile the
+    running container NAMES in its own `dgx.profile` label (set at launch).
+
+    Fail closed (05-02): an unlabeled container, or a label naming no known profile,
+    earns NO credit. Matching the served model name was a guess — every profile
+    aliases `vllm-active`, so the "match" was whichever profile came first — and a
+    guessed credit can admit a launch the pool cannot hold. A label hit is final: if
+    that profile's footprint is unknown the credit is 0, never another profile's.
+    Returns (credit, profile_id) — profile_id is "" when nothing was identified.
     """
     eng = _ENGINES.get(engine_key)
     if not eng:
@@ -3180,50 +3294,32 @@ async def _running_profile_vram_credit(engine_key: str, profiles: list) -> tuple
         return 0.0, ""
     if not status.get("running"):
         return 0.0, ""
-    served = status.get("model")
-    if not served:
-        return 0.0, ""
     container_name = next(
         (i.get("name") for i in status.get("instances", []) if i.get("running")), None)
-    if container_name:
-        label = await _docker_label(container_name, "dgx.profile")
-        if label:
-            for p in profiles:
-                if p.get("vram_gb") is None:
-                    continue
-                if p["id"].removeprefix("start_") == label:
-                    return float(p["vram_gb"]), p["id"]
-    # Primary match: served name appears verbatim in a profile's start script.
-    for p in profiles:
-        if p.get("vram_gb") is None:
-            continue
-        try:
-            content = Path(os.path.expanduser(p.get("script", ""))).read_text()
-        except Exception:
-            content = ""
-        if served in content:
-            return float(p["vram_gb"]), p["id"]
-    # Fallback heuristic: fuzzy token match on served name vs profile id/name.
-    sv = served.lower()
-    for p in profiles:
-        if p.get("vram_gb") is None:
-            continue
-        pid = p["id"].lower()
-        if pid.startswith("start_"):
-            pid = pid[6:]
-        if sv in pid or pid in sv or sv in p.get("name", "").lower():
-            return float(p["vram_gb"]), p["id"]
-    return 0.0, ""
+    if not container_name:
+        return 0.0, ""
+    label = await _docker_label(container_name, "dgx.profile")
+    if not label:
+        _logger.warning("Reclaim credit: %s is running WITHOUT a dgx.profile label — "
+                        "no credit (fail closed)", container_name)
+        return 0.0, ""
+    match = next((p for p in profiles if p["id"].removeprefix("start_") == label), None)
+    if match is None:
+        _logger.warning("Reclaim credit: %s carries dgx.profile=%s, which names no "
+                        "known profile — no credit", container_name, label)
+        return 0.0, ""
+    gib = _profile_footprint_gib(match)[0]
+    return (gib or 0.0), match["id"]
 
 
-# Safety margin (GB) reserved for the OS and other services on the unified pool.
-_VRAM_SAFETY_MARGIN_GB = 8
+# Safety margin (GiB) reserved for the OS and other services on the unified pool.
+_VRAM_SAFETY_MARGIN_GIB = 8
 
-# Minimum projected headroom (GB, on top of the safety margin) required to admit a
+# Minimum projected headroom (GiB, on top of the safety margin) required to admit a
 # profile whose VRAM need is unknown (no `# VRAM:` header). We cannot math an
 # unmetered launch, so instead of skipping the check we refuse to launch onto a
 # nearly-full pool — the case that actually hangs the box.
-_VRAM_UNKNOWN_MIN_HEADROOM_GB = 24
+_VRAM_UNKNOWN_MIN_HEADROOM_GIB = 24
 
 
 async def _other_running_engines(exclude_key: str) -> list[str]:
@@ -3262,59 +3358,179 @@ async def _other_engines_note(engine_key: str) -> str:
             f"also running and holding the shared pool — stopping it frees memory.")
 
 
+# ── Launch lock + in-flight reservations (05-02) ─────────────────────────────
+# `_engine_start` returns as soon as the launch script is spawned, but the engine's
+# memory appears over the next 1–5 minutes. A mutex around admission → Popen alone
+# would let a second start, a second later, pass admission against a MemAvailable the
+# first launch has not consumed yet. So each launch also leaves a RESERVATION that
+# other engines' admissions subtract until the launch settles (healthy, dead, or TTL).
+# DMM runs one uvicorn worker (`uvicorn.run(app, ...)`, no `workers=`), so an
+# in-process asyncio lock is the whole story; more workers would need a file lock.
+
+_LAUNCH_LOCK = asyncio.Lock()
+_INFLIGHT_TTL_S = 15 * 60
+_INFLIGHT: dict[str, dict] = {}       # engine_key -> pending launch
+_LAST_LAUNCH: dict[str, dict] = {}    # engine_key -> last settled verdict
+
+
+def _launch_container(engine_key: str) -> str:
+    """The container every profile of this engine runs as (`docker rm -f` target)."""
+    return f"{engine_key}_node"
+
+
+def _reserved_gib(exclude_key: str) -> float:
+    """GiB promised to OTHER engines' launches that have not settled yet.
+
+    Deliberately conservative: a half-loaded launch has already taken some of its
+    memory out of MemAvailable, so subtracting the full reservation double-counts
+    that part. Over-refusing for a few minutes is the safe direction.
+    """
+    return sum(float(e.get("gib") or 0.0) for k, e in _INFLIGHT.items() if k != exclude_key)
+
+
+def _exit_cause(exit_code: Optional[int], oom_killed: Optional[bool]) -> str:
+    """Plain-language reading of a dead container's State."""
+    if oom_killed:
+        return "killed by the kernel OOM killer (State.OOMKilled=true)"
+    if exit_code == 137:
+        return ("SIGKILL (exit 137) without OOMKilled: `docker kill`/`rm -f`, or a "
+                "host-level kill — check `journalctl -k` for oom-kill lines")
+    if exit_code == 139:
+        return "segmentation fault (exit 139)"
+    if exit_code == 143:
+        return "SIGTERM (exit 143): stopped by docker stop or a replacement launch"
+    if exit_code not in (None, 0):
+        return f"engine exited with code {exit_code} — see the load log for the error"
+    if exit_code == 0:
+        return "engine exited cleanly (code 0) before becoming healthy"
+    return "engine stopped before becoming healthy"
+
+
+def _finish_launch(engine_key: str, verdict: dict) -> None:
+    """Release a reservation and record why. Idempotent."""
+    entry = _INFLIGHT.pop(engine_key, None)
+    record = {**verdict,
+              "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if entry:
+        record.setdefault("profile", entry.get("profile"))
+        record.setdefault("gib", entry.get("gib"))
+    _LAST_LAUNCH[engine_key] = record
+    _logger.info("Launch on %s settled: %s", engine_key, record)
+
+
+async def _settle_launch(engine_key: str, entry: dict) -> Optional[dict]:
+    """A verdict for a pending launch, or None while it is still loading."""
+    if _time.monotonic() - entry["started"] > _INFLIGHT_TTL_S:
+        return {"result": "timeout",
+                "detail": f"not healthy after {_INFLIGHT_TTL_S // 60} min — reservation "
+                          f"released; check the load log"}
+    proc = entry.get("proc")
+    try:
+        state = await _container_state(entry["container"])
+    except Exception:
+        state = {"exists": False}
+    fresh = state.get("exists") and state.get("id") != entry.get("prior_id")
+    if fresh and state.get("status") in ("exited", "dead"):
+        code, oom = state.get("exit_code"), state.get("oom_killed")
+        return {"result": "failed", "exit_code": code, "oom_killed": oom,
+                "cause": _exit_cause(code, oom)}
+    if fresh and state.get("status") == "running":
+        eng = _ENGINES.get(engine_key, {})
+        if await service_ok(_engine_bases.get(engine_key, ""),
+                            eng.get("health_path", "/health")):
+            return {"result": "ready"}
+    rc = proc.poll() if proc is not None and hasattr(proc, "poll") else None
+    if rc not in (None, 0) and not fresh:
+        return {"result": "failed", "exit_code": None, "oom_killed": None,
+                "cause": f"launch script exited {rc} before starting a container — "
+                         f"see {entry.get('log_path')}"}
+    return None
+
+
+async def _prune_inflight() -> None:
+    """Settle every pending launch that has finished one way or the other."""
+    for key, entry in list(_INFLIGHT.items()):
+        verdict = await _settle_launch(key, entry)
+        if verdict is not None and _INFLIGHT.get(key) is entry:
+            _finish_launch(key, verdict)
+
+
+def _launch_status(engine_key: str) -> dict:
+    """The JSON-safe launch state /status exposes."""
+    entry = _INFLIGHT.get(engine_key)
+    pending = None
+    if entry:
+        pending = {"profile": entry["profile"], "gib": entry["gib"],
+                   "since": entry["since"],
+                   "elapsed_s": round(_time.monotonic() - entry["started"], 1)}
+    return {"in_flight": pending, "last": _LAST_LAUNCH.get(engine_key)}
+
+
 async def _vram_admission_check(engine_key: str, profile: dict, force: bool,
                                 scan_fn=None) -> None:
     """Reject a profile launch that would overcommit the GB10 unified-memory pool.
 
-    GB10 reasoning: GPU and system RAM share one ~121 GB pool and nvidia-smi
+    GB10 reasoning: GPU and system RAM share one ~121.6 GiB pool and nvidia-smi
     can't report memory here, so we admit based on /proc/meminfo MemAvailable
     plus a "reclaim credit" for the profile about to be torn down and replaced
     by this one (its start script runs `docker rm -f` first). Engine-generic:
-    works for any engine in _ENGINES. Profiles without a declared vram_gb, and
-    force=true launches, skip the check.
+    works for any engine in _ENGINES.
+
+    `profile["vram_gb"]` is the launch's footprint in GiB, already resolved by
+    `_profile_footprint_gib` (`_engine_start` does that); every quantity compared
+    here — MemAvailable, the reclaim credit, the margin — is GiB too.
+    `profile["footprint_source"]`, when present, says where the number came from.
     """
     if force:
         _logger.warning("VRAM admission check SKIPPED (force=true) for profile '%s'",
                         profile.get("id"))
         return
     vram = profile.get("vram_gb")
+    source = profile.get("footprint_source")
     profiles = scan_fn() if scan_fn else _scan_profiles(engine_key)
-    available = _get_available_memory_gb()
+    available = _get_available_memory_gib()
     credit, credit_id = await _running_profile_vram_credit(engine_key, profiles)
-    projected = available + credit
-    margin = _VRAM_SAFETY_MARGIN_GB
+    reserved = _reserved_gib(engine_key)
+    projected = available + credit - reserved
+    margin = _VRAM_SAFETY_MARGIN_GIB
+    reserved_note = (f", minus {reserved:.0f} GiB reserved for launches still loading on "
+                     f"{', '.join(k for k in _INFLIGHT if k != engine_key)}"
+                     if reserved else "")
     if vram is None:
         # Unknown need: can't math it, but still refuse to launch onto a
         # nearly-full pool. Require a healthy headroom floor above the margin.
         headroom = projected - margin
-        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GB:
-            credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+        if headroom < _VRAM_UNKNOWN_MIN_HEADROOM_GIB:
+            credit_note = (f"{credit:.0f} GiB reclaimed from running profile '{credit_id}'"
                            if credit else "no reclaimable running profile identified")
             raise HTTPException(
                 409,
                 f"Refusing to start '{profile.get('id')}': it declares no VRAM "
-                f"footprint (add a '# VRAM: NN' header to its start script), and only "
-                f"{headroom:.0f} GB of unified memory headroom is projected available "
-                f"({available:.0f} GB free + {credit_note}, minus a {margin} GB "
-                f"safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GB} GB floor "
+                f"footprint (no parseable --gpu-memory-utilization and no '# VRAM: NN' "
+                f"header), and only "
+                f"{headroom:.0f} GiB of unified memory headroom is projected available "
+                f"({available:.0f} GiB free + {credit_note}{reserved_note}, minus a "
+                f"{margin} GiB safety margin) — below the {_VRAM_UNKNOWN_MIN_HEADROOM_GIB} GiB floor "
                 f"required for an unmetered launch."
                 f"{await _other_engines_note(engine_key)} Pass force=true to override.")
         _logger.warning(
-            "Profile '%s' has no VRAM metadata — admitted on %.0f GB headroom floor; "
+            "Profile '%s' has no VRAM metadata — admitted on %.0f GiB headroom floor; "
             "add a '# VRAM: NN' header for a precise check",
             profile.get("id"), headroom)
         return
     if vram > projected - margin:
-        credit_note = (f"{credit:.0f} GB reclaimed from running profile '{credit_id}'"
+        credit_note = (f"{credit:.0f} GiB reclaimed from running profile '{credit_id}'"
                        if credit else
                        "no running profile could be identified, so a conservative "
-                       "0 GB reclaim credit was used")
+                       "0 GiB reclaim credit was used")
+        source_note = f" [{source}]" if source else ""
         raise HTTPException(
             409,
             f"Insufficient unified memory to start '{profile.get('id')}': needs "
-            f"{vram} GB but only {projected:.0f} GB is projected available "
-            f"({available:.0f} GB free + {credit_note}), and {margin} GB is held "
-            f"back as an OS/services safety margin."
+            f"{vram:g} GiB{source_note} but only {projected:.0f} GiB is projected "
+            f"available ({available:.0f} GiB free + {credit_note}{reserved_note}), "
+            f"and {margin} GiB "
+            f"is held back as an OS/services safety margin."
             f"{await _other_engines_note(engine_key)} Pass force=true to override.")
 
 
@@ -3572,78 +3788,6 @@ def _classify_script(text: str) -> str:
     return "legacy"
 
 
-def _profile_source_dir(script: str) -> Path | None:
-    """The launch dir a generated profile was built from, per its own header.
-
-    The header is the only link back to config.json: profiles are scanned as scripts,
-    not as models. Hand-written scripts carry no marker and return None.
-    """
-    try:
-        lines = Path(script).read_text().splitlines()[:20]
-    except Exception:
-        return None
-    for idx, line in enumerate(lines):
-        if line.strip().startswith(_GENERATED_FROM_MARKER):
-            if idx + 1 < len(lines) and lines[idx + 1].startswith("# "):
-                candidate = Path(os.path.expanduser(lines[idx + 1][2:].strip()))
-                return candidate if candidate.is_dir() else None
-    return None
-
-
-def _overridden_vram_gb(profile: dict, override_env: dict[str, str],
-                        force: bool) -> float | None:
-    """Footprint of an OVERRIDDEN launch, or None when nothing footprint-affecting changed.
-
-    Admitting an overridden launch against the script header's static `# VRAM:` comment
-    is the same trap the llama.cpp recipe ladder already sprang: the header describes the
-    launch the generator intended, not the one being asked for.
-    """
-    ctx = override_env.get("VLLM_MAX_MODEL_LEN")
-    util = override_env.get("VLLM_GPU_MEMORY_UTILIZATION")
-    if ctx is None and util is None:
-        return None
-
-    launch_dir = _profile_source_dir(profile.get("script", ""))
-    config = None
-    if launch_dir is not None:
-        try:
-            parsed = json.loads((launch_dir / "config.json").read_text())
-            config = parsed if isinstance(parsed, dict) else None
-        except Exception:
-            config = None
-    if config is None:
-        # Never silently fall back to the stale header: an unverifiable override is
-        # exactly the case where admission matters most.
-        if not force:
-            raise HTTPException(
-                400, "Cannot verify this override against the model config "
-                     f"({profile.get('id')}): no readable config.json for the profile. "
-                     "Re-send with force=true to launch unchecked.")
-        _logger.warning("override footprint underived for '%s' — forced launch",
-                        profile.get("id"))
-        return None
-
-    pool_gb = 121.0
-    if util is not None:
-        # vLLM reserves this share of the pool up front, whatever the KV math says.
-        return round(pool_gb * float(util), 1)
-
-    info = None
-    try:
-        info = _profile_model_info(launch_dir, None)
-    except Exception:
-        info = None
-    weights_gb = float((info or {}).get("size_gb") or 0.0)
-    kv_dtype = _kv_dtype_from_config(config)
-    spec = _derive_launch_spec(
-        config, weights_gb=weights_gb, pool_gb=pool_gb,
-        kv_dtype_bytes=1 if kv_dtype == "fp8" else 2,
-        requested_context=int(ctx))
-    for warning in spec.get("warnings") or []:
-        _logger.info("override derive warning for '%s': %s", profile.get("id"), warning)
-    return round(spec["weights_gb"] + spec["kv_gb"] + spec["overhead_gb"], 1)
-
-
 async def _engine_start(req_profile: str, scan_fn, engine_name: str,
                         engine_key: str | None = None, force: bool = False,
                         recipe: str | None = None,
@@ -3665,20 +3809,64 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         if r_vram is not None:
             profile = {**profile, "vram_gb": r_vram}
 
-    # Same ordering rule as the recipe block: an override that raises the real footprint
-    # must be admitted against that footprint, not the script header's static comment.
+    # Same ordering rule as the recipe block: the footprint admitted is the one THIS
+    # launch reserves — util × MemTotal from the override or the script itself — not
+    # the header comment (05-01). A llama.cpp recipe already set an explicit need.
     override_env = _resolve_overrides(overrides)
-    if override_env:
-        _over_vram = _overridden_vram_gb(profile, override_env, force)
-        if _over_vram is not None:
-            profile = {**profile, "vram_gb": _over_vram}
+    if recipe and profile.get("vram_gb") is not None:
+        profile = {**profile, "footprint_source": "llamacpp-recipe"}
+    else:
+        _gib, _source = _profile_footprint_gib(profile, override_env)
+        profile = {**profile, "vram_gb": _gib, "footprint_source": _source}
 
-    await _vram_admission_check(engine_key or engine_name, profile, force, scan_fn)
+    key = engine_key or engine_name
     script = os.path.expanduser(profile.get("script", ""))
     if not Path(script).exists():
         raise HTTPException(400, f"Script not found: {script}")
     safe_id = _re.sub(r"[^a-zA-Z0-9._-]", "_", req_profile)
     log_path = f"/tmp/{engine_name.lower()}_{safe_id}.log"
+
+    # Everything from "is anything else launching?" to "the reservation is recorded"
+    # happens under one lock, so two starts (two tabs, UI + pinned autostart, vLLM +
+    # llama.cpp) are serialized and the second sees the first's reservation.
+    async with _LAUNCH_LOCK:
+        await _prune_inflight()
+        pending = _INFLIGHT.get(key)
+        if pending is not None:
+            if not force:
+                raise HTTPException(
+                    409,
+                    f"A launch is already in progress on {engine_name}: "
+                    f"'{pending['profile']}' started {pending['since']} and is not healthy "
+                    f"or dead yet. Two launch scripts racing on `docker rm -f "
+                    f"{pending['container']}` would kill each other's container. Wait for "
+                    f"it to settle, or pass force=true to launch anyway.")
+            _logger.warning("force=true: launching over in-flight '%s' on %s",
+                            pending["profile"], key)
+            _finish_launch(key, {"result": "superseded",
+                                 "detail": f"replaced by forced launch of '{req_profile}'"})
+        if key == "vllm" and not force:
+            await _require_launch_preflight(profile)
+        await _vram_admission_check(key, profile, force, scan_fn)
+        return await _spawn_launch(key, engine_name, req_profile, profile, script,
+                                   safe_id, log_path, recipe, known_recipes, override_env)
+
+
+async def _prior_container_id(container: str) -> str:
+    """Id of the container a launch is about to replace, so settling can tell the old
+    one (removed by the script's `docker rm -f`) from the new one. "" if none."""
+    try:
+        return (await _container_state(container)).get("id", "") or ""
+    except Exception:
+        return ""
+
+
+async def _spawn_launch(key: str, engine_name: str, req_profile: str, profile: dict,
+                        script: str, safe_id: str, log_path: str, recipe: str | None,
+                        known_recipes: dict, override_env: dict) -> dict:
+    """Popen the launch and record its reservation. Caller holds _LAUNCH_LOCK."""
+    container = _launch_container(key)
+    prior_id = await _prior_container_id(container)
 
     # Recipe reaches the script as an env var. Already allow-listed against the configured
     # map above — it arrives in an HTTP body and lands in a bash script's environment, so
@@ -3700,12 +3888,21 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
         os.unlink(log_path)
         _fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(_fd, "w") as logf:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             _launch_argv(script, safe_id),
             stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True,
             env=env,
         )
+    gib = profile.get("vram_gb")
+    _INFLIGHT[key] = {
+        "profile": req_profile, "container": container, "prior_id": prior_id,
+        # An unmetered launch still holds memory: reserve the floor it was admitted on.
+        "gib": float(gib) if gib is not None else float(_VRAM_UNKNOWN_MIN_HEADROOM_GIB),
+        "started": _time.monotonic(),
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "proc": proc, "log_path": log_path,
+    }
     _logger.info("%s launched — logs at %s", engine_name, log_path)
     label = f"{profile['name']} [{recipe}]" if recipe else profile["name"]
     return {"ok": True, "message": f"Launched {label} — logs at {log_path}"}
@@ -3725,7 +3922,7 @@ async def _engine_start(req_profile: str, scan_fn, engine_name: str,
 #     buff/cache ~25 GB  ->  Available KV cache memory  0.19 GiB  (refused to start)
 #     buff/cache  ~2 GB  ->  Available KV cache memory 25.97 GiB  (ready in 165s)
 #
-# This is why admission based on MemAvailable (see _get_available_memory_gb) can
+# This is why admission based on MemAvailable (see _get_available_memory_gib) can
 # pass while the launch still dies in engine init: MemAvailable counts the page
 # cache as free, and CUDA does not.
 
@@ -3981,6 +4178,13 @@ def _preflight_static(text: str, cfg: dict) -> list:
         out.append(_pf("ok", "shape", "Recipe-backed profile",
                        f"Delegates to run-recipe.sh recipe '{facts['recipe']}'. "
                        "Launch flags are owned by the recipe YAML, not by this script."))
+    elif not facts["image"]:
+        # A wrapper script (e.g. one that delegates to another repo's serve.sh) names no
+        # image of its own, so the entrypoint contract can't be judged. Reporting `fail`
+        # here would block the launch gate on a profile that works — degrade to skip.
+        out.append(_pf("skip", "entrypoint", "No image parsed from the script",
+                       "The script does not run `docker run <image>` itself, so the "
+                       "`vllm serve` entrypoint contract cannot be checked."))
     else:
         expected = _vllm_serve_command(facts["image"], cfg)
         if expected and not facts["has_serve"]:
@@ -4029,6 +4233,67 @@ def _preflight_static(text: str, cfg: dict) -> list:
                 f"mount scoped to snapshots/<sha> leaves every weight file dangling.",
                 "Mount the models--*/ root, not the snapshot subdirectory."))
     return out
+
+
+def _preflight_footprint(profile: dict, mem_total_gib: Optional[float] = None) -> list:
+    """Does the `# VRAM:` header tell the truth about what this launch reserves?
+
+    Admission no longer trusts the header when a util is parseable (05-01), but the
+    header is still what the profile card shows and what a recipe/llama.cpp launch
+    falls back to — a stale one misleads the operator even when admission is right.
+    """
+    gib, source = _profile_footprint_gib(profile, mem_total_gib=mem_total_gib)
+    header = profile.get("vram_gb")
+    if gib is None:
+        return [_pf("warn", "footprint", "No VRAM footprint known",
+                    "No parseable --gpu-memory-utilization and no '# VRAM:' header, so "
+                    "admission can only apply its unmetered headroom floor.",
+                    "Add a '# VRAM: NN' header (GiB) to the start script.")]
+    if source == "header":
+        return [_pf("ok", "footprint", f"Footprint {gib:g} GiB from the '# VRAM:' header",
+                    "No util is parseable from the script, so the header is the "
+                    "declared need. Keep it in GiB and in step with the real launch.")]
+    expected = round(gib)
+    if header is None:
+        return [_pf("warn", "footprint", "Start script has no '# VRAM:' header",
+                    f"It reserves {gib:g} GiB ({source}); admission uses that, but the "
+                    f"profile card shows no footprint.",
+                    f"Add '# VRAM: {expected}' to the script header.")]
+    if abs(float(header) - gib) > _HEADER_DRIFT_WARN_GIB:
+        return [_pf("warn", "footprint",
+                    f"'# VRAM: {header:g}' disagrees with the real reservation",
+                    f"The launch reserves {gib:g} GiB ({source}: util × MemTotal). "
+                    f"Admission uses {gib:g}; the header only misleads the card.",
+                    f"Set the header to '# VRAM: {expected}'.")]
+    return [_pf("ok", "footprint", f"Footprint {gib:g} GiB ({source})",
+                f"'# VRAM: {header:g}' matches util × MemTotal within "
+                f"{_HEADER_DRIFT_WARN_GIB:g} GiB.")]
+
+
+async def _preflight_reclaim_label() -> list:
+    """Will the container this launch replaces earn a reclaim credit?
+
+    Admission credits ONLY a `dgx.profile`-labelled container (05-02, fail closed). An
+    unlabeled vllm_node — a launch from outside DMM, or a script that predates the
+    label — is treated as unknown, so the swap is admitted with no credit and may be
+    refused for want of memory that the swap itself would free.
+    """
+    container = _launch_container("vllm")
+    try:
+        state = await _container_state(container)
+    except Exception:
+        return []
+    if not state.get("exists") or state.get("status") != "running":
+        return []
+    label = await _docker_label(container, "dgx.profile")
+    if label:
+        return [_pf("ok", "reclaim_label", f"{container} is labelled dgx.profile={label}",
+                    "Its footprint is credited back when this launch replaces it.")]
+    return [_pf("warn", "reclaim_label", f"Running {container} has no dgx.profile label",
+                "Admission cannot tell which profile it is, so it credits NOTHING for "
+                "the memory the swap frees (fail closed). The launch may be refused even "
+                "though it would fit once the old container is gone.",
+                f"Stop {container} first, or relaunch it from a labelled profile.")]
 
 
 def _preflight_memory(util: Optional[float]) -> list:
@@ -4104,6 +4369,20 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
         else:
             out.append(_pf("ok", "image", f"Image '{image}' present", insp.stdout.strip()[:19]))
 
+    # Docker's short `-v host:container` syntax CREATES a missing host directory.
+    # Check first, so a read-only validation never mutates the host and then reports the
+    # resulting empty directory as if it were a corrupt model download (b6d1f00).
+    missing_mounts = []
+    for mount in facts.get("mounts", []):
+        source = mount.split(":", 1)[0]
+        if source and "$" not in source and not Path(source).exists():
+            missing_mounts.append(source)
+            out.append(_pf(
+                "fail", "mount_source", "Model mount source does not exist",
+                f"{source} is absent on this host. Docker would create an empty "
+                "directory there, hiding the stale profile path until vLLM starts.",
+                "Regenerate the profile from the model's current Inventory path."))
+
     # The mount-scope test from 2026-07-30, run for real: read the model's own
     # config.json through the exact bind mounts the launch will use. A dangling
     # symlink fails here in about a second instead of after a 3-minute load.
@@ -4116,7 +4395,8 @@ async def _preflight_runtime(facts: dict, script: str) -> list:
             "skip", "mount_readable", "Model path is computed at runtime",
             f"{facts.get('model')} contains a shell substitution, so the files could "
             f"not be read ahead of the launch. Static checks still apply."))
-    elif facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]:
+    elif (facts.get("model") and facts.get("mounts") and not facts["recipe_backed"]
+          and not missing_mounts):
         args = ["docker", "run", "--rm", "--entrypoint", "/bin/sh"]
         for m in facts["mounts"]:
             args += ["-v", m]
@@ -4203,6 +4483,33 @@ async def vllm_preflight(req: EngineStartRequest):
     profile = next((p for p in profiles if p["id"] == req.profile), None)
     if not profile:
         raise HTTPException(404, f"Profile '{req.profile}' not found")
+    return await _preflight_profile(profile)
+
+
+async def _require_launch_preflight(profile: dict) -> None:
+    """The authoritative preflight before every unforced vLLM launch (absorbs b6d1f00).
+
+    Dry Run in the UI is advisory — a refresh forgets its verdict and an API client
+    never runs it — so the server checks the exact profile it is about to launch.
+    Any `fail` check blocks with 409; `force=true` is the operator's explicit bypass,
+    shared with admission. Runs under _LAUNCH_LOCK, so what it checked is still true
+    when the launch is spawned.
+    """
+    result = await _preflight_profile(profile)
+    if result.get("verdict") != "fail":
+        return
+    failures = [c for c in result.get("checks", []) if c.get("level") == "fail"]
+    detail = "; ".join(
+        f"{c.get('title', 'Preflight failure')}: {c.get('detail', '')}".rstrip(": ")
+        + (f" (fix: {c['fix']})" if c.get("fix") else "")
+        for c in failures) or "profile validation failed"
+    raise HTTPException(
+        409, f"vLLM preflight blocked '{profile.get('id')}': {detail}. "
+             "Run Dry Run for the full report, or retry with force=true.")
+
+
+async def _preflight_profile(profile: dict) -> dict:
+    """Every preflight check for one already-resolved profile."""
     script_path = Path(os.path.expanduser(profile.get("script", "")))
     if not script_path.exists():
         raise HTTPException(400, f"Script not found: {script_path}")
@@ -4213,6 +4520,8 @@ async def vllm_preflight(req: EngineStartRequest):
     util = facts["util"]
     if util is None and facts["recipe_backed"]:
         util = _recipe_util(facts["recipe"])
+    checks += _preflight_footprint(profile)
+    checks += await _preflight_reclaim_label()
     checks += _preflight_memory(util)
     checks += await _preflight_runtime(facts, text)
     checks += await _preflight_smoke(facts, text)
@@ -4220,7 +4529,7 @@ async def vllm_preflight(req: EngineStartRequest):
     verdict = ("fail" if any(c["level"] == "fail" for c in checks)
                else "warn" if any(c["level"] == "warn" for c in checks) else "ok")
     return {
-        "profile": req.profile,
+        "profile": profile["id"],
         "verdict": verdict,
         "checks": checks,
         "facts": facts,
@@ -4364,15 +4673,27 @@ _PROGRESS_CAUSE_WINDOW = 120  # log lines kept for root-cause extraction
 
 
 async def _container_state(name: str) -> dict:
+    """Id, status, exit code and OOMKilled of one container (05-02 adds OOMKilled).
+
+    On cgroup v2 (gb10: docker 29, cgroup2fs) the kernel counts every OOM kill of a
+    process in the container's cgroup — cgroup-limit or host-global — in its
+    memory.events, which is what docker reports as OOMKilled. NOTE that GB10's usual
+    memory failure is NOT that: CUDA allocations fail inside the driver
+    (NVRM NV_ERR_NO_MEMORY in `journalctl -k`) and vLLM exits non-zero by itself.
+    """
     res = await _run("docker", "inspect", name,
-                     "--format", "{{.Id}}|{{.State.Status}}|{{.State.ExitCode}}",
+                     "--format",
+                     "{{.Id}}|{{.State.Status}}|{{.State.ExitCode}}|{{.State.OOMKilled}}",
                      timeout=15)
     if res.returncode != 0:
-        return {"exists": False, "status": "absent", "exit_code": None, "id": ""}
-    cid, _, rest = (res.stdout or "").strip().partition("|")
-    status, _, code = rest.partition("|")
+        return {"exists": False, "status": "absent", "exit_code": None, "id": "",
+                "oom_killed": None}
+    parts = (res.stdout or "").strip().split("|")
+    parts += [""] * (4 - len(parts))
+    cid, status, code, oom = parts[:4]
     return {"exists": True, "id": cid, "status": status,
-            "exit_code": int(code) if code.strip().lstrip("-").isdigit() else None}
+            "exit_code": int(code) if code.strip().lstrip("-").isdigit() else None,
+            "oom_killed": {"true": True, "false": False}.get(oom.strip().lower())}
 
 
 _PROGRESS_APPEAR_TIMEOUT_S = 45   # docker rm -f + docker run, plus an image pull check
@@ -4503,9 +4824,14 @@ async def _load_progress_events(container: str, fresh: bool = False) -> AsyncGen
         # The stream ended without a verdict: the container died, or the log closed.
         state = await _container_state(container_id)
         if state["status"] in ("exited", "dead"):
+            code, oom = state.get("exit_code"), state.get("oom_killed")
+            cause = _exit_cause(code, oom)
+            if container == _launch_container("vllm") and "vllm" in _INFLIGHT:
+                _finish_launch("vllm", {"result": "failed", "exit_code": code,
+                                        "oom_killed": oom, "cause": cause})
             yield frame(status="failed", phase="failed", percent=pct,
                         error=_load_failure_reason(recent),
-                        exit_code=state.get("exit_code"), **facts)
+                        exit_code=code, oom_killed=oom, cause=cause, **facts)
         else:
             # Container is Up but the log ended — on the recipe path the container
             # outlives a dead engine, so `Up` is not proof of health. Ask the API.
@@ -4855,9 +5181,14 @@ for _ek, _ev in _ENGINES.items():
 
         @app.get(f"/api/{key}/status", name=f"{key}_status")
         async def status(k=key, e=eng):
-            return await _engine_status(
+            out = await _engine_status(
                 _engine_bases[k], e.get("docker_filter", k),
                 e.get("health_path", "/health"), e.get("models_path"))
+            # Settling here too means a launch that died with nobody watching the
+            # progress stream still reports its verdict on the next status poll.
+            if k in _INFLIGHT:
+                await _prune_inflight()
+            return {**out, "launch": _launch_status(k)}
 
         @app.post(f"/api/{key}/stop", name=f"{key}_stop",
                   dependencies=[Depends(verify_auth)])
@@ -5454,6 +5785,24 @@ def _script_meta_headers(info: dict, resolved: Optional[dict]) -> str:
     )
 
 
+def _generated_vram_header(info: dict, resolved: Optional[dict]) -> float | int:
+    """The `# VRAM:` value a generated script declares: what vLLM will reserve.
+
+    `round(util × MemTotal GiB)` whenever the launch util is known — the docker shape's
+    placeholder default, or a recipe's `--gpu-memory-utilization`. Only when no util
+    is knowable does it fall back to the weights estimate, which admission then treats
+    as the `header` source of last resort (05-01).
+    """
+    util = None
+    if resolved and resolved.get("shape") == "recipe":
+        util = (resolved.get("record") or {}).get("gpu_memory_utilization")
+    elif resolved:
+        util = _launch_defaults(resolved)["util"]
+    if isinstance(util, (int, float)) and not isinstance(util, bool) and 0 < util <= 1:
+        return round(float(util) * _mem_total_gib())
+    return info["vram_gb"]
+
+
 def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool,
                           resolved: Optional[dict] = None) -> str:
     """The single shared owner of generated profile metadata and collision cleanup."""
@@ -5466,7 +5815,7 @@ def _vllm_script_preamble(info: dict, launch_dir: Path, *, recipe_backed: bool,
     return f"""#!/bin/bash
 # Name: HF {_one_line(info['name'])}
 # Description: Local HF snapshot via vLLM ({_one_line(info['dtype'])}, {info['size_gb']:.1f} GB on disk)
-# VRAM: {info['vram_gb']}
+# VRAM: {_generated_vram_header(info, resolved)}
 #
 # Auto-generated by DGX Model Manager from:
 # {_one_line(launch_dir)}
@@ -5499,11 +5848,34 @@ unset _dmm_var _dmm_val
 """
 
 
-def _recipe_profile_body(recipe_dir, recipe_name: str) -> str:
+def _profile_label_args(profile_label: str, engine: str = "vllm") -> str:
+    """`--label` flags that let admission identify this launch's container (05-02).
+
+    Reclaim credit is granted ONLY to a container whose `dgx.profile` label names a
+    known profile; an unlabeled container is "unknown" and earns nothing. Every
+    generated launch therefore labels itself. The value is the script stem minus
+    `start_`, which is what `_running_profile_vram_credit` matches.
+    """
+    return (f"--label {shlex.quote('dgx.profile=' + profile_label)} "
+            f"--label {shlex.quote('dgx.engine=' + engine)}")
+
+
+def _recipe_profile_body(recipe_dir, recipe_name: str, profile_label: str = "") -> str:
     recipe_path = Path(os.path.expanduser(os.fspath(recipe_dir)))
+    label_block = ""
+    if profile_label:
+        # launch-cluster.sh appends $VLLM_SPARK_EXTRA_DOCKER_ARGS (word-split) to its
+        # `docker run`; that is the only seam for labelling a recipe-backed container.
+        labels = _profile_label_args(profile_label)
+        # Assigned outright, not appended: these scripts run under `set -u`, and the
+        # recipe shape must stay free of `${VLLM_*}` placeholders (it is not
+        # parameterizable — the recipe YAML owns its flags).
+        label_block = (
+            "# Label the container so admission can credit it on the next swap.\n"
+            f"export VLLM_SPARK_EXTRA_DOCKER_ARGS=\"{labels}\"\n")
     return f"""RECIPE_DIR={shlex.quote(str(recipe_path))}
 RECIPE={shlex.quote(recipe_name)}
-
+{label_block}
 # recipe_dir owns the YAMLs; run-recipe.sh is its sibling in the checkout root.
 cd "$RECIPE_DIR/.."
 # Detached mode lets DMM read progress uniformly from docker logs.
@@ -5537,7 +5909,8 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
             info, launch_dir, recipe_backed=True, resolved=resolved)
         res_dir = _vllm_cfg.get("recipe_dir") or "~/spark-vllm-docker/recipes"
         return (script_name, preamble + _recipe_profile_body(
-            res_dir, resolved["recipe"]), info)
+            res_dir, resolved["recipe"],
+            profile_label=script_name.removesuffix(".sh").removeprefix("start_")), info)
     # The docker preamble is deliberately built LAST (just before script assembly):
     # capability warnings are appended to info["warnings"] further down, and the
     # `# Warnings:` header must carry the complete list, not a prefix of it.
@@ -5649,6 +6022,7 @@ def _build_vllm_profile_script(launch_dir: Path, model_name: str | None = None) 
     script = preamble + _VLLM_OVERRIDE_GUARD + f"""docker run -d --name vllm_node --gpus all -p 8000:8000 \\
 {chr(10).join(mounts)}
 {chr(10).join(env_lines)}
+  {_profile_label_args(script_name.removesuffix(".sh").removeprefix("start_"))} \\
   {image} \\
 {chr(10).join(arg_lines)}
 """

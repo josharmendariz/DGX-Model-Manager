@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-last_updated: "2026-08-21T02:49:06.122Z"
-last_activity: 2026-08-21 -- Phase 04 closed (waves 1-3 shipped, live checkpoint run, gsd-verifier PASS)
+last_updated: "2026-10-18T00:00:00.000Z"
+last_activity: 2026-10-18 -- state reconciled against code and live gb10 (read-only); Phase 5 plan drafted
 progress:
   total_phases: 7
   completed_phases: 5
@@ -20,58 +20,65 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-02)
 
 **Core value:** Switching the active vLLM model must be safe and correct.
-**Current focus:** Phase 5 — admission truth
+**Current focus:** Phase 5 (admission truth). A plan draft exists; it has not been executed.
 
 ## Current Position
 
-Phase: 04 (parameterized-scripts-ui-settings) — COMPLETE, 3/3 plans, gsd-verifier PASS
-(04-VERIFICATION.md). Suite 464 passing at HEAD (rec-approve-actions, 3ccb35d). Live
-human-verify checkpoint run 2026-08-21: override reaches the container (docker inspect),
-concurrent-edit 409, HF-browse XSS payload renders as text, two profile scripts
-parameterized for real via the browser dialog. Checkpoint caught three renderer defects
-(classification outranking flag-parseability) and one missing affordance (Regenerate
-metadata on generated-lineage scripts), all fixed and tested.
-Next: Phase 5 (admission truth) — not yet planned. Phase 6 (verifiable research capture)
-is independent and can be planned at any point.
-Last activity: 2026-08-21 -- Phase 04 closed
+Reconciled 2026-10-18 against `origin/main` 56bdfb5. Only the facts below were verified;
+older narrative is in git history (`git log -- .planning/STATE.md`).
 
-See .planning/HANDOFF.json for the full situation: live engine/litellm state, the PR
-intent and why a direct PR would be 41 commits, three open questions, and the one
-root cause (litellm file-vs-ConfigMap drift) that is still unguarded.
-Remaining: Phase 5 admits on executor budget and identifies the reclaim target by docker
-label. Phase 6 (verifiable research capture) is independent and can be planned at any
-point.
+- Phases 1, 1.1, 2, 3 and 4 are complete. Phase 4 was closed in 0250f22 and is on `main`.
+  The 2026-08-20 "cut a 41-commit PR" step in HANDOFF.json is obsolete because that work
+  reached `main` through later PRs.
+- **Phase 5 (admission truth)** is not formally planned or executed, but parts shipped
+  without a plan:
+  - label-based reclaim identification (9410656, `dgx.profile`)
+  - overridden-footprint admission (8639fe0, done under 04-01)
 
-Progress: [██████░░░░] 63%
+  Still open: executor-budget metadata, consistent GiB units, a launch lock / in-flight
+  reservation, and OOM surfacing. Per-criterion status is in ROADMAP.md.
+  The draft plan is `phases/05-admission-truth/05-PLAN-DRAFT.md`.
+- **Phase 6 (verifiable research capture)** has not started. It is independent of Phase 5.
+- Suite: 540 passed, 3 skipped (`.venv/bin/python -m pytest -q`, about 2 s). The 3 skips
+  are the host-dependent litellm config tests, which also skip in CI.
+- CI (`.github/workflows/tests.yml`) runs pytest. A ruff correctness-lint job is proposed
+  separately.
 
-## Performance Metrics
+## Off-roadmap work since Phase 4 (on main)
 
-**Velocity:**
+Image drift checker (cb30594), unified background-job runner (b1ba906), dashboards/homelab
+tabs (c08019b, 75090de), dashboard frontend extracted to `dashboard.html` (e8ab05e), pinned
+vLLM model on boot + load-log tail (db32241), Qwen Flash host-headroom fix (6730286).
 
-- Total plans completed: 0
-- Average duration: — min
-- Total execution time: 0.0 hours
+## Open items carried forward
 
-**By Phase:**
-
-| Phase | Plans | Total | Avg/Plan |
-|-------|-------|-------|----------|
-| - | - | - | - |
+- **litellm file-vs-ConfigMap drift is still unguarded.** `_sync_litellm` pushes the file
+  into the ConfigMap, but nothing compares the two. (HANDOFF task 21)
+- The running service is bound to a Tailscale IP with no API key and
+  `MODEL_MANAGER_ALLOW_UNAUTH=1` (deploy unit, acknowledged tailnet trust model). Every
+  mutating endpoint is therefore open to tailnet peers.
 
 ## Environment Notes
 
-- **vLLM is UP.** `vllm_node` serves Qwen3.6-35B-A3B-FP8 at util 0.55 / 262144 via the
-  recipe-backed profile, aliased `vllm-active` for litellm. The earlier "intentionally
-  down for Helix training" note is stale — that blocker is resolved.
+- **Live state, read-only check on 2026-10-18 (gb10):**
+  - **Service:** `dgx-model-manager.service` (systemd --user) has been active since
+    2026-10-13 20:55:53 UTC. `app.py` and `dashboard.html` were last modified at
+    20:55:52, so the running code matches the checkout.
+  - **Model:** `vllm_node` serves `qwen38-flash-dgx`, labelled
+    `dgx.profile=hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid`, with `--max-model-len 262144`
+    and `--gpu-memory-utilization 0.76`. The container was started 2026-10-16T03:18Z.
+  - **Checkout:** gb10's checkout is one commit ahead of origin (e77077a, native 262k
+    for that profile). That commit is proposed to origin as-is; it is already what's
+    running.
+  - **Memory:** MemTotal is 121.6 GiB. MemAvailable was about 16 GiB with this model up.
 
 - **Page cache is charged against `--gpu-memory-utilization` on this box.** CUDA reports
   MemFree, not MemAvailable, so `usable = MemTotal * util - (MemTotal - MemFree)`. Drop
-  caches before a large launch (`POST /api/vllm/reclaim-cache`, or `sync && sudo sh -c
-  'echo 3 > /proc/sys/vm/drop_caches'`). At an unchanged util 0.55, Qwen3.6 got 0.19 GiB
-  of KV with ~25 GB cached and 25.97 GiB after reclaiming.
+  caches before a large launch (`POST /api/vllm/reclaim-cache`).
 
-- Editing `app.py` does NOT restart the running service — `systemctl --user restart
-  dgx-model-manager.service` is required to deploy.
+- Editing `app.py` does NOT restart the running service. Deploying requires
+  `systemctl --user restart dgx-model-manager.service` and Josh's approval. Engines run in
+  their own `systemd-run --scope`, so a restart does not stop them.
 
-- **~3 concurrent claude sessions run in this repo.** Commit by explicit path; never
-  `git add -A`. `app.py` currently holds two sessions' work at once.
+- **Several Claude sessions may work in this repo concurrently.** Commit by explicit path
+  and never use `git add -A`.

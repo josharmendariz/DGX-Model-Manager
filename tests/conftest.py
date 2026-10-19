@@ -54,6 +54,32 @@ def isolate_agent_history(tmp_path, monkeypatch):
     yield
 
 
+_REAL_REQUIRE_LAUNCH_PREFLIGHT = appmod._require_launch_preflight
+
+
+@pytest.fixture(autouse=True)
+def isolate_launch_state(monkeypatch):
+    """Fresh launch lock / in-flight table per test, and no docker or preflight probes
+    from `_engine_start` unless a test opts back in.
+
+    The mandatory vLLM preflight (05-02) would otherwise shell out to docker for every
+    test that exercises `_engine_start`; tests of the gate itself use
+    `_REAL_REQUIRE_LAUNCH_PREFLIGHT`.
+    """
+    monkeypatch.setattr(appmod, "_LAUNCH_LOCK", asyncio.Lock())
+    monkeypatch.setattr(appmod, "_INFLIGHT", {})
+    monkeypatch.setattr(appmod, "_LAST_LAUNCH", {})
+
+    async def _no_preflight(profile):
+        return None
+
+    async def _no_prior(container):
+        return ""
+    monkeypatch.setattr(appmod, "_require_launch_preflight", _no_preflight)
+    monkeypatch.setattr(appmod, "_prior_container_id", _no_prior)
+    yield
+
+
 @pytest.fixture(scope="session")
 def model_fixtures():
     """The whole parsed model-fixtures.json snapshot: {generated, pool_gb, models, anomalies}."""
