@@ -547,3 +547,33 @@ def test_headers_do_not_break_bash_syntax(tmp_path):
     _real_config(model_dir, layer_types=["full_attention"] * 35 + ["od'd\"type"])
     _, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/MetaBash-7B")
     assert _bash_syntax_ok(tmp_path, script)
+
+
+# ── 05-02: every generated launch labels its container ───────────────────────
+
+def test_docker_shape_labels_its_container_with_the_profile_id(tmp_path):
+    """Reclaim credit is granted only to a `dgx.profile`-labelled container, so a
+    generated profile that did not label itself would never be credited on a swap."""
+    model_dir = _plain_model(tmp_path, "labelled")
+    name, script, _ = appmod._build_vllm_profile_script(model_dir, "Acme/Label-7B")
+    profile_label = name.removesuffix(".sh").removeprefix("start_")
+    assert f"--label dgx.profile={profile_label}" in script
+    assert "--label dgx.engine=vllm" in script
+    # labels are docker-run options: they must precede the image
+    assert script.index("--label dgx.profile=") < script.index("--model")
+    assert _bash_syntax_ok(tmp_path, script)
+
+
+def test_recipe_shape_labels_via_launch_cluster_extra_args(tmp_path, monkeypatch):
+    _configure_qwen36_recipe(tmp_path, monkeypatch)
+    model_dir = _plain_model(tmp_path, "recipe-label")
+    name, script, _ = appmod._build_vllm_profile_script(model_dir, "Qwen/Qwen3.6-35B-A3B-FP8")
+    profile_label = name.removesuffix(".sh").removeprefix("start_")
+    assert (f'export VLLM_SPARK_EXTRA_DOCKER_ARGS="--label dgx.profile={profile_label} '
+            f'--label dgx.engine=vllm"') in script
+    assert script.index("VLLM_SPARK_EXTRA_DOCKER_ARGS") < script.index("run-recipe.sh \"$RECIPE\"")
+    assert _bash_syntax_ok(tmp_path, script)
+
+
+def test_label_args_are_shell_quoted():
+    assert appmod._profile_label_args("hf_a b") == "--label 'dgx.profile=hf_a b' --label dgx.engine=vllm"

@@ -34,6 +34,10 @@ RECIPE="qwen3.6-35b-a3b-fp8-solo"
 docker rm -f vllm_node 2>/dev/null || true
 
 cd "$RECIPE_DIR"
+# Label the container so admission credits it on the next swap (05-02: an unlabeled
+# container earns NO reclaim credit). launch-cluster.sh word-splits this variable into
+# its `docker run`.
+export VLLM_SPARK_EXTRA_DOCKER_ARGS="--label dgx.profile=hf_qwen_qwen3.6-35b-a3b-fp8 --label dgx.engine=vllm"
 # -d is required: without it run-recipe stays attached streaming container logs.
 # Progress is read from `docker logs -f vllm_node` instead, which works
 # identically for recipe-backed and generated profiles.
