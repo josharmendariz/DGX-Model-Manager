@@ -1,7 +1,7 @@
 #!/bin/bash
 # Name: Nemotron-3 Super 120B (NVFP4)
 # Description: 69.5G weights + bounded KV at util 0.75 -- native 262K ctx, tool calling
-# VRAM: 95
+# VRAM: 91
 #
 # GB10 profile verified 2026-07-14: vLLM 0.20.0, marlin NVFP4 backend.
 # Serves "nvidia/nemotron-3-super", "nemotron-3-super", and "vllm-active" on :8000.

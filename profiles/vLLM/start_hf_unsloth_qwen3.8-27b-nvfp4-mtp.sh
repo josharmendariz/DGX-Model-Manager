@@ -1,7 +1,7 @@
 #!/bin/bash
 # Name: HF unsloth/Qwen3.8-27B-NVFP4 (MTP)
 # Description: NVFP4 Qwen3.8-27B with MTP speculation + prefix caching — fastest at long context
-# VRAM: 85
+# VRAM: 88
 #
 # Same launch shape as the FP8 profile, different weights. Measured head to head
 # on gb10 2026-09-08, both with prefix caching and depth-4 MTP:
