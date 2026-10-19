@@ -13,6 +13,10 @@ Summarised from `git log v0.2.0..main` (2026-05-14 → 2026-10-13). Planning-onl
 
 ### Security
 
+- **Authenticated service default** — the shipped user unit no longer enables
+  `MODEL_MANAGER_ALLOW_UNAUTH`. An authentication drop-in is provided for existing
+  customized units. Server-side key hashes and browser-side plaintext token storage
+  are now documented separately.
 - **Mutating endpoints fail closed on an open bind** — with no API key and a
   non-loopback bind, `verify_auth` now returns 503 for every mutating request
   instead of allowing it. `MODEL_MANAGER_ALLOW_UNAUTH=1` restores open access and
@@ -27,6 +31,9 @@ Summarised from `git log v0.2.0..main` (2026-05-14 → 2026-10-13). Planning-onl
 
 ### Added
 
+- **Read-only LiteLLM startup drift check** — Kubernetes mode compares the local
+  router YAML with the ConfigMap and logs a mismatch or unavailable comparison
+  without exposing config values, syncing, or restarting LiteLLM.
 - **llama.cpp engine** — GGUF profiles driven by a config-owned quant ladder
   (`llamacpp.recipes`), run in the upstream `server-cuda` container.
 - **Derived launch spec** — `_derive_launch_spec` computes attention topology,

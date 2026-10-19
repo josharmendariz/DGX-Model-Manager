@@ -23,7 +23,7 @@ printed, and so synthesis runs on this box rather than an external service.
 - [x] **Phase 2: Derived launch spec** - Hybrid-aware KV/context/utilization solver, pure and testable
 - [x] **Phase 3: Curated recipe overrides** - config.json recipe table that wins over derived values
 - [x] **Phase 4: Parameterized scripts + UI settings** - Env-var overrides and the context/util controls (completed 2026-08-21)
-- [x] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label (implemented in #23/#24, deployed to gb10 2026-10-19; live util measurements pending, see status below)
+- [x] **Phase 5: Admission truth** - Admit on executor budget; identify reclaim target by docker label (implemented in #23/#24, deployment present on gb10 at the 2026-10-18 check; live util measurements pending, see status below)
 - [ ] **Phase 6: Verifiable research capture** - Findings must cite a quote that exists; rules stay human-owned
 
 ## Phase Details
@@ -183,8 +183,9 @@ Plans:
 - [x] 05-01: Executor-budget metadata + unit-consistent admission math (#23)
 - [x] 05-02: Label-based reclaim identification, launch lock, and failure surfacing (#24)
 
-**Status (2026-10-19)**: Implemented in #23 (05-01) and #24 (05-02), plus #22 and #25 as
-follow-ups. Deployed to gb10 (service restarted, engines untouched). No separate PLAN.md
+**Status (reconciled 2026-10-18, America/Chicago)**: Implemented in #23 (05-01) and #24
+(05-02), plus #22 and #25 as follow-ups. GB10's checkout is 1c2d785; the earlier service
+restart and unaffected engines are reported by the Claude handoff. No separate PLAN.md
 exists: the draft plan (PR #21) was closed as superseded once the work shipped; the design
 is recorded in the #23/#24 PR descriptions.
   1. Executor budget: **done**. A launch's footprint is `util × live MemTotal`, with util
@@ -212,6 +213,9 @@ of a false `fail` (found during the deploy: the gate would otherwise have refuse
 flash-next profile).
 
 **Still open after the deploy:**
+  - Session update (2026-10-18, America/Chicago): the key is now configured and
+    protected reads reject missing/invalid tokens. Authentication exception cleanup
+    and the LiteLLM startup drift check are prepared locally, not deployed; see STATE.md.
   - The five profiles that launch at util 0.75 (qwen3-8b, qwen3-vl-4b, qwen3-14b,
     qwen2.5-14b-gptq, deepseek-14b) are refused alongside a running engine. Their utils are
     unchanged; proposed starting points (0.35, 0.20, 0.45, 0.30, 0.40) need measuring on
