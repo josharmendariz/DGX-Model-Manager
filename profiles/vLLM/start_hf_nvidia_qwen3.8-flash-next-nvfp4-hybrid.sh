@@ -68,6 +68,25 @@
 # other profile in this directory.
 set -euo pipefail
 
+# Validate bounded measurement overrides before touching the running engine/cache.
+for _dmm_var in VLLM_MAX_MODEL_LEN VLLM_MAX_NUM_SEQS; do
+  _dmm_val="${!_dmm_var:-}"
+  if [[ -n "$_dmm_val" && ! "$_dmm_val" =~ ^[1-9][0-9]{0,6}$ ]]; then
+    echo "Invalid $_dmm_var: expected a positive bounded integer" >&2
+    exit 2
+  fi
+done
+if (( ${VLLM_MAX_MODEL_LEN:-262144} > 262144 || ${VLLM_MAX_NUM_SEQS:-8} > 8 )); then
+  echo "Overrides exceed native context 262144 or sequence cap 8" >&2
+  exit 2
+fi
+if [[ ! "${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" =~ ^0\.[0-9]{1,4}$ \
+   || "${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" =~ ^0\.0+$ ]]; then
+  echo "Invalid VLLM_GPU_MEMORY_UTILIZATION: expected a fraction between zero and one" >&2
+  exit 2
+fi
+unset _dmm_var _dmm_val
+
 FLASH_REPO="$HOME/qwen3.8-Flash-DGX"
 if [ ! -x "$FLASH_REPO/scripts/serve.sh" ]; then
   echo "ERROR: $FLASH_REPO not found (clone github.com/blazux/qwen3.8-Flash-DGX there)" >&2
@@ -103,6 +122,7 @@ fi
 # notes): a restart policy on a launch that may be wrong turns a bad script into a
 # persistent outage. vllm-default-model.service owns boot recovery instead.
 cd "$FLASH_REPO"
-NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=0 CTX=262144 MTP=2 \
+NAME=vllm_node PORT=8000 IMAGE=qwen38-flash-dgx MODE=hybrid YARN=0 \
+  CTX="${VLLM_MAX_MODEL_LEN:-262144}" SEQS="${VLLM_MAX_NUM_SEQS:-8}" MTP=2 \
   GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}" ./scripts/serve.sh
 docker update --restart no vllm_node
