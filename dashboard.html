@@ -391,14 +391,14 @@ a.model-card:hover{border-color:var(--amber)}
   white-space:pre;
 }
 .preflight-head{
-  display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;
   font-size:12px;font-weight:600;padding:8px 10px;border-radius:5px 5px 0 0;
   border:1px solid var(--border);border-bottom:none;background:var(--s2);
 }
 .preflight-head.pf-ok{color:var(--green)}
 .preflight-head.pf-warn{color:var(--amber)}
 .preflight-head.pf-fail{color:var(--red)}
-.preflight-budget{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--muted)}
+.preflight-budget{flex-basis:100%;font-family:var(--mono);font-size:11px;font-weight:400;color:var(--muted);line-height:1.5}
 .preflight-row{
   border:1px solid var(--border);border-top:none;padding:8px 10px;
   border-left:3px solid var(--border);background:#04040a;
@@ -3482,10 +3482,25 @@ function renderPreflight(out, r) {
   head.className = 'preflight-head pf-' + r.verdict;
   head.textContent = icons[r.verdict] + ' ' + r.profile;
   if (r.budget) {
-    const b = document.createElement('span');
+    const b = document.createElement('div');
     b.className = 'preflight-budget';
-    b.textContent = 'util ' + r.budget.util + ' → ' + r.budget.usable_gib
-      + ' GiB usable of a ' + r.budget.budget_gib + ' GiB budget';
+    const current = document.createElement('div');
+    current.textContent = 'Current state, before replacing any engine: '
+      + r.budget.usable_gib + ' GiB budget balance (util ' + r.budget.util
+      + ', reservation ' + r.budget.budget_gib + ' GiB).';
+    b.appendChild(current);
+    const estimate = document.createElement('div');
+    const replacement = r.budget.replacement;
+    estimate.textContent = replacement
+      ? 'Estimated after replacing ' + replacement.profile + ': '
+        + replacement.usable_gib + ' GiB; with cache reclaim: '
+        + replacement.usable_after_reclaim_gib + ' GiB. Based on '
+        + replacement.reservation_credit_gib + ' GiB of labelled reservation credit.'
+      : 'Replacement estimate unavailable: no identified reservation credit.';
+    b.appendChild(estimate);
+    const limit = document.createElement('div');
+    limit.textContent = 'Estimates only; KV capacity and startup readiness are not measured.';
+    b.appendChild(limit);
     head.appendChild(b);
   }
   out.appendChild(head);

@@ -4009,7 +4009,7 @@ def _cuda_visible_memory() -> dict:
 
 
 def _vllm_budget_gib(util: float, mem: dict) -> dict:
-    """What vLLM will actually have to work with at `util`, and what a cache drop buys."""
+    """Current-state budget balance; includes resident engines, not measured KV capacity."""
     total = mem.get("total_gib", 0.0)
     unavailable = mem.get("cuda_unavailable_gib", 0.0)
     reclaimable = mem.get("reclaimable_gib", 0.0)
@@ -4021,6 +4021,29 @@ def _vllm_budget_gib(util: float, mem: dict) -> dict:
         "usable_gib": round(budget - unavailable, 1),
         "usable_after_reclaim_gib": round(budget - max(unavailable - reclaimable, 0.0), 1),
     }
+
+
+async def _preflight_budget(util: float, mem: dict) -> dict:
+    """Advisory current/replacement balances; never used to grant launch admission."""
+    budget = _vllm_budget_gib(util, mem)
+    budget["replacement"] = None
+    try:
+        credit, profile_id = await _running_profile_vram_credit("vllm", _scan_profiles("vllm"))
+    except Exception:
+        return budget
+    # Reservation credit is an estimate, not measured released memory. Reuse the
+    # admission policy's label-only identification, never match a served alias.
+    if not profile_id or credit <= 0:
+        return budget
+    credit = min(credit, mem.get("cuda_unavailable_gib", 0.0))
+    projected = {**mem, "cuda_unavailable_gib": max(
+        mem.get("cuda_unavailable_gib", 0.0) - credit, 0.0)}
+    budget["replacement"] = {
+        "profile": profile_id,
+        "reservation_credit_gib": round(credit, 1),
+        **_vllm_budget_gib(util, projected),
+    }
+    return budget
 
 
 # ── vLLM load-progress parsing ────────────────────────────────────────────────
@@ -4215,7 +4238,8 @@ def _parse_launch_script(text: str) -> dict:
         "image": image,
         "mounts": mounts,
         "model": _expand_script_vars(_first_group(_PF_MODEL_RE.search(code)), code),
-        "util": float(_first_group(_PF_UTIL_RE.search(code)) or 0) or None,
+        "util": (float(_first_group(_PF_UTIL_RE.search(code)) or 0)
+                 or _parse_templated_defaults(code).get("gpu_memory_utilization")),
         "restart": _first_group(_PF_RESTART_RE.search(code)),
         "has_serve": bool(_re.search(r"^\s*vllm serve\b", code, _re.M)),
         "clears_container": "docker rm -f vllm_node" in code,
@@ -4400,19 +4424,27 @@ async def _preflight_reclaim_label() -> list:
                 f"Stop {container} first, or relaunch it from a labelled profile.")]
 
 
-def _preflight_memory(util: Optional[float]) -> list:
-    """The budget check. `util` None means the script did not declare one."""
-    mem = _cuda_visible_memory()
+def _preflight_memory(util: Optional[float], mem: Optional[dict] = None,
+                      budget: Optional[dict] = None) -> list:
+    """Page-cache policy plus explicitly advisory budget context."""
+    mem = _cuda_visible_memory() if mem is None else mem
     if "error" in mem:
         return [_pf("warn", "memory", "Could not read /proc/meminfo", mem["error"])]
     reclaim = mem["reclaimable_gib"]
-    budget = _vllm_budget_gib(util, mem) if util else None
+    budget = budget if budget is not None else (_vllm_budget_gib(util, mem) if util else None)
     arith = ""
     if budget:
-        arith = (f" At util {util}, vLLM's budget is {budget['budget_gib']} GiB, of which "
-                 f"{budget['charged_gib']} GiB is already charged as unavailable — leaving "
-                 f"{budget['usable_gib']} GiB. Reclaiming the cache would raise that to "
-                 f"{budget['usable_after_reclaim_gib']} GiB.")
+        arith = (f" Current-state budget balance at util {util}: {budget['usable_gib']} GiB"
+                 f" of a {budget['budget_gib']} GiB reservation, including resident engines."
+                 f" After cache reclaim only: {budget['usable_after_reclaim_gib']} GiB.")
+        replacement = budget.get("replacement")
+        if replacement:
+            arith += (f" Estimated balance after replacing {replacement['profile']}: "
+                      f"{replacement['usable_gib']} GiB; after replacement plus cache reclaim: "
+                      f"{replacement['usable_after_reclaim_gib']} GiB. This assumes "
+                      f"{replacement['reservation_credit_gib']} GiB of label-based reservation"
+                      " credit, not measured released memory.")
+        arith += " These balances do not measure KV capacity or establish startup readiness."
     detail = (f"{reclaim} GiB of page cache is held. CUDA reports free memory, not "
               f"MemAvailable, so cached pages are billed against "
               f"--gpu-memory-utilization even though the kernel would happily drop "
@@ -4435,16 +4467,31 @@ _PF_SMOKE_TIMEOUT_S = 90
 
 # Validates flags without allocating a single byte of KV cache. Kept tolerant of
 # vLLM's module reshuffles — an ImportError here means "cannot check", not "bad".
-_PF_ARGPARSE_PROBE = (
-    "import sys\n"
-    "try:\n"
-    "    from vllm.utils.argparse_utils import FlexibleArgumentParser\n"
-    "except Exception:\n"
-    "    from vllm.utils import FlexibleArgumentParser\n"
-    "from vllm.entrypoints.openai.cli_args import make_arg_parser\n"
-    "make_arg_parser(FlexibleArgumentParser()).parse_args(sys.argv[1:])\n"
-    "print('ARGS_OK')\n"
-)
+_PF_ARGPARSE_PROBE = """
+import dataclasses
+import sys
+from vllm.config import DeviceConfig, VllmConfig
+field = next((f for f in dataclasses.fields(VllmConfig) if f.name == "device_config"), None)
+default = getattr(field, "default", None)
+factory = getattr(default, "default_factory", None)
+if factory is not DeviceConfig:
+    print("ARGS_PROBE_UNSUPPORTED_DEVICE_DEFAULT")
+    sys.exit(0)
+# The image's CLI builder materializes this default during introspection. Use an
+# explicit CPU device only for that default: no platform spoofing or GPU access.
+default.default_factory = lambda: DeviceConfig(device="cpu")
+try:
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except ImportError:
+        from vllm.utils import FlexibleArgumentParser
+    from vllm.entrypoints.openai.cli_args import make_arg_parser
+    parser = make_arg_parser(FlexibleArgumentParser())
+finally:
+    default.default_factory = factory
+parser.parse_args(sys.argv[1:])
+print("ARGS_OK_SYNTAX_ONLY")
+"""
 
 
 _PF_MODEL_CONFIG_PROBE = """
@@ -4609,10 +4656,11 @@ async def _preflight_smoke(facts: dict, script: str) -> list:
     args += [facts["image"], "-c", _PF_ARGPARSE_PROBE] + flags
     probe = await _run(*args, timeout=_PF_SMOKE_TIMEOUT_S)
     combined = ((probe.stdout or "") + (probe.stderr or "")).strip()
-    if probe.returncode == 0 and "ARGS_OK" in combined.splitlines():
-        return [_pf("ok", "smoke", "vLLM accepted every flag",
-                    f"{len(flags)} arguments parsed by vLLM's own argument parser "
-                    f"inside {facts['image']}, without loading weights.")]
+    if probe.returncode == 0 and "ARGS_OK_SYNTAX_ONLY" in combined.splitlines():
+        return [_pf("ok", "smoke", "CLI flags accepted (syntax only)",
+                    f"{len(flags)} arguments parsed by vLLM's own CLI parser in "
+                    f"{facts['image']}. Parser construction uses an explicit CPU device default. "
+                    "No weights loaded; GPU compatibility and engine readiness are unverified.")]
     # Only argparse's own vocabulary counts as the script being wrong. Everything
     # else — an import that needs CUDA, a moved module, a slow pull — means the
     # probe could not run, and saying "rejected" there would be a false alarm.
@@ -4624,8 +4672,8 @@ async def _preflight_smoke(facts: dict, script: str) -> list:
                     combined[-600:])]
     return [_pf("skip", "smoke", "Could not run the argument probe",
                 (combined[-400:] or "no output") +
-                "\n\nThe probe runs without a GPU, so vLLM config objects that touch "
-                "the device cannot be constructed. This says nothing about the script.")]
+                "\n\nThis offline probe requests no GPU. Unsupported parser layouts or "
+                "device-dependent initialization leave CLI syntax unqualified.")]
 
 
 @app.post("/api/vllm/preflight", dependencies=[Depends(verify_auth)])
@@ -4672,9 +4720,11 @@ async def _preflight_profile(profile: dict) -> dict:
     util = facts["util"]
     if util is None and facts["recipe_backed"]:
         util = _recipe_util(facts["recipe"])
+    mem = _cuda_visible_memory()
+    budget = await _preflight_budget(util, mem) if util and "error" not in mem else None
     checks += _preflight_footprint(profile)
     checks += await _preflight_reclaim_label()
-    checks += _preflight_memory(util)
+    checks += _preflight_memory(util, mem, budget)
     checks += await _preflight_runtime(facts, text)
     checks += await _preflight_smoke(facts, text)
 
@@ -4685,8 +4735,8 @@ async def _preflight_profile(profile: dict) -> dict:
         "verdict": verdict,
         "checks": checks,
         "facts": facts,
-        "memory": _cuda_visible_memory(),
-        "budget": _vllm_budget_gib(util, _cuda_visible_memory()) if util else None,
+        "memory": mem,
+        "budget": budget,
     }
 
 

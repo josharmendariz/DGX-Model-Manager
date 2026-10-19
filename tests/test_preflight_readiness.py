@@ -58,7 +58,7 @@ def test_argument_probe_checks_both_image_entrypoint_styles(script, monkeypatch,
     if explicit:
         script = script.replace("vllm/vllm-openai:test", "eugr/spark-vllm:test \\\n  vllm serve")
     facts = appmod._parse_launch_script(script)
-    calls = docker_stub(monkeypatch, output="ARGS_OK\n")
+    calls = docker_stub(monkeypatch, output="ARGS_OK_SYNTAX_ONLY\n")
     checks = asyncio.run(appmod._preflight_smoke(facts, script))
     assert checks[0]["level"] == "ok"
     call = next(a for a in calls if a[:2] == ("docker", "run"))
@@ -190,7 +190,7 @@ def test_comment_only_offline_setting_cannot_make_online_cache_miss_fail(script,
 
 
 def test_docker_failure_is_unknown_even_if_output_contains_success_marker(script, monkeypatch):
-    docker_stub(monkeypatch, output="ARGS_OK\n", code=1)
+    docker_stub(monkeypatch, output="ARGS_OK_SYNTAX_ONLY\n", code=1)
     checks = asyncio.run(appmod._preflight_smoke(appmod._parse_launch_script(script), script))
     assert checks[0]["level"] == "skip"
 
