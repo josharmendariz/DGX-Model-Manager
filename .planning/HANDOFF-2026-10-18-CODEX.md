@@ -1,7 +1,34 @@
 # Session handoff — 2026-10-18 (America/Chicago)
 
-Josh asked for autonomous preparation and verification, stopping at approval or scope
-boundaries. No live configuration or service was changed by Codex this session.
+Josh asked for autonomous preparation and verification, then explicitly approved
+publication, merges, deployment, and the DMM-only restart. The rollout below is complete.
+
+## Completed rollout — 2026-10-18 21:23 CDT
+
+- Josh confirmed authenticated System Overview works before authorizing rollout.
+- PR #26 merged as `1133dde`; #27 merged as `80b127d`; startup-output follow-up #28
+  merged as `c005e60`. All CI lint and pytest checks passed before their merges.
+- GB10 fast-forwarded to `c005e60` through Git. The exact merged application tree
+  matches the tested candidate: 692 passed, 4 skipped, Ruff 0.14.0 passed.
+- Installed only `require-auth.conf` beside the customized user unit. Verified unit
+  syntax, reloaded systemd and restarted only DMM. The process has no
+  `MODEL_MANAGER_ALLOW_UNAUTH`; the original unit and saved config are unchanged.
+- The new invocation journal reports `LiteLLM config drift startup result: match`.
+  No router contents were printed, synced or applied; LiteLLM was not rolled.
+- DMM is active, configured key retained, and missing/invalid token protected reads
+  return 401. Tailscale bind is unchanged. Controlplane consumer checks returned
+  200 for the UI, 401 for protected config, and 200 for direct inference.
+- `vllm_node` retained full container identity `4c4f68ed11cd...` and start time
+  `2026-10-16T03:18:53.41314325Z`. Its model IDs are unchanged; no engine was stopped,
+  restarted or switched. DMM job/launch state is idle after restart.
+- Private backup directory on GB10:
+  `~/.local/state/dgx-model-manager/rollouts/20261019T022354Z-auth-and-drift`.
+  It contains protected unit/config backups and nonsecret `verification.json`.
+- Remaining operator check: refresh Logs & Debug to confirm the browser session
+  still succeeds after restart. Do not share the token.
+
+The following sections preserve the preparation snapshot; their pending-approval
+language was superseded by the explicit approval and completed rollout above.
 
 ## Observed live
 

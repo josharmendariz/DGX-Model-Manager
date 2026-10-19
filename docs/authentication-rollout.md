@@ -1,6 +1,8 @@
 # Authentication rollout for an existing GB10 deployment
 
-Prepared 2026-10-18. Deployment and service restart require Josh's approval.
+Prepared 2026-10-18. Josh approved and the rollout completed at 21:23 CDT on
+2026-10-18, deploying `c005e60`; see `.planning/HANDOFF-2026-10-18-CODEX.md` for
+verification evidence. Future deployments and restarts require fresh approval.
 Keep DMM bound to Tailscale. Do not stop or switch inference engines.
 
 ## Verified before preparation

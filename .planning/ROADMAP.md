@@ -213,9 +213,10 @@ of a false `fail` (found during the deploy: the gate would otherwise have refuse
 flash-next profile).
 
 **Still open after the deploy:**
-  - Session update (2026-10-18, America/Chicago): the key is now configured and
-    protected reads reject missing/invalid tokens. Authentication exception cleanup
-    and the LiteLLM startup drift check are prepared locally, not deployed; see STATE.md.
+  - Session update (2026-10-18, America/Chicago): the key is configured and protected
+    reads reject missing/invalid tokens. Authentication exception cleanup and the
+    LiteLLM startup drift check are deployed at c005e60; startup reports a match.
+    The inference container identity/start time did not change; see STATE.md.
   - The five profiles that launch at util 0.75 (qwen3-8b, qwen3-vl-4b, qwen3-14b,
     qwen2.5-14b-gptq, deepseek-14b) are refused alongside a running engine. Their utils are
     unchanged; proposed starting points (0.35, 0.20, 0.45, 0.30, 0.40) need measuring on
