@@ -1,0 +1,245 @@
+{
+  "schema_version": 1,
+  "evidence": [
+    {
+      "event": "begin",
+      "at": "2026-10-19T03:08:20.741343+00:00",
+      "directory": "/home/josh/.local/state/dgx-model-manager/measurements/20261019T030820Z",
+      "memory": {
+        "MemTotal_GiB": 121.627,
+        "MemFree_GiB": 1.022,
+        "MemAvailable_GiB": 14.682,
+        "Cached_GiB": 12.368,
+        "SwapTotal_GiB": 16.0,
+        "SwapFree_GiB": 10.907,
+        "SReclaimable_GiB": 1.51,
+        "pressure": "some avg10=0.05 avg60=0.18 avg300=0.14 total=209083712\nfull avg10=0.05 avg60=0.18 avg300=0.14 total=208708682"
+      },
+      "metrics": [
+        "vllm:num_requests_running{engine=\"0\",model_name=\"qwen3.8-flash-next\"} 1.0",
+        "vllm:num_requests_waiting{engine=\"0\",model_name=\"qwen3.8-flash-next\"} 0.0",
+        "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"qwen3.8-flash-next\"} 0.24637681159420288",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"qwen3.8-flash-next\"} 1499.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"qwen3.8-flash-next\"} 3.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"qwen3.8-flash-next\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"error\",model_name=\"qwen3.8-flash-next\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"repetition\",model_name=\"qwen3.8-flash-next\"} 0.0"
+      ]
+    },
+    {
+      "event": "original",
+      "at": "2026-10-19T03:08:20.762309+00:00",
+      "identity": "4c4f68ed11cd13a3e07c4a5ccded9f1f0dabb633db3820e8ae266a0ea3b0aa18|sha256:826800d5af37e81df3af1dc77982376d657ab70ab2fe1fd2e0bf2378ae367076|hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid"
+    },
+    {
+      "event": "post_reclaim",
+      "at": "2026-10-19T03:08:45.440988+00:00",
+      "memory": {
+        "MemTotal_GiB": 121.627,
+        "MemFree_GiB": 116.169,
+        "MemAvailable_GiB": 116.018,
+        "Cached_GiB": 0.678,
+        "SwapTotal_GiB": 16.0,
+        "SwapFree_GiB": 13.271,
+        "SReclaimable_GiB": 0.194,
+        "pressure": "some avg10=0.00 avg60=0.12 avg300=0.12 total=209083712\nfull avg10=0.00 avg60=0.12 avg300=0.12 total=208708682"
+      }
+    },
+    {
+      "event": "launched",
+      "at": "2026-10-19T03:08:46.030975+00:00",
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "util": 0.49,
+      "pid": 129077,
+      "script_sha256": "b4aaf468f18ef1c4169d104766d468fbca45e5d92124b6765aca771ea7f4f4c0"
+    },
+    {
+      "event": "ready",
+      "at": "2026-10-19T03:16:20.998051+00:00",
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "startup_seconds": 454.9,
+      "models": [
+        "Qwen/Qwen3.8-27B-FP8",
+        "Qwen--Qwen3.8-27B-FP8",
+        "vllm-active"
+      ],
+      "memory": {
+        "MemTotal_GiB": 121.627,
+        "MemFree_GiB": 21.871,
+        "MemAvailable_GiB": 52.572,
+        "Cached_GiB": 31.488,
+        "SwapTotal_GiB": 16.0,
+        "SwapFree_GiB": 13.272,
+        "SReclaimable_GiB": 0.239,
+        "pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=209083712\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=208708682"
+      },
+      "metrics": [
+        "vllm:num_requests_running{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:num_requests_waiting{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"error\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"repetition\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0"
+      ],
+      "logs": [
+        "(EngineCore pid=256) INFO 10-19 03:12:56 [gpu_model_runner.py:5279] Model loading took 28.51 GiB memory and 208.851418 seconds",
+        "(EngineCore pid=256) INFO 10-19 03:15:13 [gpu_worker.py:569] Available KV cache memory: 25.06 GiB",
+        "(EngineCore pid=256) INFO 10-19 03:15:13 [kv_cache_utils.py:2146] GPU KV cache size: 405,625 tokens",
+        "(EngineCore pid=256) INFO 10-19 03:15:13 [kv_cache_utils.py:2147] Maximum concurrency for 262,144 tokens per request: 1.55x"
+      ]
+    },
+    {
+      "event": "smoke",
+      "at": "2026-10-19T03:16:38.181326+00:00",
+      "profile": "start_hf_qwen_qwen3.8-27b-fp8",
+      "seconds": 17.176,
+      "usage": {
+        "prompt_tokens": 17,
+        "total_tokens": 19,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null
+      },
+      "finish_reason": "stop",
+      "content": "READY",
+      "memory": {
+        "MemTotal_GiB": 121.627,
+        "MemFree_GiB": 22.107,
+        "MemAvailable_GiB": 52.831,
+        "Cached_GiB": 31.51,
+        "SwapTotal_GiB": 16.0,
+        "SwapFree_GiB": 13.272,
+        "SReclaimable_GiB": 0.24,
+        "pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=209083712\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=208708682"
+      },
+      "metrics": [
+        "vllm:num_requests_running{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 1.0",
+        "vllm:num_requests_waiting{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.017241379310344862",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 1.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"error\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"repetition\",model_name=\"Qwen/Qwen3.8-27B-FP8\"} 0.0"
+      ]
+    },
+    {
+      "event": "post_reclaim",
+      "at": "2026-10-19T03:18:07.171655+00:00",
+      "memory": {
+        "MemTotal_GiB": 121.627,
+        "MemFree_GiB": 116.168,
+        "MemAvailable_GiB": 116.007,
+        "Cached_GiB": 0.679,
+        "SwapTotal_GiB": 16.0,
+        "SwapFree_GiB": 13.272,
+        "SReclaimable_GiB": 0.174,
+        "pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=209083713\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=208708682"
+      }
+    },
+    {
+      "event": "launched",
+      "at": "2026-10-19T03:18:07.178326+00:00",
+      "profile": "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid",
+      "util": 0.76,
+      "pid": 140780,
+      "script_sha256": "bedee306c2373b82af6764132aea7ab3ec0b4ef667da6ace59b99293a1cd4f59"
+    },
+    {
+      "event": "RESTORATION_FAILED",
+      "at": "2026-10-19T03:30:07.750804+00:00",
+      "error": "TimeoutError: Startup deadline exceeded",
+      "logs": [
+        "(EngineCore pid=367) INFO 10-19 03:28:19 [model_runner.py:407] Model loading took 74.4 GiB memory and 566.331983 seconds",
+        "(EngineCore pid=367) INFO 10-19 03:30:00 [gpu_worker.py:693] Available KV cache memory: 14.6 GiB",
+        "(EngineCore pid=367) INFO 10-19 03:30:00 [kv_cache_utils.py:2258] GPU KV cache size: 515,598 tokens, Maximum concurrency for 262,144 tokens per request: 1.97x"
+      ]
+    },
+    {
+      "event": "restored_verified",
+      "at": "2026-10-19T03:31:36.697833+00:00",
+      "status": {
+        "running": true,
+        "model": "qwen3.8-flash-next",
+        "state": "serving",
+        "container_info": "vllm_node\tUp 13 minutes",
+        "instances": [
+          {
+            "name": "vllm_node",
+            "status": "Up 13 minutes",
+            "port": 8000,
+            "running": true,
+            "model": "qwen3.8-flash-next"
+          }
+        ],
+        "launch": {
+          "in_flight": null,
+          "last": null
+        }
+      },
+      "profile_files_unchanged": {
+        "start_hf_qwen_qwen3.8-27b-fp8": true,
+        "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid": true
+      },
+      "identity": "a6997620cbcf8bfc5a695525a1c3a184fb156a27ddb86b159cf02d947f2e0306|sha256:826800d5af37e81df3af1dc77982376d657ab70ab2fe1fd2e0bf2378ae367076|false|2026-10-19T03:18:08.147178571Z|hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid"
+    }
+  ],
+  "gpu_process_memory": "130281, VLLM::EngineCore, 55912 MiB",
+  "restoration_note": "The 720-second harness observation deadline expired during normal Flash initialization. No second restart was issued. Follow-up controlplane models and inference checks passed.",
+  "candidate_controlplane_smoke": [
+    {
+      "request": 1,
+      "seconds": 31.364,
+      "finish_reason": "stop",
+      "content": "BATCH_OK",
+      "usage": {
+        "prompt_tokens": 18,
+        "total_tokens": 22,
+        "completion_tokens": 4,
+        "prompt_tokens_details": null
+      }
+    },
+    {
+      "request": 2,
+      "seconds": 30.578,
+      "finish_reason": "stop",
+      "content": "BATCH_OK",
+      "usage": {
+        "prompt_tokens": 18,
+        "total_tokens": 22,
+        "completion_tokens": 4,
+        "prompt_tokens_details": null
+      }
+    }
+  ],
+  "flash_controlplane_smoke": {
+    "at": "2026-10-19T03:31:03.291378+00:00",
+    "seconds": 1.114,
+    "finish_reason": "stop",
+    "content": "READY",
+    "usage": {
+      "prompt_tokens": 17,
+      "total_tokens": 19,
+      "completion_tokens": 2,
+      "prompt_tokens_details": null,
+      "completion_tokens_details": {
+        "reasoning_tokens": 0
+      }
+    },
+    "models": [
+      {
+        "id": "qwen3.8-flash-next",
+        "max_model_len": 262144
+      },
+      {
+        "id": "nvidia--Qwen3.8-Flash-Next-NVFP4",
+        "max_model_len": 262144
+      },
+      {
+        "id": "vllm-active",
+        "max_model_len": 262144
+      }
+    ]
+  }
+}
