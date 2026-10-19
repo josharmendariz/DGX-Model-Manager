@@ -29,6 +29,13 @@ Summarised from `git log v0.2.0..main` (2026-05-14 → 2026-10-13). Planning-onl
 - **Escaped UI rendering** — one `esc()` helper is applied at every enumerated
   DOM sink (e.g. HF-browse results).
 
+### Fixed
+
+- **Profile readiness preflight** — correctly parse read-only mount destinations,
+  resolve Hub IDs through the offline image cache, and validate arguments for
+  entrypoint-style vLLM profiles. Container probes cannot pull images or create
+  missing bind sources. See `docs/preflight-readiness.md` for diagnostic limits.
+
 ### Added
 
 - **Read-only LiteLLM startup drift check** — Kubernetes mode compares the local
