@@ -41,7 +41,10 @@ prepares the plan and units and runs the host maintenance experiment.
 | Flash Next | .74, .72 | 262144 | 4 |
 | Flash Next | .76 | 196608 | 4 |
 
-This is eight bounded candidates, not an exhaustive optimum search. Changing
+This is eight bounded candidates, not an exhaustive optimum search.
+The Qwen FP8 rows are currently suspended (`SUSPENDED_PROFILES`), so a run tests
+only the four Flash Next rows. The 2026-10-20 run hung GB10 for hours during the
+Qwen .49 cold load, and the cause is not yet known. Changing
 Flash utilization and sequence cap together measures deployable combinations;
 it does not isolate the causal effect of either setting. Candidates at 196608
 are limited to smaller workflows and never selected for shared fleet use.

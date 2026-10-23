@@ -507,3 +507,9 @@ def test_capped_or_unreadable_gpu_power_aborts_sweep(tmp_path, monkeypatch, peak
     assert result['status'] == ('failed' if capped else 'measured')
     assert bool(result.get('abort_sweep')) is capped
     assert bool(result.get('power_capped')) is capped
+
+
+def test_suspended_qwen_is_never_launched_and_flash_baseline_runs_first():
+    plan = tune.candidates()
+    assert plan and all(c['profile'] == tune.FLASH for c in plan)
+    assert plan[0] == {'profile': tune.FLASH, 'util': .76, 'context': 262144, 'seqs': 8}

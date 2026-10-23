@@ -43,12 +43,18 @@ STATE = Path.home() / '.local/state/dmm-overnight' / RUN_ID
 GPU_POWER_FLOOR_W = 25.0
 
 
+# The 2026-10-20 run hung GB10 for hours during the Qwen .49 cold load; cause unknown.
+# Re-enabling requires a reviewed change once the hang is explained.
+SUSPENDED_PROFILES = {QWEN}
+
+
 def candidates():
-    # Eight cold starts, not a Cartesian search. All values remain hypotheses.
+    # Cold starts, not a Cartesian search. All values remain hypotheses.
     return [dict(profile=p, util=u, context=c, seqs=s) for p, u, c, s in [
         (QWEN, .49, 262144, 2), (QWEN, .46, 262144, 2), (QWEN, .43, 262144, 2),
         (QWEN, .49, 196608, 4), (FLASH, .76, 262144, 8),
-        (FLASH, .74, 262144, 4), (FLASH, .72, 262144, 4), (FLASH, .76, 196608, 4)]]
+        (FLASH, .74, 262144, 4), (FLASH, .72, 262144, 4), (FLASH, .76, 196608, 4)]
+        if p not in SUSPENDED_PROFILES]
 
 
 class CommandFailure(RuntimeError):
