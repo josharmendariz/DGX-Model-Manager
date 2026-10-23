@@ -38,6 +38,9 @@ RUN_ID = os.environ.get('DMM_RUN_ID', 'manual')
 if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', RUN_ID):
     raise ValueError('Invalid run ID')
 STATE = Path.home() / '.local/state/dmm-overnight' / RUN_ID
+# Healthy GB10 load peaks at 30-90 W; after the 2026-10-20 fault a latched platform
+# cap held it at 13-17 W with no driver-visible throttle. Below this, timings are invalid.
+GPU_POWER_FLOOR_W = 25.0
 
 
 def candidates():
@@ -104,6 +107,16 @@ def memory():
             'swap_used_gib': (info['SwapTotal'] - info['SwapFree']) / 1024**2,
             'swap_out_pages': int(vm['pswpout']),
             'psi_full_avg10': float(re.search(r'full avg10=(\S+)', psi)[1])}
+
+
+def gpu_power():
+    # GB10 reports no power limit or cap reason, so read the draw itself.
+    try:
+        r = subprocess.run(['nvidia-smi', '--query-gpu=power.draw', '--format=csv,noheader,nounits'],
+                           capture_output=True, text=True, timeout=5)
+        return float(r.stdout.split()[0]) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
 
 
 def container():
@@ -247,6 +260,7 @@ class Monitor:
     def __init__(self):
         self.stop = threading.Event()
         self.samples = [memory()]
+        self.power = []
         self.fault = None
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -256,6 +270,7 @@ class Monitor:
         while not self.stop.is_set():
             sample = memory()
             self.samples.append(sample)
+            self.power.append((time.monotonic(), gpu_power()))
             first_swap = sample['swap_out_pages'] if first_swap is None else first_swap
             low = low + 1 if sample['available_gib'] < 8 else 0
             if low >= 3 or sample['psi_full_avg10'] > 5 or (sample['swap_out_pages'] - first_swap) * os.sysconf('SC_PAGE_SIZE') > 256 * 1024**2:
@@ -265,6 +280,10 @@ class Monitor:
     def check(self):
         if self.fault:
             raise RuntimeError(self.fault)
+
+    def peak_power(self, since):
+        readings = [w for t, w in self.power if t >= since and w is not None]
+        return max(readings) if readings else None
 
     def finish(self):
         self.stop.set()
@@ -432,11 +451,17 @@ def qualify(settings, directory, cutoff, first_replacement=False):
                 continue
             before = completed_requests()
             deadline = min(cutoff, time.monotonic() + 570)
+            batch_start = time.monotonic()
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(tokens)) as pool:
                 futures = [pool.submit(infer, model, t, deadline, monitor, decode) for t in tokens]
                 records = [f.result() for f in futures]
-            result['batches'].append({'sizes': sizes, 'decode': decode, 'requests': records,
+            peak = monitor.peak_power(batch_start)
+            result['batches'].append({'sizes': sizes, 'decode': decode, 'requests': records, 'gpu_peak_w': peak,
                                      'aggregate_output_tps': sum(r['output_tokens'] or 0 for r in records) / max(r['seconds'] for r in records)})
+            # Fail closed: an unreadable or capped GPU makes every later comparison invalid.
+            if peak is None or peak < GPU_POWER_FLOOR_W:
+                result['power_capped'] = True
+                raise RuntimeError('GPU power unreadable or below floor under load; suspected platform power cap')
             result['kernel_fault_count'] = kernel_faults(started_at)
             if result['kernel_fault_count']:
                 raise RuntimeError('Kernel allocation/OOM errors observed')
@@ -455,7 +480,8 @@ def qualify(settings, directory, cutoff, first_replacement=False):
         result['failure_reason'] = str(exc) if type(exc) in (RuntimeError, CommandFailure) else type(exc).__name__
         result['failure_stage'] = 'startup' if 'startup_s' not in result else 'inference'
         result['abort_sweep'] = bool(monitor.fault or result['failure_stage'] == 'startup'
-                                     or result.get('contaminated') or result.get('kernel_fault_count'))
+                                     or result.get('contaminated') or result.get('kernel_fault_count')
+                                     or result.get('power_capped'))
     finally:
         if proc is not None and proc.poll() is None:
             os.killpg(proc.pid, signal.SIGTERM)

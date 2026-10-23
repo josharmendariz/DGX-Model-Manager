@@ -74,6 +74,13 @@ may allow subsequent healthy candidates; incomplete runs are not passing results
 A detected extra completed request marks results contaminated. Other traffic
 outside batches or concurrent failed requests may escape that detector.
 
+Every measured batch must also reach **25 W** peak GPU draw, read with nvidia-smi
+every two seconds. Healthy GB10 load peaks at about 30–90 W. After a hard fault the
+platform can latch a power cap of about 15 W that slows decode about threefold.
+The driver reports no limit or throttle reason, so the draw is the only signal.
+Only a full AC power removal has cleared the cap; a reboot did not. A batch below
+the floor, or with no readable draw, fails the candidate and stops the sweep.
+
 ## Ownership, deadlines and recovery
 
 Controlplane drains agent-control for up to ten minutes. A short SQLite writer

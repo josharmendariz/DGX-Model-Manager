@@ -459,3 +459,51 @@ def test_wait_ready_tolerates_container_replacement_gap(monkeypatch):
     class Process:
         def poll(self):return 0
     assert tune.wait_ready(Process(),10,'original',tune.QWEN)=='new-model'
+
+
+@pytest.mark.parametrize('stdout,code,expected', [('57.91\n', 0, 57.91), ('[N/A]\n', 0, None), ('', 9, None)])
+def test_gpu_power_reads_draw_and_fails_soft(monkeypatch, stdout, code, expected):
+    monkeypatch.setattr(tune.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], code, stdout, ''))
+    assert tune.gpu_power() == expected
+
+
+def test_monitor_peak_power_only_counts_window():
+    monitor = tune.Monitor()
+    monitor.power = [(1.0, 80.0), (5.0, 15.0), (6.0, None), (7.0, 17.0)]
+    assert monitor.peak_power(5.0) == 17.0
+    assert monitor.peak_power(8.0) is None
+
+
+@pytest.mark.parametrize('peak,capped', [(57.9, False), (16.5, True), (None, True)])
+def test_capped_or_unreadable_gpu_power_aborts_sweep(tmp_path, monkeypatch, peak, capped):
+    class Monitor:
+        fault = None
+        class thread:
+            start = staticmethod(lambda: None)
+        def check(self): pass
+        def peak_power(self, since): return peak
+        def finish(self): return {'min_available_gib': 20}
+    done = [0]
+    monkeypatch.setattr(tune, 'Monitor', Monitor)
+    monkeypatch.setattr(tune, 'check_manager_idle', lambda: None)
+    monkeypatch.setattr(tune, 'ensure_idle', lambda: None)
+    monkeypatch.setattr(tune, 'container', lambda: {'id': 'original'})
+    monkeypatch.setattr(tune, 'launch', lambda *a: type('P', (), {'poll': lambda self: 0})())
+    monkeypatch.setattr(tune, 'wait_ready', lambda *a: 'model')
+    monkeypatch.setattr(tune, 'memory', lambda: {'total_gib': 121.6})
+    monkeypatch.setattr(tune, 'kernel_faults', lambda *a: 0)
+    monkeypatch.setattr(tune, 'tool_smoke', lambda *a: {'passed': True})
+    monkeypatch.setattr(tune, 'workloads', lambda context: [])
+    monkeypatch.setattr(tune, 'synthetic_tokens', lambda model, n, seed, decode: [1] * n)
+    monkeypatch.setattr(tune, 'completed_requests', lambda: done[0])
+    def infer(*a):
+        done[0] += 1
+        return {'output_tokens': 128, 'seconds': 10.0, 'needle_pass': True}
+    monkeypatch.setattr(tune, 'infer', infer)
+    monkeypatch.setattr(tune.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 0, 'GPU KV cache size: 405,625 tokens', ''))
+    result = tune.qualify({'profile': tune.FLASH, 'util': .76, 'context': 262144, 'seqs': 8},
+                          tmp_path, tune.time.monotonic() + 7200, first_replacement=True)
+    assert result['batches'][-1]['gpu_peak_w'] == peak
+    assert result['status'] == ('failed' if capped else 'measured')
+    assert bool(result.get('abort_sweep')) is capped
+    assert bool(result.get('power_capped')) is capped
