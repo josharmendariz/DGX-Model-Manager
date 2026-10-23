@@ -259,9 +259,8 @@ _REPO_PROFILES = pathlib.Path(appmod.__file__).parent / "profiles" / "vLLM"
 _EXPECTED_CLASSES = {
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-14b.sh": "generated",
     "start_hf_deepseek-ai_deepseek-r1-distill-qwen-32b.sh": "generated",
-    # Hand-written wrapper around a third-party serve.sh; no generated-by marker,
-    # no placeholder, no recipe call.
-    "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh": "legacy",
+    # Hand-written wrapper with bounded context/sequence placeholders for tuning.
+    "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh": "parameterized",
     "start_hf_openai_gpt-oss-120b.sh": "legacy",
     "start_hf_qwen2.5-14b-instruct-gptq-int8.sh": "generated",
     # Rewritten by parameterize/apply during the 04-03 live checkpoint (2026-08-21,
@@ -312,11 +311,13 @@ def _committed_profile_names():
     )
 
 
-def test_qwen_flash_profile_preserves_500k_with_bounded_memory_default():
+def test_qwen_flash_profile_preserves_native_context_and_bounded_defaults():
     text = _committed_text(
         "start_hf_nvidia_qwen3.8-flash-next-nvfp4-hybrid.sh"
     )
-    assert "CTX=500000" in text
+    assert 'CTX="${VLLM_MAX_MODEL_LEN:-262144}"' in text
+    assert 'SEQS="${VLLM_MAX_NUM_SEQS:-8}"' in text
+    assert "YARN=0" in text and "MTP=2" in text
     assert 'GPU_MEM="${VLLM_GPU_MEMORY_UTILIZATION:-0.76}"' in text
     assert "GPU_MEM=0.80" not in text
 
